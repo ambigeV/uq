@@ -1,6 +1,6 @@
 import deepchem as dc
 from data_utils import prepare_datasets, evaluate_uq_metrics_from_interval
-from nn_baseline import train_nn_baseline
+from nn_baseline import train_nn_baseline, train_nn_deep_ensemble, train_nn_mc_dropout
 from deepchem.molnet import load_qm7, load_delaney, load_qm8, load_qm9, load_lipo, load_freesolv
 
 import torch
@@ -12,11 +12,11 @@ import numpy as np
 
 def load_dataset():
     FEATURIZER = "coulomb"  # not ECFP -> will flatten (N, A, A) -> (N, A*A)
-    tasks, datasets, transformers = load_qm7()
-    # tasks, datasets, transformers = load_qm8()
+    # tasks, datasets, transformers = load_qm7()
+    tasks, datasets, transformers = load_qm8()
     #
     # FEATURIZER = "ecfp"  # not ECFP -> will flatten (N, A, A) -> (N, A*A)
-    # # tasks, datasets, transformers = load_delaney()
+    # tasks, datasets, transformers = load_delaney()
     # tasks, datasets, transformers = load_lipo()
 
     train_dc, valid_dc, test_dc = prepare_datasets(datasets, featurizer_name=FEATURIZER)
@@ -171,7 +171,7 @@ def main_svgp_ensemble():
     items = []
     for i in range(5):
         # indices for training this base model: all folds except i
-        train_idx_i = np.concatenate([folds[j] for j in range(5) if j != i])
+        train_idx_i = np.concatenate([folds[j] for j in [i, (i+1)%5]])
         ds_i = _subset_numpy_dataset(train_dc, train_idx_i)
 
         # tensors for model init (wrapper learns x/y stats here)
@@ -225,10 +225,11 @@ def main_svgp_ensemble():
 def main_nn():
     tasks, train_dc, valid_dc, test_dc, transformers = load_dataset()
 
-    train_nn_baseline(train_dc, valid_dc, test_dc)
-
+    # train_nn_baseline(train_dc, valid_dc, test_dc)
+    train_nn_mc_dropout(train_dc, valid_dc, test_dc)
+    train_nn_deep_ensemble(train_dc, valid_dc, test_dc)
 
 if __name__ == "__main__":
-    # main_nn()
+    main_nn()
     # main_gp()
-    main_svgp_ensemble()
+    # main_svgp()
