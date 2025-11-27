@@ -101,3 +101,143 @@ class GPTrainer:
             lower.cpu().numpy(),
             upper.cpu().numpy(),
         )
+
+
+class EnsembleGPTrainer:
+    """
+    Train multiple GP models (ExactGP or SVGP) potentially on different datasets.
+    Aggregates predictions as an equal-weight mixture of Gaussians using moment matching.
+    """
+    def __init__(self, items, device: str = "cpu"):
+        """
+        items: list of dicts, each like
+          {
+            "model": <GPyTorchRegressor>,
+            "train_dataset": <dc.data.NumpyDataset>,
+            # optional per-model overrides:
+            "lr": 0.1,
+            "num_iters": 100,
+            "log_interval": 10,
+          }
+        """
+        self.device = device
+        self.trainers = []
+        for k, it in enumerate(items):
+            trainer = GPTrainer(
+                model=it["model"],
+                train_dataset=it["train_dataset"],
+                lr=it.get("lr", 0.1),
+                num_iters=it.get("num_iters", 100),
+                device=device,
+                log_interval=it.get("log_interval", 10),
+            )
+            self.trainers.append(trainer)
+
+    def train(self):
+        for i, t in enumerate(self.trainers, 1):
+            print(f"[Ensemble] Training model {i}/{len(self.trainers)}")
+            t.train()
+
+    def _dc_to_torch(self, dataset: dc.data.NumpyDataset):
+        X = torch.from_numpy(dataset.X).float().to(self.device)
+        y = torch.from_numpy(dataset.y).float().to(self.device)
+        if y.ndim == 2 and y.shape[1] == 1:
+            y = y.squeeze(-1)
+        return X, y
+
+    @staticmethod
+    def _get_y_stats(model, device):
+        # y_std/y_mean may be registered buffers in your wrapper; fall back to (1,0)
+        y_std = getattr(model, "y_std", torch.tensor(1.0, device=device))
+        y_mean = getattr(model, "y_mean", torch.tensor(0.0, device=device))
+        # Ensure shapes are broadcastable
+        if y_std.ndim == 0: y_std = y_std.view(1)
+        if y_mean.ndim == 0: y_mean = y_mean.view(1)
+        return y_mean, y_std
+
+    def _component_mean_var(self, model, X: torch.Tensor):
+        """
+        Returns mean and variance in ORIGINAL y units for a single model.
+        Works for ExactGP and SVGP. Relies on model.gp_model normalizing X internally.
+        """
+        model.eval()
+        model.likelihood.eval()
+        with torch.no_grad(), gpytorch.settings.fast_pred_var():
+            dist = model.likelihood(model.gp_model(X))  # dist is in normalized y-space if model normalizes y
+            mean_n = dist.mean
+            var_n  = dist.variance
+
+        # De-normalize using model's y stats (if any)
+        y_mean, y_std = self._get_y_stats(model, X.device)
+        mean = mean_n * y_std + y_mean
+        var  = var_n  * (y_std ** 2)
+        return mean, var  # tensors shape (N,)
+
+    # ---------- evaluation / prediction ----------
+    def evaluate_mse(self, dataset: dc.data.NumpyDataset) -> float:
+        """
+        Compute MSE between mixture mean and true y (original units).
+        """
+        X, y_true = self._dc_to_torch(dataset)
+
+        means = []
+        for t in self.trainers:
+            m, _ = self._component_mean_var(t.model, X)
+            means.append(m)
+
+        mean_mix = torch.stack(means, dim=0).mean(dim=0)  # (N,)
+        mse = torch.mean((mean_mix - y_true) ** 2).item()
+        return mse
+
+    def predict_mean(self, dataset: dc.data.NumpyDataset) -> np.ndarray:
+        """
+        Mixture mean (equal weight), original units.
+        """
+        X, _ = self._dc_to_torch(dataset)
+        means = []
+        for t in self.trainers:
+            m, _ = self._component_mean_var(t.model, X)
+            means.append(m)
+        mean_mix = torch.stack(means, dim=0).mean(dim=0)  # (N,)
+        return mean_mix.detach().cpu().numpy()
+
+    def predict_mixture_moments(self, dataset: dc.data.NumpyDataset):
+        """
+        Return (mean_mix, var_mix) for the equal-weight Gaussian mixture,
+        using moment matching. Original units.
+        """
+        X, _ = self._dc_to_torch(dataset)
+
+        comp_means = []
+        comp_vars  = []
+        for t in self.trainers:
+            m, v = self._component_mean_var(t.model, X)
+            comp_means.append(m)
+            comp_vars.append(v)
+
+        M = len(comp_means)
+        means = torch.stack(comp_means, dim=0)  # (M, N)
+        vars_ = torch.stack(comp_vars,  dim=0)  # (M, N)
+
+        mean_mix = means.mean(dim=0)                           # (N,)
+        second_moment = (vars_ + means**2).mean(dim=0)         # E[σ^2 + μ^2]
+        var_mix = second_moment - mean_mix**2                  # Var law
+
+        return (mean_mix.detach().cpu().numpy(),
+                var_mix.clamp_min(0.0).detach().cpu().numpy())
+
+    def predict_interval(self, dataset: dc.data.NumpyDataset, alpha: float = 0.05, method: str = "moment"):
+        """
+        (mean, lower, upper) for the mixture.
+        method="moment": Gaussian approx using matched mean/var (fast).
+        """
+        mean_mix, var_mix = self.predict_mixture_moments(dataset)
+        std_mix = np.sqrt(var_mix + 1e-12)
+        if alpha == 0.05:
+            z = 1.96
+        else:
+            import scipy.stats as st
+            z = st.norm.ppf(1 - alpha/2.0)
+        lower = mean_mix - z * std_mix
+        upper = mean_mix + z * std_mix
+        return mean_mix, lower, upper

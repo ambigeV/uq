@@ -6,16 +6,17 @@ from deepchem.molnet import load_qm7, load_delaney, load_qm8, load_qm9, load_lip
 import torch
 import gpytorch
 from gp_single import GPyTorchRegressor, SVGPModel
-from gp_trainer import GPTrainer
+from gp_trainer import GPTrainer, EnsembleGPTrainer
+import numpy as np
 
 
 def load_dataset():
     FEATURIZER = "coulomb"  # not ECFP -> will flatten (N, A, A) -> (N, A*A)
-    # tasks, datasets, transformers = load_qm7()
-    tasks, datasets, transformers = load_qm8()
+    tasks, datasets, transformers = load_qm7()
+    # tasks, datasets, transformers = load_qm8()
     #
     # FEATURIZER = "ecfp"  # not ECFP -> will flatten (N, A, A) -> (N, A*A)
-    # tasks, datasets, transformers = load_delaney()
+    # # tasks, datasets, transformers = load_delaney()
     # tasks, datasets, transformers = load_lipo()
 
     train_dc, valid_dc, test_dc = prepare_datasets(datasets, featurizer_name=FEATURIZER)
@@ -143,6 +144,84 @@ def main_svgp():
     print("UQ (SVGP):", uq_metrics)
 
 
+def _subset_numpy_dataset(ds: dc.data.NumpyDataset, idx: np.ndarray) -> dc.data.NumpyDataset:
+    """Return a DeepChem NumpyDataset subsetted by idx."""
+    X = ds.X[idx]
+    y = ds.y[idx]
+    w = None if ds.w is None else ds.w[idx]
+    try:
+        ids = ds.ids[idx]
+    except Exception:
+        try:
+            ids = [ds.ids[int(i)] for i in idx]
+        except Exception:
+            ids = None
+    return dc.data.NumpyDataset(X=X, y=y, w=w, ids=ids)
+
+
+def main_svgp_ensemble():
+    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset()
+
+    print("Train X shape:", train_dc.X.shape)
+    N, D = train_dc.X.shape
+    print("Train y shape:", train_dc.y.shape)
+
+    folds = np.array_split(np.arange(N), 5)
+
+    items = []
+    for i in range(5):
+        # indices for training this base model: all folds except i
+        train_idx_i = np.concatenate([folds[j] for j in range(5) if j != i])
+        ds_i = _subset_numpy_dataset(train_dc, train_idx_i)
+
+        # tensors for model init (wrapper learns x/y stats here)
+        X_train_torch = torch.from_numpy(ds_i.X).float()
+        y_np = ds_i.y
+        if y_np.ndim == 2 and y_np.shape[1] == 1:
+            y_np = y_np[:, 0]
+        y_train_torch = torch.from_numpy(y_np).float()
+
+        Ni = X_train_torch.shape[0]
+        gp_model_i = GPyTorchRegressor(
+            train_x=X_train_torch,
+            train_y=y_train_torch,
+            gp_model_cls=SVGPModel,
+            likelihood=gpytorch.likelihoods.GaussianLikelihood(),
+            num_inducing=max(128, Ni // 20),  # same params across models
+            kmeans_iters=15,
+        )
+
+        items.append({
+            "model": gp_model_i,
+            "train_dataset": ds_i,   # trainer will use normalized y internally
+            "lr": 0.01,
+            "num_iters": 500,
+            "log_interval": 10,
+        })
+
+    # 4) Train ensemble
+    ens = EnsembleGPTrainer(items, device="cpu")
+    ens.train()
+
+    # 5) Evaluate (mixture mean via moment matching)
+    valid_mse = ens.evaluate_mse(valid_dc)
+    test_mse  = ens.evaluate_mse(test_dc)
+    print("[SVGP-Ens] Validation MSE:", valid_mse)
+    print("[SVGP-Ens] Test MSE:",      test_mse)
+
+    # 6) UQ from mixture (Gaussian approx via matched moments)
+    mean_test, lower_test, upper_test = ens.predict_interval(test_dc, alpha=0.05)
+
+    uq_metrics = evaluate_uq_metrics_from_interval(
+        y_true=test_dc.y,
+        mean=mean_test,
+        lower=lower_test,
+        upper=upper_test,
+        alpha=0.05,
+    )
+    print("UQ (SVGP-Ens):", uq_metrics)
+
+
 def main_nn():
     tasks, train_dc, valid_dc, test_dc, transformers = load_dataset()
 
@@ -152,4 +231,4 @@ def main_nn():
 if __name__ == "__main__":
     # main_nn()
     # main_gp()
-    main_svgp()
+    main_svgp_ensemble()
