@@ -25,10 +25,6 @@ class GPTrainer:
 
         self.train_x, self.train_y = self._dc_to_torch(train_dataset)
 
-        # if hasattr(self.model, "train_x_norm") and hasattr(self.model, "train_y_norm"):
-        #     self.train_x = self.model.train_x_norm
-        #     self.train_y = self.model.train_y_norm
-        # keep raw X (model normalizes internally)
         if hasattr(self.model, "train_y_norm"):
             self.train_y = self.model.train_y_norm
 
@@ -43,6 +39,17 @@ class GPTrainer:
             self.mll = gpytorch.mlls.ExactMarginalLogLikelihood(self.likelihood, self.gp)
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+
+    def _summ(self, tensor, name, k: int = 5) -> str:
+        """Pretty summary for scalar or vector tensors."""
+        if tensor is None:
+            return f"{name}: N/A"
+        t = tensor.detach().float().cpu()
+        if t.ndim == 0 or t.numel() == 1:
+            return f"{name}: {t.item():.3e}"
+        flat = t.view(-1)
+        head = " ".join(f"{v:.3e}" for v in flat[:k].tolist())
+        return f"{name}[0:{min(k, flat.numel())}]: {head} | mean={flat.mean().item():.3e}"
 
     def _dc_to_torch(self, dataset: dc.data.NumpyDataset):
         X = torch.from_numpy(dataset.X).float().to(self.device)
@@ -65,8 +72,33 @@ class GPTrainer:
             loss.backward()
             self.optimizer.step()
 
+            # if i % self.log_interval == 0 or i == 1 or i == self.num_iters:
+            #     print(f"[Iter {i:03d}] Loss: {loss.item():.4f}")
             if i % self.log_interval == 0 or i == 1 or i == self.num_iters:
-                print(f"[Iter {i:03d}] Loss: {loss.item():.4f}")
+                # Safely grab hypers across kernels/likelihoods
+                try:
+                    ls = self.gp.covar_module.base_kernel.lengthscale
+                except Exception:
+                    ls = None
+                try:
+                    os = self.gp.covar_module.outputscale
+                except Exception:
+                    os = None
+                # GaussianLikelihood -> scalar; FixedNoise -> per-point vector
+                noise = getattr(self.likelihood, "noise", None)
+
+                ls_str = self._summ(ls, "lengthscale")
+                os_str = self._summ(os, "outputscale")
+                if noise is None:
+                    noise_str = "noise: N/A"
+                else:
+                    n = noise.detach().float().cpu()
+                    if n.ndim == 0 or n.numel() == 1:
+                        noise_str = f"noise: {n.item():.3e}"
+                    else:
+                        noise_str = f"noise(mean/min/max): {n.mean().item():.3e}/{n.min().item():.3e}/{n.max().item():.3e}"
+
+                print(f"[Iter {i:03d}] Loss: {loss.item():.4f} | {ls_str} | {os_str} | {noise_str}")
 
     def evaluate_mse(self, dataset: dc.data.NumpyDataset) -> float:
         self.model.eval()
