@@ -53,6 +53,7 @@ class SVGPModel(gpytorch.models.ApproximateGP):
         normalize_x: bool,
         num_inducing: int = 128,
         kmeans_iters: int = 15,
+        kernel: str = "matern52",  # <- NEW: "rbf" | "matern32" | "matern52"
     ):
         self.normalize_x = normalize_x
 
@@ -91,9 +92,20 @@ class SVGPModel(gpytorch.models.ApproximateGP):
 
         input_dim = train_x.shape[-1]
         self.mean_module = gpytorch.means.ConstantMean()
-        self.covar_module = gpytorch.kernels.ScaleKernel(
-            gpytorch.kernels.RBFKernel(ard_num_dims=input_dim)
-        )
+        # self.covar_module = gpytorch.kernels.ScaleKernel(
+        #     gpytorch.kernels.RBFKernel(ard_num_dims=input_dim)
+        # )
+        kernel = kernel.lower()
+        if kernel == "rbf":
+            base = gpytorch.kernels.RBFKernel(ard_num_dims=input_dim)
+        elif kernel == "matern32":
+            base = gpytorch.kernels.MaternKernel(nu=1.5, ard_num_dims=input_dim)
+        elif kernel == "matern52":
+            base = gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=input_dim)
+        else:
+            raise ValueError(f"Unknown kernel '{kernel}'. Use 'rbf' | 'matern32' | 'matern52'.")
+
+        self.covar_module = gpytorch.kernels.ScaleKernel(base)
 
     @staticmethod
     def _kmeans_medoid_init(X: torch.Tensor, k: int, num_iters: int = 15) -> torch.Tensor:
