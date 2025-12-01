@@ -257,18 +257,18 @@ class NNSVGPLearnedInducing(gpytorch.models.ApproximateGP):
         elif k == "matern52": base = gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=feat_dim)
         else: raise ValueError("kernel must be 'rbf' | 'matern32' | 'matern52'")
 
-        self.mean_module = gpytorch.means.ConstantMean()
-        deep = DeepFeatureKernel(feature_extractor, base,
-                                 x_mean=None, x_std=None, normalize_x=False)  # [MODIFIED] no norm
-        self.covar_module = gpytorch.kernels.ScaleKernel(deep)
-        self.likelihood = likelihood
-
         q  = CholeskyVariationalDistribution(inducing_inputs.size(0))
         vs = VariationalStrategy(self, inducing_points=inducing_inputs,
                                  variational_distribution=q,
                                  learn_inducing_locations=True)   # learned inputs
         # vs = WhitenedVariationalStrategy(vs)
         super().__init__(vs)
+
+        self.mean_module = gpytorch.means.ConstantMean()
+        deep = DeepFeatureKernel(feature_extractor, base,
+                                 x_mean=None, x_std=None, normalize_x=False)  # [MODIFIED] no norm
+        self.covar_module = gpytorch.kernels.ScaleKernel(deep)
+        self.likelihood = likelihood
 
     def forward(self, x):
         return gpytorch.distributions.MultivariateNormal(self.mean_module(x), self.covar_module(x))
