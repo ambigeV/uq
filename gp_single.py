@@ -2,6 +2,9 @@
 import torch
 import torch.nn as nn
 import gpytorch
+from gpytorch.variational import (
+    CholeskyVariationalDistribution, VariationalStrategy
+)
 
 
 class ExactGPModel(gpytorch.models.ExactGP):
@@ -151,6 +154,124 @@ class SVGPModel(gpytorch.models.ApproximateGP):
         mean_x = self.mean_module(x_n)
         covar_x = self.covar_module(x_n)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+
+class FeatureNet(nn.Module):
+    """
+    R^Din -> R^Dfeat via MLP + final BatchNorm1d (affine=True).
+    BatchNorm stabilizes feature scale; we therefore DO NOT z-normalize X anywhere.
+    """
+    def __init__(self, in_dim, feat_dim=128, hidden=(256, 128), dropout=0.0):
+        super().__init__()
+        layers, last = [], in_dim
+        for h in hidden:
+            layers += [nn.Linear(last, h), nn.ReLU()]
+            if dropout > 0:
+                layers += [nn.Dropout(dropout)]
+            last = h
+        layers += [nn.Linear(last, feat_dim)]
+        self.backbone = nn.Sequential(*layers)
+        self.post_bn  = nn.BatchNorm1d(feat_dim, affine=True)   # [MODIFIED] LayerNorm -> BatchNorm1d
+
+    def forward(self, x):
+        z = self.backbone(x)
+        return self.post_bn(z)                                  # [MODIFIED] apply BN here
+
+
+class DeepFeatureKernel(gpytorch.kernels.Kernel):
+    """
+    k_deep(x1, x2) = k_base( φ(x1), φ(x2) ).
+    NOTE: No X normalization here—BatchNorm in FeatureNet handles scale.
+    """
+    is_stationary = False
+
+    def __init__(self, feature_extractor: nn.Module, base_kernel: gpytorch.kernels.Kernel,
+                 x_mean=None, x_std=None, normalize_x: bool = False):
+        super().__init__()
+        self.feature_extractor = feature_extractor
+        self.base_kernel = base_kernel
+        # [MODIFIED] accept x_mean/x_std/normalize_x for compatibility but ignore them
+
+    def _to_feat(self, x):
+        # [MODIFIED] identity "normalization" — BN lives inside FeatureNet
+        return self.feature_extractor(x)
+
+    def forward(self, x1, x2, diag=False, **params):
+        z1 = self._to_feat(x1)
+        z2 = self._to_feat(x2)
+        return self.base_kernel(z1, z2, diag=diag, **params)
+
+
+class NNGPExactGPModel(gpytorch.models.ExactGP):
+    """
+    Exact GP on neural features; no X z-norm. Wrapper may pass x_mean/x_std—ignored.
+    """
+    def __init__(self, train_x, train_y, likelihood,
+                 x_mean=None, x_std=None, normalize_x: bool = False,   # [MODIFIED] kept but unused
+                 feature_extractor: nn.Module = None,
+                 kernel: str = "matern52"):
+        super().__init__(train_x, train_y, likelihood)
+
+        # infer feature dimension once on raw X (BatchNorm handles scaling)
+        with torch.no_grad():
+            feat_dim = feature_extractor(train_x[:min(2048, train_x.size(0))]).shape[-1]
+
+        k = kernel.lower()
+        if   k == "rbf":      base = gpytorch.kernels.RBFKernel(ard_num_dims=feat_dim)
+        elif k == "matern32": base = gpytorch.kernels.MaternKernel(nu=1.5, ard_num_dims=feat_dim)
+        elif k == "matern52": base = gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=feat_dim)
+        else: raise ValueError("kernel must be 'rbf' | 'matern32' | 'matern52'")
+
+        self.mean_module = gpytorch.means.ConstantMean()
+        deep = DeepFeatureKernel(feature_extractor, base,
+                                 x_mean=None, x_std=None, normalize_x=False)
+        self.covar_module = gpytorch.kernels.ScaleKernel(deep)
+
+    def forward(self, x):
+        return gpytorch.distributions.MultivariateNormal(self.mean_module(x), self.covar_module(x))
+
+
+class NNSVGPLearnedInducing(gpytorch.models.ApproximateGP):
+    """
+    Inducing *inputs* initialized from a random subset of raw TRAIN X, then optimized.
+    No X z-norm (BatchNorm in FeatureNet already stabilizes features).
+    """
+    def __init__(self, train_x, train_y, likelihood,
+                 x_mean=None, x_std=None, normalize_x: bool = False,   # [MODIFIED] kept but unused
+                 feature_extractor: nn.Module = None,
+                 num_inducing: int = 800,
+                 kernel: str = "matern52",
+                 inducing_idx: torch.Tensor = None):
+
+        N, device = train_x.size(0), train_x.device
+        if inducing_idx is None:
+            inducing_idx = torch.randperm(N, device=device)[:num_inducing]
+        inducing_inputs = train_x[inducing_idx].contiguous()    # raw-X init
+
+        with torch.no_grad():
+            feat_dim = feature_extractor(train_x[:min(2048, N)]).shape[-1]
+
+        k = kernel.lower()
+        if   k == "rbf":      base = gpytorch.kernels.RBFKernel(ard_num_dims=feat_dim)
+        elif k == "matern32": base = gpytorch.kernels.MaternKernel(nu=1.5, ard_num_dims=feat_dim)
+        elif k == "matern52": base = gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=feat_dim)
+        else: raise ValueError("kernel must be 'rbf' | 'matern32' | 'matern52'")
+
+        self.mean_module = gpytorch.means.ConstantMean()
+        deep = DeepFeatureKernel(feature_extractor, base,
+                                 x_mean=None, x_std=None, normalize_x=False)  # [MODIFIED] no norm
+        self.covar_module = gpytorch.kernels.ScaleKernel(deep)
+        self.likelihood = likelihood
+
+        q  = CholeskyVariationalDistribution(inducing_inputs.size(0))
+        vs = VariationalStrategy(self, inducing_points=inducing_inputs,
+                                 variational_distribution=q,
+                                 learn_inducing_locations=True)   # learned inputs
+        # vs = WhitenedVariationalStrategy(vs)
+        super().__init__(vs)
+
+    def forward(self, x):
+        return gpytorch.distributions.MultivariateNormal(self.mean_module(x), self.covar_module(x))
 
 
 class GPyTorchRegressor(nn.Module):

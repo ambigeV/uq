@@ -5,15 +5,16 @@ from deepchem.molnet import load_qm7, load_delaney, load_qm8, load_qm9, load_lip
 
 import torch
 import gpytorch
-from gp_single import GPyTorchRegressor, SVGPModel
+from gp_single import GPyTorchRegressor, SVGPModel, FeatureNet, \
+    DeepFeatureKernel, NNGPExactGPModel, NNSVGPLearnedInducing
 from gp_trainer import GPTrainer, EnsembleGPTrainer
 import numpy as np
 
 
 def load_dataset():
     FEATURIZER = "coulomb"  # not ECFP -> will flatten (N, A, A) -> (N, A*A)
-    tasks, datasets, transformers = load_qm7()
-    # tasks, datasets, transformers = load_qm8()
+    # tasks, datasets, transformers = load_qm7()
+    tasks, datasets, transformers = load_qm8()
     #
     # FEATURIZER = "ecfp"  # not ECFP -> will flatten (N, A, A) -> (N, A*A)
     # tasks, datasets, transformers = load_delaney()
@@ -40,6 +41,121 @@ def load_dataset():
         test_dc = _keep_first_task(test_dc)
 
     return tasks, train_dc, valid_dc, test_dc, transformers
+
+
+def _to_torch_xy(dc_dataset):
+    X_t = torch.from_numpy(dc_dataset.X).float()
+    y_np = dc_dataset.y
+    if y_np.ndim == 2 and y_np.shape[1] == 1:
+        y_np = y_np[:, 0]
+    y_t = torch.from_numpy(y_np).float()
+    return X_t, y_t
+
+
+def main_nngp_exact(device: str = None):
+    # 1) Load
+    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset()
+    print("Train X shape:", train_dc.X.shape)
+    print("Train y shape:", train_dc.y.shape)
+
+    # 2) Torch tensors
+    X_train_t, y_train_t = _to_torch_xy(train_dc)
+
+    # 3) Build NNGP (Exact)
+    in_dim = X_train_t.shape[1]
+    feat = FeatureNet(in_dim=in_dim, feat_dim=128, hidden=(256, 128), dropout=0.0)
+
+    nngp_exact = GPyTorchRegressor(
+        train_x=X_train_t,
+        train_y=y_train_t,
+        normalize_x=False,                        # BatchNorm handles scale
+        gp_model_cls=NNGPExactGPModel,
+        likelihood=gpytorch.likelihoods.GaussianLikelihood(),
+        feature_extractor=feat,
+        kernel="matern52",
+    )
+
+    # 4) Train
+    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    trainer = GPTrainer(
+        model=nngp_exact,
+        train_dataset=train_dc,
+        lr=5e-3,               # smaller LR tends to work better for deep kernels (exact GP uses single Adam)
+        num_iters=250,
+        device=dev,
+        log_interval=10,
+    )
+    trainer.train()
+
+    # 5) Eval
+    valid_mse = trainer.evaluate_mse(valid_dc)
+    test_mse  = trainer.evaluate_mse(test_dc)
+    print("[NNGP-Exact] Validation MSE:", valid_mse)
+    print("[NNGP-Exact] Test MSE:",      test_mse)
+
+    # 6) UQ (intervals on test)
+    mean_t, lo_t, hi_t = trainer.predict_interval(test_dc, alpha=0.05)
+    uq = evaluate_uq_metrics_from_interval(
+        y_true=test_dc.y, mean=mean_t, lower=lo_t, upper=hi_t, alpha=0.05
+    )
+    print("UQ (NNGP-Exact):", uq)
+
+
+def main_nngp_svgp(device: str = None):
+    # 1) Load
+    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset()
+    print("Train X shape:", train_dc.X.shape)
+    N, D = train_dc.X.shape
+    print("Train y shape:", train_dc.y.shape)
+
+    # 2) Torch tensors
+    X_train_t, y_train_t = _to_torch_xy(train_dc)
+
+    # 3) Build NNGP (SVGP with learned inducing inputs)
+    in_dim = D
+    feat = FeatureNet(in_dim=in_dim, feat_dim=128, hidden=(256, 128), dropout=0.0)
+
+    M = max(256, N // 20)      # e.g., ~5% of data or at least 256 (tune per dataset/capacity)
+    nngp_svgp = GPyTorchRegressor(
+        train_x=X_train_t,
+        train_y=y_train_t,
+        normalize_x=False,                        # BatchNorm handles scale
+        gp_model_cls=NNSVGPLearnedInducing,
+        likelihood=gpytorch.likelihoods.GaussianLikelihood(),
+        feature_extractor=feat,
+        num_inducing=M,
+        kernel="matern52",
+        # inducing_idx can be omitted to random-init inside the class
+    )
+
+    # 4) Train (SVGP branch uses NGD(q) + Adam(others) in your GPTrainer)
+    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    trainer = GPTrainer(
+        model=nngp_svgp,
+        train_dataset=train_dc,
+        lr=5e-3,               # Adam LR for kernel/likelihood params
+        nn_lr=1e-3,            # Adam LR for feature extractor
+        ngd_lr=0.02,           # NGD LR for q(u) (un-whitened); try 0.01–0.05 if needed
+        warmup_iters=5,        # freeze feature net briefly for stability
+        clip_grad=1.0,
+        num_iters=500,         # SVGP typically needs more iters
+        device=dev,
+        log_interval=10,
+    )
+    trainer.train()
+
+    # 5) Eval
+    valid_mse = trainer.evaluate_mse(valid_dc)
+    test_mse  = trainer.evaluate_mse(test_dc)
+    print("[NNGP-SVGP] Validation MSE:", valid_mse)
+    print("[NNGP-SVGP] Test MSE:",      test_mse)
+
+    # 6) UQ (intervals on test)
+    mean_t, lo_t, hi_t = trainer.predict_interval(test_dc, alpha=0.05)
+    uq = evaluate_uq_metrics_from_interval(
+        y_true=test_dc.y, mean=mean_t, lower=lo_t, upper=hi_t, alpha=0.05
+    )
+    print("UQ (NNGP-SVGP):", uq)
 
 
 def main_gp():
@@ -236,7 +352,7 @@ def main_svgp_ensemble_all():
     items = []
     for i in range(5):
         # (keeps your current "two-folds per model" split)
-        train_idx_i = np.concatenate([folds[j] for j in [i, (i + 1) % 5, (i + 2) % 5]])
+        train_idx_i = np.concatenate([folds[j] for j in [i, (i + 1) % 5]])
         ds_i = _subset_numpy_dataset(train_dc, train_idx_i)
 
         X_train_torch = torch.from_numpy(ds_i.X).float()

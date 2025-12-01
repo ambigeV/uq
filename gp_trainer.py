@@ -1,8 +1,10 @@
 # gp_trainer.py
 import torch
+import torch.nn as nn
 import gpytorch
 import deepchem as dc
 import numpy as np
+from gpytorch.optim import NGD
 
 
 class GPTrainer:
@@ -14,6 +16,11 @@ class GPTrainer:
         num_iters: int = 100,
         device: str = "cpu",
         log_interval: int = 10,
+        nn_lr: float = 1e-3,
+        ngd_lr: float = 0.02,
+        warmup_iters: int = 5,
+        clip_grad: float = 1.0,
+        add_prior_term: bool = False,
     ):
         self.model = model.to(device)
         self.device = device
@@ -22,6 +29,7 @@ class GPTrainer:
 
         self.likelihood = self.model.likelihood
         self.gp = self.model.gp_model
+        self.feat_log_sample = 4096  # default for feature/predictive logging
 
         self.train_x, self.train_y = self._dc_to_torch(train_dataset)
 
@@ -31,14 +39,53 @@ class GPTrainer:
         # After self.gp is set
         if hasattr(self.gp, "variational_strategy"):
             # SVGP path
+            self.is_svgp = True
             self.mll = gpytorch.mlls.VariationalELBO(
                 self.likelihood, self.gp, num_data=self.train_x.size(0)
             )
+            # --------- [MODIFIED] Optimizers: NGD(q) + Adam(other params) ----------
+            self.opt_ngd = NGD(
+                self.gp.variational_parameters(),
+                num_data=self.train_x.size(0),
+                lr=ngd_lr,
+            )
+            # Build Adam param groups excluding variational params
+            q_param_ids = {id(p) for p in self.gp.variational_parameters()}
+            other_params = [p for p in self.model.parameters() if id(p) not in q_param_ids]
+            # Try to detect the feature extractor inside deep kernel to give it nn_lr
+            feat_params = []
+            try:
+                # ScaleKernel(base_kernel=DeepFeatureKernel(...))
+                feat_params = list(self.gp.covar_module.base_kernel.feature_extractor.parameters())
+            except Exception:
+                pass
+            feat_ids = {id(p) for p in feat_params}
+
+            groups = []
+            if feat_params:
+                groups.append({
+                    "params": [p for p in other_params if id(p) in feat_ids],
+                    "lr": nn_lr,
+                    "weight_decay": 1e-4,
+                })
+                groups.append({
+                    "params": [p for p in other_params if id(p) not in feat_ids],
+                    "lr": lr,
+                })
+            else:
+                groups.append({"params": other_params, "lr": lr})
+
+            self.opt_adam = torch.optim.Adam(groups)
+
+            self.warmup_iters = int(max(0, warmup_iters))
+            self.clip_grad = clip_grad
+            self.add_prior_term = add_prior_term
+
         else:
             # Exact GP path
+            self.is_svgp = False  # [MODIFIED]
             self.mll = gpytorch.mlls.ExactMarginalLogLikelihood(self.likelihood, self.gp)
-
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
 
     def _summ(self, tensor, name, k: int = 5) -> str:
         """Pretty summary for scalar or vector tensors."""
@@ -58,19 +105,167 @@ class GPTrainer:
         # single-task case: (N, 1) -> (N,)
         if y.ndim == 2 and y.shape[1] == 1:
             y = y.squeeze(-1)
-
         return X, y
+
+    # --------------------- [MODIFIED] helpers for logging ---------------------
+    def _has_feature_extractor(self) -> bool:
+        try:
+            _ = self.gp.covar_module.base_kernel.feature_extractor
+            return True
+        except Exception:
+            return False
+
+    def _get_bn_module(self):
+        """Return the (first) BatchNorm1d in the feature extractor if present."""
+        try:
+            feat = self.gp.covar_module.base_kernel.feature_extractor
+        except Exception:
+            return None
+        # Prefer attribute 'post_bn' if exists
+        bn = getattr(feat, "post_bn", None)
+        if isinstance(bn, nn.BatchNorm1d):
+            return bn
+        # Otherwise search modules
+        for m in feat.modules():
+            if isinstance(m, nn.BatchNorm1d):
+                return m
+        return None
+
+    @torch.no_grad()
+    def _feature_stats_str(self, sample_k: int = 4096, k_head: int = 5) -> str:
+        """
+        Summarize φ(X) distribution and BN running stats (if any).
+        Prints compact stats to avoid flooding logs.
+        """
+        if not self._has_feature_extractor():
+            return "feat: N/A"
+
+        feat = self.gp.covar_module.base_kernel.feature_extractor
+        N = self.train_x.size(0)
+        if sample_k < N:
+            idx = torch.randperm(N, device=self.train_x.device)[:sample_k]
+            xb = self.train_x[idx]
+        else:
+            xb = self.train_x
+
+        z = feat(xb).detach()  # (n, Dz)
+        # per-dim stats
+        z_mu = z.mean(dim=0)
+        z_sd = z.std(dim=0, unbiased=False)
+        # summarize
+        mu_abs_mean = z_mu.abs().mean().item()
+        sd_mean = z_sd.mean().item()
+        sd_min = z_sd.min().item()
+        sd_max = z_sd.max().item()
+        # head preview
+        head_mu = " ".join(f"{v:.2e}" for v in z_mu[:k_head].cpu().tolist())
+        head_sd = " ".join(f"{v:.2e}" for v in z_sd[:k_head].cpu().tolist())
+
+        # BN running stats if available
+        bn = self._get_bn_module()
+        if bn is not None and bn.track_running_stats:
+            rm = bn.running_mean.detach().cpu()
+            rv = bn.running_var.detach().cpu()
+            bn_str = (f" | BNμ(mean)={rm.mean():.2e}, BNσ(mean)={(rv.clamp_min(1e-12).sqrt().mean()):.2e}")
+        else:
+            bn_str = ""
+
+        return (f"feat| μ_abs(avg)={mu_abs_mean:.2e}, σ(avg/min/max)={sd_mean:.2e}/{sd_min:.2e}/{sd_max:.2e} "
+                f"| μ[:{k_head}]={head_mu} | σ[:{k_head}]={head_sd}{bn_str}")
+
+    @torch.no_grad()
+    def _predictive_stats_str(self, output=None, sample_k: int = 4096) -> str:
+        """
+        Summarize predictive distribution on a subset of train_x (mean/std on ORIGINAL y-scale).
+        """
+        if sample_k < self.train_x.size(0):
+            idx = torch.randperm(self.train_x.size(0), device=self.train_x.device)[:sample_k]
+            xb = self.train_x[idx]
+        else:
+            xb = self.train_x
+
+        # Reuse output if passed (must correspond to full train_x); otherwise recompute
+        if output is not None and xb.shape[0] == self.train_x.shape[0]:
+            pred = self.likelihood(output)
+            mean_n = pred.mean
+            std_n = pred.stddev
+        else:
+            with gpytorch.settings.fast_pred_var():
+                pred = self.likelihood(self.gp(xb))
+                mean_n = pred.mean
+                std_n = pred.stddev
+
+        # de-normalize if model has y stats
+        y_mean = getattr(self.model, "y_mean", None)
+        y_std = getattr(self.model, "y_std", None)
+        if isinstance(y_mean, torch.Tensor) and isinstance(y_std, torch.Tensor):
+            mean = mean_n * y_std + y_mean
+            std = std_n * y_std
+        else:
+            mean, std = mean_n, std_n
+
+        mean = mean.detach().float().cpu().view(-1)
+        std = std.detach().float().cpu().view(-1)
+
+        mu_mean, mu_min, mu_max = mean.mean().item(), mean.min().item(), mean.max().item()
+        sd_mean, sd_min, sd_max = std.mean().item(), std.min().item(), std.max().item()
+        return (f"pred| μ(mean/min/max)={mu_mean:.3e}/{mu_min:.3e}/{mu_max:.3e} "
+                f"| σ(mean/min/max)={sd_mean:.3e}/{sd_min:.3e}/{sd_max:.3e}")
 
     def train(self):
         self.model.train()
         self.likelihood.train()
 
+        if self.is_svgp and getattr(self, "warmup_iters", 0) > 0:
+            try:
+                for p in self.gp.covar_module.base_kernel.feature_extractor.parameters():
+                    p.requires_grad_(False)
+            except Exception:
+                pass
+
         for i in range(1, self.num_iters + 1):
-            self.optimizer.zero_grad()
-            output = self.gp(self.train_x)
-            loss = -self.mll(output, self.train_y)
-            loss.backward()
-            self.optimizer.step()
+            if self.is_svgp:
+                self.opt_ngd.zero_grad()
+                self.opt_adam.zero_grad()
+
+                # --------- [MODIFIED] add a bit more jitter for un-whitened SVGP ----------
+                with gpytorch.settings.cholesky_jitter(1e-4):
+                    output = self.gp(self.train_x)
+
+                loss = -self.mll(output, self.train_y)
+
+                # --------- [MODIFIED] optional MAP term if you registered priors ----------
+                if getattr(self, "add_prior_term", False):
+                    prior_term = 0.0
+                    if hasattr(self.gp, "prior_log_prob"):
+                        prior_term += self.gp.prior_log_prob
+                    if hasattr(self.likelihood, "prior_log_prob"):
+                        prior_term += self.likelihood.prior_log_prob
+                    loss = loss - prior_term
+
+                loss.backward()
+
+                # --------- [MODIFIED] clip gradients to stabilize deep-kernel training ----------
+                if getattr(self, "clip_grad", None):
+                    if self.clip_grad and self.clip_grad > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad)
+
+                self.opt_ngd.step()
+                self.opt_adam.step()
+
+                # --------- [MODIFIED] unfreeze feature extractor after warmup ----------
+                if i == getattr(self, "warmup_iters", 0) and self.warmup_iters > 0:
+                    try:
+                        for p in self.gp.covar_module.base_kernel.feature_extractor.parameters():
+                            p.requires_grad_(True)
+                    except Exception:
+                        pass
+            else:
+                self.optimizer.zero_grad()
+                output = self.gp(self.train_x)
+                loss = -self.mll(output, self.train_y)
+                loss.backward()
+                self.optimizer.step()
 
             # if i % self.log_interval == 0 or i == 1 or i == self.num_iters:
             #     print(f"[Iter {i:03d}] Loss: {loss.item():.4f}")
@@ -98,7 +293,18 @@ class GPTrainer:
                     else:
                         noise_str = f"noise(mean/min/max): {n.mean().item():.3e}/{n.min().item():.3e}/{n.max().item():.3e}"
 
-                print(f"[Iter {i:03d}] Loss: {loss.item():.4f} | {ls_str} | {os_str} | {noise_str}")
+                # print(f"[Iter {i:03d}] Loss: {loss.item():.4f} | {ls_str} | {os_str} | {noise_str}")
+
+                # [MODIFIED] feature & BN stats (if we have a feature extractor)
+                feat_str = self._feature_stats_str(sample_k=self.feat_log_sample, k_head=5)
+
+                # [MODIFIED] predictive distribution summary (original y-scale if available)
+                pred_str = self._predictive_stats_str(output=output, sample_k=self.feat_log_sample)
+
+                print(
+                    f"[Iter {i:03d}] Loss: {loss.item():.4f} | {ls_str} | {os_str} | {noise_str} | "
+                    f"{feat_str} | {pred_str}"  # [MODIFIED]
+                )
 
     def evaluate_mse(self, dataset: dc.data.NumpyDataset) -> float:
         self.model.eval()
