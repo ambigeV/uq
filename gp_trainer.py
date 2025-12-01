@@ -177,23 +177,49 @@ class GPTrainer:
     def _predictive_stats_str(self, output=None, sample_k: int = 4096) -> str:
         """
         Summarize predictive distribution on a subset of train_x (mean/std on ORIGINAL y-scale).
+        Handles the ExactGP-in-train-mode restriction by reusing `output` or temporarily
+        switching to eval() for subset predictions.
         """
-        if sample_k < self.train_x.size(0):
-            idx = torch.randperm(self.train_x.size(0), device=self.train_x.device)[:sample_k]
-            xb = self.train_x[idx]
+        N = self.train_x.size(0)
+
+        # choose subset indices (used if we need to subselect later)
+        if sample_k < N:
+            idx = torch.randperm(N, device=self.train_x.device)[:sample_k]
+            xb = self.train_x.index_select(0, idx)
         else:
+            idx = None  # [FIX] remember if we subselected
             xb = self.train_x
 
-        # Reuse output if passed (must correspond to full train_x); otherwise recompute
-        if output is not None and xb.shape[0] == self.train_x.shape[0]:
-            pred = self.likelihood(output)
-            mean_n = pred.mean
-            std_n = pred.stddev
+        # ---------- [FIX] Safe predictive path selection ----------
+        if (not getattr(self, "is_svgp", False)) and self.gp.training:
+            # ExactGP *in training mode* cannot take arbitrary inputs.
+            if (output is not None) and (output.mean.shape[0] == N):
+                # Reuse full-train output; optionally subselect if we sampled
+                mean_n = output.mean
+                std_n = output.stddev
+                if idx is not None:
+                    mean_n = mean_n.index_select(0, idx)
+                    std_n = std_n.index_select(0, idx)
+            else:
+                # Temporarily switch to eval() to do a subset forward safely
+                gp_was_train = self.gp.training
+                lik_was_train = self.likelihood.training
+                self.gp.eval()
+                self.likelihood.eval()
+                with gpytorch.settings.fast_pred_var():
+                    pred = self.likelihood(self.gp(xb))
+                    mean_n = pred.mean
+                    std_n = pred.stddev
+                # restore original modes
+                self.gp.train(gp_was_train)
+                self.likelihood.train(lik_was_train)
         else:
+            # SVGP (OK in train) OR any model already in eval
             with gpytorch.settings.fast_pred_var():
                 pred = self.likelihood(self.gp(xb))
                 mean_n = pred.mean
                 std_n = pred.stddev
+        # ---------------------------------------------------------
 
         # de-normalize if model has y stats
         y_mean = getattr(self.model, "y_mean", None)
