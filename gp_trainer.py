@@ -394,6 +394,10 @@ class EnsembleGPTrainer:
                 num_iters=it.get("num_iters", 100),
                 device=device,
                 log_interval=it.get("log_interval", 10),
+                nn_lr=it.get("nn_lr", 1e-3),
+                ngd_lr=it.get("ngd_lr", 0.02),
+                warmup_iters=it.get("warmup_iters", 0),
+                clip_grad=it.get("clip_grad", 1.0),
             )
             self.trainers.append(trainer)
 

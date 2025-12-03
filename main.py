@@ -63,7 +63,7 @@ def main_nngp_exact(device: str = None):
 
     # 3) Build NNGP (Exact)
     in_dim = X_train_t.shape[1]
-    feat = FeatureNet(in_dim=in_dim, feat_dim=128, hidden=(256, 128), dropout=0.0)
+    feat = FeatureNet(in_dim=in_dim, feat_dim=64, hidden=(128, 64), dropout=0.0)
 
     nngp_exact = GPyTorchRegressor(
         train_x=X_train_t,
@@ -81,9 +81,9 @@ def main_nngp_exact(device: str = None):
         model=nngp_exact,
         train_dataset=train_dc,
         lr=5e-3,               # smaller LR tends to work better for deep kernels (exact GP uses single Adam)
-        num_iters=250,
+        num_iters=300,
         device=dev,
-        log_interval=10,
+        log_interval=40,
     )
     trainer.train()
 
@@ -101,6 +101,115 @@ def main_nngp_exact(device: str = None):
     print("UQ (NNGP-Exact):", uq)
 
 
+def main_nngp_exact_ensemble_all():
+    # ---------------- 1) Load data ----------------
+    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset()
+
+    print("Train X shape:", train_dc.X.shape)
+    N, D = train_dc.X.shape
+    print("Train y shape:", train_dc.y.shape)
+    # 2) Torch tensors
+    X_train_t, y_train_t = _to_torch_xy(train_dc)
+
+    # 3) Build NNGP (Exact)
+    in_dim = X_train_t.shape[1]
+
+    device = "cpu"
+    # 4) Train
+    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ---------------- 2) Build K base models ----------------
+    folds = np.array_split(np.arange(N), 5)
+
+    items = []
+    for i in range(5):
+        # (keeps your current "two-folds per model" split)
+        train_idx_i = np.concatenate([folds[j] for j in [i, (i + 1) % 5]])
+        ds_i = _subset_numpy_dataset(train_dc, train_idx_i)
+
+        X_train_torch = torch.from_numpy(ds_i.X).float()
+        y_np = ds_i.y
+        if y_np.ndim == 2 and y_np.shape[1] == 1:
+            y_np = y_np[:, 0]
+        y_train_torch = torch.from_numpy(y_np).float()
+
+        # Ni = X_train_torch.shape[0]
+        feat = FeatureNet(in_dim=in_dim, feat_dim=64, hidden=(128, 64), dropout=0.0)
+        gp_model_i = GPyTorchRegressor(
+            train_x=X_train_torch,
+            train_y=y_train_torch,
+            normalize_x=False,                        # BatchNorm handles scale
+            gp_model_cls=NNGPExactGPModel,
+            likelihood=gpytorch.likelihoods.GaussianLikelihood(),
+            feature_extractor=feat,
+            kernel="matern52")
+
+        items.append({
+            "model": gp_model_i,
+            "train_dataset": ds_i,
+            "lr": 5e-3,
+            "num_iters": 300,
+            "log_interval": 40,
+        })
+
+    # ---------------- 3) Train ensemble once ----------------
+    ens = EnsembleGPTrainer(items, device="cpu")
+    ens.train()
+    K = len(ens.trainers)
+
+    # ---------------- 4) Loop over weighting strategies ----------------
+    strategies = [
+        # name, kwargs, needs_labels?
+        ("uniform", {}, False),
+        ("precision", {"tau": 1.0}, False),
+        ("mse",       {"l2": 1e-3}, True),
+        ("nll",       {"l2": 1e-3, "dirichlet_alpha": 1.05}, True),
+    ]
+
+    results = []
+    for name, kwargs, _needs_y in strategies:
+        # (a) get weights
+        if name == "uniform":
+            w = np.ones(K, dtype=float) / K
+            print(f"\n[Calib:{name}] Using uniform weights.")
+        else:
+            w = ens.calibrate_weights(valid_dc, method=name, **kwargs)
+            print(f"\n[Calib:{name}] Weights: {np.round(w, 4)}")
+
+        # (b) evaluate on valid/test with these weights
+        valid_mse = ens.evaluate_mse_w(valid_dc, w=w)
+        test_mse  = ens.evaluate_mse_w(test_dc,  w=w)
+        print(f"[{name}] Validation MSE: {valid_mse:.6f}")
+        print(f"[{name}] Test MSE:       {test_mse:.6f}")
+
+        # (c) UQ on test via weighted moment-matched mixture
+        mean_test, lower_test, upper_test = ens.predict_interval_w(test_dc, alpha=0.05, w=w)
+        uq_metrics = evaluate_uq_metrics_from_interval(
+            y_true=test_dc.y,
+            mean=mean_test,
+            lower=lower_test,
+            upper=upper_test,
+            alpha=0.05,
+        )
+        print(f"[{name}] UQ metrics: {uq_metrics}")
+
+        results.append({
+            "name": name,
+            "weights": w,
+            "valid_mse": valid_mse,
+            "test_mse": test_mse,
+            "uq_metrics": uq_metrics,
+        })
+
+    # ---------------- 5) Pretty summary ----------------
+    print("\n===== Summary over weighting strategies =====")
+    for r in results:
+        w_str = " ".join([f"{x:.3f}" for x in r["weights"]])
+        print(f"{r['name']:>9} | valid MSE: {r['valid_mse']:.6f} | test MSE: {r['test_mse']:.6f} | w: [{w_str}]")
+
+    return results
+
+
 def main_nngp_svgp(device: str = None):
     # 1) Load
     tasks, train_dc, valid_dc, test_dc, transformers = load_dataset()
@@ -113,7 +222,7 @@ def main_nngp_svgp(device: str = None):
 
     # 3) Build NNGP (SVGP with learned inducing inputs)
     in_dim = D
-    feat = FeatureNet(in_dim=in_dim, feat_dim=128, hidden=(256, 128), dropout=0.0)
+    feat = FeatureNet(in_dim=in_dim, feat_dim=64, hidden=(128, 64), dropout=0.0)
 
     M = max(256, N // 20)      # e.g., ~5% of data or at least 256 (tune per dataset/capacity)
     nngp_svgp = GPyTorchRegressor(
@@ -140,7 +249,7 @@ def main_nngp_svgp(device: str = None):
         clip_grad=1.0,
         num_iters=500,         # SVGP typically needs more iters
         device=dev,
-        log_interval=10,
+        log_interval=40,
     )
     trainer.train()
 
@@ -156,6 +265,120 @@ def main_nngp_svgp(device: str = None):
         y_true=test_dc.y, mean=mean_t, lower=lo_t, upper=hi_t, alpha=0.05
     )
     print("UQ (NNGP-SVGP):", uq)
+
+
+def main_nngp_svgp_exact_ensemble_all():
+    # ---------------- 1) Load data ----------------
+    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset()
+
+    print("Train X shape:", train_dc.X.shape)
+    N, D = train_dc.X.shape
+    print("Train y shape:", train_dc.y.shape)
+    # 2) Torch tensors
+    X_train_t, y_train_t = _to_torch_xy(train_dc)
+
+    # 3) Build NNGP (Exact)
+    in_dim = X_train_t.shape[1]
+
+    device = "cpu"
+    # 4) Train
+    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ---------------- 2) Build K base models ----------------
+    folds = np.array_split(np.arange(N), 5)
+    M = max(256, N // 20)      # e.g., ~5% of data or at least 256 (tune per dataset/capacity)
+    items = []
+    for i in range(5):
+        # (keeps your current "two-folds per model" split)
+        train_idx_i = np.concatenate([folds[j] for j in [i, (i + 1) % 5]])
+        ds_i = _subset_numpy_dataset(train_dc, train_idx_i)
+
+        X_train_torch = torch.from_numpy(ds_i.X).float()
+        y_np = ds_i.y
+        if y_np.ndim == 2 and y_np.shape[1] == 1:
+            y_np = y_np[:, 0]
+        y_train_torch = torch.from_numpy(y_np).float()
+
+        # Ni = X_train_torch.shape[0]
+        feat = FeatureNet(in_dim=in_dim, feat_dim=64, hidden=(128, 64), dropout=0.0)
+        gp_model_i = GPyTorchRegressor(
+            train_x=X_train_torch,
+            train_y=y_train_torch,
+            normalize_x=False,                        # BatchNorm handles scale
+            gp_model_cls=NNSVGPLearnedInducing,
+            likelihood=gpytorch.likelihoods.GaussianLikelihood(),
+            feature_extractor=feat,
+            num_inducing=M,
+            kernel="matern52")
+
+        items.append({
+            "model": gp_model_i,
+            "train_dataset": ds_i,
+            "lr": 5e-3,
+            "nn_lr": 1e-3,
+            "ngd_lr": 0.02,
+            "warmup_iters": 5,
+            "clip_grad": 1.0,
+            "num_iters": 500,
+            "log_interval": 40,
+        })
+
+    # ---------------- 3) Train ensemble once ----------------
+    ens = EnsembleGPTrainer(items, device="cpu")
+    ens.train()
+    K = len(ens.trainers)
+
+    # ---------------- 4) Loop over weighting strategies ----------------
+    strategies = [
+        # name, kwargs, needs_labels?
+        ("uniform", {}, False),
+        ("precision", {"tau": 1.0}, False),
+        ("mse",       {"l2": 1e-3}, True),
+        ("nll",       {"l2": 1e-3, "dirichlet_alpha": 1.05}, True),
+    ]
+
+    results = []
+    for name, kwargs, _needs_y in strategies:
+        # (a) get weights
+        if name == "uniform":
+            w = np.ones(K, dtype=float) / K
+            print(f"\n[Calib:{name}] Using uniform weights.")
+        else:
+            w = ens.calibrate_weights(valid_dc, method=name, **kwargs)
+            print(f"\n[Calib:{name}] Weights: {np.round(w, 4)}")
+
+        # (b) evaluate on valid/test with these weights
+        valid_mse = ens.evaluate_mse_w(valid_dc, w=w)
+        test_mse  = ens.evaluate_mse_w(test_dc,  w=w)
+        print(f"[{name}] Validation MSE: {valid_mse:.6f}")
+        print(f"[{name}] Test MSE:       {test_mse:.6f}")
+
+        # (c) UQ on test via weighted moment-matched mixture
+        mean_test, lower_test, upper_test = ens.predict_interval_w(test_dc, alpha=0.05, w=w)
+        uq_metrics = evaluate_uq_metrics_from_interval(
+            y_true=test_dc.y,
+            mean=mean_test,
+            lower=lower_test,
+            upper=upper_test,
+            alpha=0.05,
+        )
+        print(f"[{name}] UQ metrics: {uq_metrics}")
+
+        results.append({
+            "name": name,
+            "weights": w,
+            "valid_mse": valid_mse,
+            "test_mse": test_mse,
+            "uq_metrics": uq_metrics,
+        })
+
+    # ---------------- 5) Pretty summary ----------------
+    print("\n===== Summary over weighting strategies =====")
+    for r in results:
+        w_str = " ".join([f"{x:.3f}" for x in r["weights"]])
+        print(f"{r['name']:>9} | valid MSE: {r['valid_mse']:.6f} | test MSE: {r['test_mse']:.6f} | w: [{w_str}]")
+
+    return results
 
 
 def main_gp():
@@ -445,7 +668,10 @@ def main_nn():
 
 
 if __name__ == "__main__":
-    main_svgp_ensemble_all()
+    # main_svgp_ensemble_all()
+    # main_nngp_exact()
+    # main_nngp_exact_ensemble_all()
+    main_nngp_svgp_exact_ensemble_all()
     # main_nn()
     # main_gp()
     # main_svgp()
