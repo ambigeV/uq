@@ -9,31 +9,78 @@ from gp_single import GPyTorchRegressor, SVGPModel, FeatureNet, \
     DeepFeatureKernel, NNGPExactGPModel, NNSVGPLearnedInducing
 from gp_trainer import GPTrainer, EnsembleGPTrainer
 import numpy as np
+import csv
+import random
 
 
-def load_dataset():
-    # FEATURIZER = "coulomb"  # not ECFP -> will flatten (N, A, A) -> (N, A*A)
-    # tasks, datasets, transformers = load_qm7()
-    # tasks, datasets, transformers = load_qm8()
-    #
-    FEATURIZER = "ecfp"  # not ECFP -> will flatten (N, A, A) -> (N, A*A)
-    tasks, datasets, transformers = load_delaney()
-    # tasks, datasets, transformers = load_lipo()
+def set_global_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    # if torch.cuda.is_available():
+    #     torch.cuda.manual_seed_all(seed)
 
-    train_dc, valid_dc, test_dc = prepare_datasets(datasets, featurizer_name=FEATURIZER)
 
+def save_summary_to_csv(all_results, n_runs, out_path: str):
+    rows = []
+    for method, uq_list in all_results.items():
+        if not uq_list:
+            continue
+        metric_names = uq_list[0].keys()
+        row = {"method": method}
+        for m in metric_names:
+            vals = [d[m] for d in uq_list if d[m] is not None]
+            if not vals:
+                continue
+            vals = np.asarray(vals, dtype=float)
+            row[f"{m}_mean"] = float(vals.mean())
+            row[f"{m}_std"]  = float(vals.std(ddof=0))
+        rows.append(row)
+
+    fieldnames = sorted({k for r in rows for k in r.keys()})
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def load_dataset(dataset_name: str = "delaney"):
+    """
+    dataset_name: one of {"qm7", "qm8", "delaney", "lipo"}
+    featurizer_name: "ecfp" or "coulomb" (depending on dataset)
+    """
+    if dataset_name == "qm7":
+        FEATURIZER = "coulomb"
+        tasks, datasets, transformers = load_qm7()
+    elif dataset_name == "qm8":
+        FEATURIZER = "coulomb"
+        tasks, datasets, transformers = load_qm8()
+    elif dataset_name == "delaney":
+        FEATURIZER = "ecfp"
+        tasks, datasets, transformers = load_delaney()
+    elif dataset_name == "lipo":
+        FEATURIZER = "ecfp"
+        tasks, datasets, transformers = load_lipo()
+    else:
+        raise ValueError(f"Unknown dataset_name: {dataset_name}")
+
+    train_dc, valid_dc, test_dc = prepare_datasets(
+        datasets,
+        featurizer_name=FEATURIZER
+    )
+
+    # Keep only first task if multi-task
     if train_dc.y.ndim == 2 and train_dc.y.shape[1] > 1:
         first_task_name = tasks[0]
         tasks = [first_task_name]
 
         def _keep_first_task(ds) -> dc.data.NumpyDataset:
-            # y: (N, T) -> (N, 1) taking the first column
             return dc.data.NumpyDataset(
                 X=ds.X,
                 y=ds.y[:, 0:1],
                 w=ds.w[:, 0:1],
                 ids=ds.ids,
-                n_tasks=1
+                n_tasks=1,
             )
 
         train_dc = _keep_first_task(train_dc)
@@ -52,9 +99,8 @@ def _to_torch_xy(dc_dataset):
     return X_t, y_t
 
 
-def main_nngp_exact(device: str = None):
+def main_nngp_exact(train_dc, valid_dc, test_dc, device: str = None):
     # 1) Load
-    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset()
     print("Train X shape:", train_dc.X.shape)
     print("Train y shape:", train_dc.y.shape)
 
@@ -96,14 +142,15 @@ def main_nngp_exact(device: str = None):
     # 6) UQ (intervals on test)
     mean_t, lo_t, hi_t = trainer.predict_interval(test_dc, alpha=0.05)
     uq = evaluate_uq_metrics_from_interval(
-        y_true=test_dc.y, mean=mean_t, lower=lo_t, upper=hi_t, alpha=0.05
+        y_true=test_dc.y, mean=mean_t, lower=lo_t, upper=hi_t, alpha=0.05, test_error=test_mse,
     )
+
     print("UQ (NNGP-Exact):", uq)
+    return uq
 
 
-def main_nngp_exact_ensemble_all():
+def main_nngp_exact_ensemble_all(train_dc, valid_dc, test_dc, M=5):
     # ---------------- 1) Load data ----------------
-    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset()
 
     print("Train X shape:", train_dc.X.shape)
     N, D = train_dc.X.shape
@@ -119,12 +166,12 @@ def main_nngp_exact_ensemble_all():
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     # ---------------- 2) Build K base models ----------------
-    folds = np.array_split(np.arange(N), 5)
+    folds = np.array_split(np.arange(N), M)
 
     items = []
-    for i in range(5):
+    for i in range(M):
         # (keeps your current "two-folds per model" split)
-        train_idx_i = np.concatenate([folds[j] for j in [i, (i + 1) % 5]])
+        train_idx_i = np.concatenate([folds[j] for j in [i, (i + 1) % M]])
         ds_i = _subset_numpy_dataset(train_dc, train_idx_i)
 
         X_train_torch = torch.from_numpy(ds_i.X).float()
@@ -190,6 +237,7 @@ def main_nngp_exact_ensemble_all():
             lower=lower_test,
             upper=upper_test,
             alpha=0.05,
+            test_error=test_mse,
         )
         print(f"[{name}] UQ metrics: {uq_metrics}")
 
@@ -210,9 +258,7 @@ def main_nngp_exact_ensemble_all():
     return results
 
 
-def main_nngp_svgp(device: str = None):
-    # 1) Load
-    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset()
+def main_nngp_svgp(train_dc, valid_dc, test_dc, device: str = None):
     print("Train X shape:", train_dc.X.shape)
     N, D = train_dc.X.shape
     print("Train y shape:", train_dc.y.shape)
@@ -262,15 +308,13 @@ def main_nngp_svgp(device: str = None):
     # 6) UQ (intervals on test)
     mean_t, lo_t, hi_t = trainer.predict_interval(test_dc, alpha=0.05)
     uq = evaluate_uq_metrics_from_interval(
-        y_true=test_dc.y, mean=mean_t, lower=lo_t, upper=hi_t, alpha=0.05
+        y_true=test_dc.y, mean=mean_t, lower=lo_t, upper=hi_t, alpha=0.05, test_error=test_mse
     )
     print("UQ (NNGP-SVGP):", uq)
+    return uq
 
 
-def main_nngp_svgp_exact_ensemble_all():
-    # ---------------- 1) Load data ----------------
-    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset()
-
+def main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc, E=5):
     print("Train X shape:", train_dc.X.shape)
     N, D = train_dc.X.shape
     print("Train y shape:", train_dc.y.shape)
@@ -285,12 +329,12 @@ def main_nngp_svgp_exact_ensemble_all():
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     # ---------------- 2) Build K base models ----------------
-    folds = np.array_split(np.arange(N), 5)
+    folds = np.array_split(np.arange(N), E)
     M = max(256, N // 20)      # e.g., ~5% of data or at least 256 (tune per dataset/capacity)
     items = []
-    for i in range(5):
+    for i in range(E):
         # (keeps your current "two-folds per model" split)
-        train_idx_i = np.concatenate([folds[j] for j in [i, (i + 1) % 5]])
+        train_idx_i = np.concatenate([folds[j] for j in [i, (i + 1) % E]])
         ds_i = _subset_numpy_dataset(train_dc, train_idx_i)
 
         X_train_torch = torch.from_numpy(ds_i.X).float()
@@ -361,6 +405,7 @@ def main_nngp_svgp_exact_ensemble_all():
             lower=lower_test,
             upper=upper_test,
             alpha=0.05,
+            test_error=test_mse,
         )
         print(f"[{name}] UQ metrics: {uq_metrics}")
 
@@ -381,10 +426,7 @@ def main_nngp_svgp_exact_ensemble_all():
     return results
 
 
-def main_gp():
-    # 1. Load single-task data (QM7 + Coulomb matrices flattened)
-    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset()
-
+def main_gp(train_dc, valid_dc, test_dc):
     print("Train X shape:", train_dc.X.shape)  # (N, D) after flattening
     print("Train y shape:", train_dc.y.shape)  # (N, 1) or (N,)
 
@@ -406,7 +448,7 @@ def main_gp():
         # num_iters=500,
         num_iters=200,
         device="cpu",
-        log_interval=10,
+        log_interval=40,
     )
     trainer.train()
 
@@ -425,14 +467,13 @@ def main_gp():
         lower=lower_test,
         upper=upper_test,
         alpha=0.05,
+        test_error=test_mse,
     )
     print("UQ:", uq_metrics)
+    return uq_metrics
 
 
-def main_svgp():
-    # 1. Load single-task data (same as main_gp)
-    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset()
-
+def main_svgp(train_dc, valid_dc, test_dc):
     print("Train X shape:", train_dc.X.shape)  # (N, D)
     N, D = train_dc.X.shape
     print("Train y shape:", train_dc.y.shape)  # (N, 1) or (N,)
@@ -460,7 +501,7 @@ def main_svgp():
         lr=0.01,           # often a bit smaller LR works better for SVGP
         num_iters=500,     # more iters than exact GP is common; adjust as needed
         device="cpu",
-        log_interval=10,
+        log_interval=40,
     )
     trainer.train()
 
@@ -478,9 +519,10 @@ def main_svgp():
         mean=mean_test,
         lower=lower_test,
         upper=upper_test,
-        alpha=0.05,
+        test_error=test_mse,
     )
-    print("UQ (SVGP):", uq_metrics)
+    print("UQ:", uq_metrics)
+    return uq_metrics
 
 
 def _subset_numpy_dataset(ds: dc.data.NumpyDataset, idx: np.ndarray) -> dc.data.NumpyDataset:
@@ -498,9 +540,7 @@ def _subset_numpy_dataset(ds: dc.data.NumpyDataset, idx: np.ndarray) -> dc.data.
     return dc.data.NumpyDataset(X=X, y=y, w=w, ids=ids)
 
 
-def main_svgp_ensemble():
-    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset()
-
+def main_svgp_ensemble(train_dc, valid_dc, test_dc):
     print("Train X shape:", train_dc.X.shape)
     N, D = train_dc.X.shape
     print("Train y shape:", train_dc.y.shape)
@@ -535,7 +575,7 @@ def main_svgp_ensemble():
             "train_dataset": ds_i,   # trainer will use normalized y internally
             "lr": 0.01,
             "num_iters": 500,
-            "log_interval": 10,
+            "log_interval": 40,
         })
 
     # 4) Train ensemble
@@ -561,10 +601,8 @@ def main_svgp_ensemble():
     print("UQ (SVGP-Ens):", uq_metrics)
 
 
-def main_svgp_ensemble_all():
+def main_svgp_ensemble_all(train_dc, valid_dc, test_dc):
     # ---------------- 1) Load data ----------------
-    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset()
-
     print("Train X shape:", train_dc.X.shape)
     N, D = train_dc.X.shape
     print("Train y shape:", train_dc.y.shape)
@@ -599,7 +637,7 @@ def main_svgp_ensemble_all():
             "train_dataset": ds_i,
             "lr": 0.01,
             "num_iters": 500,
-            "log_interval": 10,
+            "log_interval": 40,
         })
 
     # ---------------- 3) Train ensemble once ----------------
@@ -610,6 +648,7 @@ def main_svgp_ensemble_all():
     # ---------------- 4) Loop over weighting strategies ----------------
     strategies = [
         # name, kwargs, needs_labels?
+        ("uniform", {}, False),
         ("precision", {"tau": 1.0}, False),
         ("mse",       {"l2": 1e-3}, True),
         ("nll",       {"l2": 1e-3, "dirichlet_alpha": 1.05}, True),
@@ -639,6 +678,7 @@ def main_svgp_ensemble_all():
             lower=lower_test,
             upper=upper_test,
             alpha=0.05,
+            test_error=test_mse,
         )
         print(f"[{name}] UQ metrics: {uq_metrics}")
 
@@ -659,19 +699,173 @@ def main_svgp_ensemble_all():
     return results
 
 
-def main_nn():
-    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset()
+def run_once_nn(dataset_name: str,
+                seed: int = 0):
+    """
+    One full run on a given dataset & featurizer with a fixed seed.
+    """
+    set_global_seed(seed)
 
-    train_nn_baseline(train_dc, valid_dc, test_dc)
-    train_nn_mc_dropout(train_dc, valid_dc, test_dc)
-    train_nn_deep_ensemble(train_dc, valid_dc, test_dc)
+    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset(
+        dataset_name=dataset_name
+    )
+
+    print(f"\n=== Run with seed={seed} on dataset={dataset_name}")
+    results = {}
+    if dataset_name not in ["qm8"]:
+        results["nn_baseline"] = train_nn_baseline(train_dc, valid_dc, test_dc)
+    results["nn_mc_dropout"] = train_nn_mc_dropout(train_dc, valid_dc, test_dc)
+    results["nn_deep_ensemble"] = train_nn_deep_ensemble(train_dc, valid_dc, test_dc)
+
+    return results
+
+
+def main_nn(dataset_name: str = "delaney",
+            n_runs: int = 5,
+            base_seed: int = 0):
+
+    all_results = {}
+
+    for run_idx in range(n_runs):
+        seed = base_seed + run_idx
+        run_res = run_once_nn(dataset_name=dataset_name, seed=seed)
+        for method, uq_dict in run_res.items():
+            all_results.setdefault(method, []).append(uq_dict)
+
+    # Aggregate: per method, per metric → mean & std
+    print("\n===== Aggregated results over", n_runs, "runs =====")
+    for method, uq_list in all_results.items():
+        print(f"\n### Method: {method}")
+        if not uq_list:
+            print("  (no results)")
+            continue
+
+        # assume all dicts have same keys
+        metric_names = uq_list[0].keys()
+
+        for m in metric_names:
+            # collect values, ignoring None
+            vals = [d[m] for d in uq_list if d[m] is not None]
+            if not vals:
+                print(f"  {m}: no valid values")
+                continue
+            vals = np.asarray(vals, dtype=float)
+            mean = float(vals.mean())
+            std = float(vals.std(ddof=0))
+            print(f"  {m}: mean={mean:.5g}, std={std:.5g}")
+
+    save_summary_to_csv(all_results, n_runs, "./data/NN_{}.csv".format(dataset_name))
+
+
+def run_once_gp(dataset_name: str,
+                seed: int = 0):
+    """
+    One full run on a given dataset with a fixed seed,
+    running both Exact GP and SVGP in a single shot.
+
+    Analogous to run_once_nn().
+    """
+    set_global_seed(seed)
+
+    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset(
+        dataset_name=dataset_name
+    )
+
+    print(f"\n=== [GP] Run with seed={seed} on dataset={dataset_name}")
+    results = {}
+
+    if dataset_name not in ["qm8"]:
+        results["gp_exact"] = main_gp(train_dc, valid_dc, test_dc)
+        results["gp_nngp"] = main_nngp_exact(train_dc, valid_dc, test_dc)
+
+    results["gp_svgp"] = main_svgp(train_dc, valid_dc, test_dc)
+    results["gp_nnsvgp"] = main_nngp_svgp(train_dc, valid_dc, test_dc)
+
+    result = main_svgp_ensemble_all(train_dc, valid_dc, test_dc)
+    for cur in result:
+        results["svgp_ensemble_{}".format(cur["name"])] = cur["uq_metrics"]
+
+    result = main_nngp_exact_ensemble_all(train_dc, valid_dc, test_dc)
+    for cur in result:
+        results["nngp_ensemble_{}".format(cur["name"])] = cur["uq_metrics"]
+
+    result = main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc)
+    for cur in result:
+        results["nnsvgp_ensemble_{}".format(cur["name"])] = cur["uq_metrics"]
+
+    return results
+
+
+def main_gp_all(dataset_name: str = "delaney",
+                n_runs: int = 5,
+                base_seed: int = 0):
+    """
+    Multi-run driver for GP + SVGP, analogous to main_nn().
+
+    - Calls run_once_gp(...) n_runs times with different seeds.
+    - Aggregates per-method, per-metric mean/std.
+    - Saves a CSV via save_summary_to_csv.
+    """
+    all_results = {}  # method_name -> list[metrics_dict]
+
+    for run_idx in range(n_runs):
+        seed = base_seed + run_idx
+        run_res = run_once_gp(dataset_name=dataset_name, seed=seed)
+
+        for method, uq_dict in run_res.items():
+            all_results.setdefault(method, []).append(uq_dict)
+
+    # Aggregate: per method, per metric → mean & std
+    print("\n===== [GP] Aggregated results over", n_runs, "runs =====")
+    for method, uq_list in all_results.items():
+        print(f"\n### Method: {method}")
+        if not uq_list:
+            print("  (no results)")
+            continue
+
+        metric_names = uq_list[0].keys()
+
+        for m in metric_names:
+            vals = [d[m] for d in uq_list if d[m] is not None]
+            if not vals:
+                print(f"  {m}: no valid values")
+                continue
+            vals = np.asarray(vals, dtype=float)
+            mean = float(vals.mean())
+            std = float(vals.std(ddof=0))
+            print(f"  {m}: mean={mean:.5g}, std={std:.5g}")
+
+    # Reuse the same helper as NN, different filename prefix
+    save_summary_to_csv(
+        all_results,
+        n_runs,
+        "./data/GP_{}.csv".format(dataset_name),
+    )
+
+# if __name__ == "__main__":
+#     # main_svgp_ensemble_all()
+#     # main_nngp_exact()
+#     # main_nngp_exact_ensemble_all()
+#     main_nngp_svgp_exact_ensemble_all()
+#     # main_nn()
+#     # main_gp()
+#     # main_svgp()
 
 
 if __name__ == "__main__":
-    # main_svgp_ensemble_all()
-    # main_nngp_exact()
-    # main_nngp_exact_ensemble_all()
-    # main_nngp_svgp_exact_ensemble_all()
-    main_nn()
-    # main_gp()
-    # main_svgp()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, default="delaney",
+                        choices=["qm7", "qm8", "delaney", "lipo"])
+    parser.add_argument("--n_runs", type=int, default=5)
+    parser.add_argument("--base_seed", type=int, default=0)
+    args = parser.parse_args()
+
+    main_nn(dataset_name=args.dataset,
+            n_runs=args.n_runs,
+            base_seed=args.base_seed)
+    
+    main_gp_all(dataset_name=args.dataset,
+                n_runs=args.n_runs,
+                base_seed=args.base_seed)

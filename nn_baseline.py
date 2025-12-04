@@ -245,7 +245,7 @@ def train_nn_baseline(train_dc, valid_dc, test_dc):
     print("[NN Baseline] Validation MSE:", valid_score[metric.name])
     print("[NN Baseline] Test MSE:",        test_score[metric.name])
 
-    return dc_model
+    return {"MSE": test_score[metric.name]}
 
 
 # ------------------------------
@@ -277,6 +277,7 @@ def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5):
     # Evaluate using ensemble mean
     mean_valid, _, _ = ensemble.predict_interval(valid_dc)
     mean_test,  lower_test, upper_test = ensemble.predict_interval(test_dc)
+    test_error = mse_from_mean_prediction(mean_test,  test_dc)
 
     print("[Deep Ensemble] Validation MSE:", mse_from_mean_prediction(mean_valid, valid_dc))
     print("[Deep Ensemble] Test MSE:",        mse_from_mean_prediction(mean_test,  test_dc))
@@ -287,11 +288,12 @@ def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5):
         lower=lower_test,
         upper=upper_test,
         alpha=0.05,
+        test_error=test_error,
     )
 
     print("UQ (Deep Ensemble):", uq_metrics)
 
-    return ensemble
+    return uq_metrics
 
 
 # ------------------------------
@@ -460,11 +462,14 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05):
         mean=mean_test,
         lower=lower,
         upper=upper,
-        alpha=alpha
+        alpha=alpha,
+        test_error=test_mse
     )
 
-    print(f"Corrected MC Test MSE: {test_mse:.6f}")
-    print(f"Corrected UQ Metrics: {uq_metrics}")
+    print(f"[NN MC-DROPOUT] Test MSE: {test_mse:.6f}")
+    print(f"[NN MC-DROPOUT] UQ Metrics: {uq_metrics}")
+
+    return uq_metrics
 
 
 class MyTorchRegressor(nn.Module):
@@ -506,3 +511,14 @@ def train_nn_baseline(train_dc, valid_dc, test_dc):
 
     print("[NN Baseline] Validation MSE:", valid_scores[metric.name])
     print("[NN Baseline] Test MSE:",      test_scores[metric.name])
+    mse_test = test_scores[metric.name]
+
+    return {
+        "alpha": None,
+        "empirical_coverage": None,
+        "avg_pred_std": None,
+        "nll": None,
+        "ce": None,
+        "spearman_err_unc": None,
+        "MSE": float(mse_test),
+    }

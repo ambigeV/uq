@@ -95,6 +95,7 @@ def evaluate_uq_metrics_from_interval(
     lower,
     upper,
     alpha: float = 0.05,
+    test_error: float = 0,
     ce_p_grid: np.ndarray | None = None,
 ):
     """
@@ -175,6 +176,7 @@ def evaluate_uq_metrics_from_interval(
 
     return {
         "alpha": float(alpha),
+        "MSE": test_error,
         "empirical_coverage": empirical_coverage,
         "avg_pred_std": avg_pred_std,
         "nll": nll,
