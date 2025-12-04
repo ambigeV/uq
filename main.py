@@ -12,12 +12,12 @@ import numpy as np
 
 
 def load_dataset():
-    FEATURIZER = "coulomb"  # not ECFP -> will flatten (N, A, A) -> (N, A*A)
+    # FEATURIZER = "coulomb"  # not ECFP -> will flatten (N, A, A) -> (N, A*A)
     # tasks, datasets, transformers = load_qm7()
-    tasks, datasets, transformers = load_qm8()
+    # tasks, datasets, transformers = load_qm8()
     #
-    # FEATURIZER = "ecfp"  # not ECFP -> will flatten (N, A, A) -> (N, A*A)
-    # tasks, datasets, transformers = load_delaney()
+    FEATURIZER = "ecfp"  # not ECFP -> will flatten (N, A, A) -> (N, A*A)
+    tasks, datasets, transformers = load_delaney()
     # tasks, datasets, transformers = load_lipo()
 
     train_dc, valid_dc, test_dc = prepare_datasets(datasets, featurizer_name=FEATURIZER)
@@ -662,7 +662,7 @@ def main_svgp_ensemble_all():
 def main_nn():
     tasks, train_dc, valid_dc, test_dc, transformers = load_dataset()
 
-    # train_nn_baseline(train_dc, valid_dc, test_dc)
+    train_nn_baseline(train_dc, valid_dc, test_dc)
     train_nn_mc_dropout(train_dc, valid_dc, test_dc)
     train_nn_deep_ensemble(train_dc, valid_dc, test_dc)
 
@@ -671,7 +671,7 @@ if __name__ == "__main__":
     # main_svgp_ensemble_all()
     # main_nngp_exact()
     # main_nngp_exact_ensemble_all()
-    main_nngp_svgp_exact_ensemble_all()
-    # main_nn()
+    # main_nngp_svgp_exact_ensemble_all()
+    main_nn()
     # main_gp()
     # main_svgp()
