@@ -73,9 +73,41 @@ class EvidentialRegressionLoss(Loss):
     and L_R is the evidential regularizer.
     """
 
-    def __init__(self, reg_coeff=1.0, **kwargs):
-        self.reg_coeff = reg_coeff
+    def __init__(self, reg_coeff=1.0, reg_coeff_u=1.0, **kwargs):
+        self.reg_coeff_r = reg_coeff
+        self.reg_coeff_u = reg_coeff_u
         # super(EvidentialRegressionLoss, self).__init__(**kwargs)
+
+    def nig_reg_U_tensor(self, y, gamma, v, alpha, beta):
+
+        log_arg = torch.exp(alpha - 1) - 1
+        
+        # 3. Calculate the log-evidence factor
+        log_factor = torch.log(log_arg)
+        
+        # 4. Calculate the prediction error
+        error_factor = torch.abs(y - gamma)
+        
+        # L_U = -|y - gamma| * log_factor
+        loss_u = -error_factor * log_factor
+        
+        return loss_u
+
+        # # The term nu(alpha - 1) is in the numerator
+        # numerator_factor = v * (alpha - 1)
+        
+        # # The term beta(nu + 1) is in the denominator
+        # denominator_factor = beta * (v + 1)
+        
+        # # Calculate the inverse of Total Uncertainty
+        # inv_total_unc = numerator_factor / denominator_factor
+        
+        # # L_U = (y - gamma)^2 * (Inverse of Total Uncertainty) 
+        # squared_error = (y - gamma) ** 2
+        
+        # loss_u = squared_error * inv_total_unc
+        
+        # return loss_u
 
     def nig_nll_tensor(self, y, gamma, v, alpha, beta):
         twoBlambda = 2 * beta * (1 + v)
@@ -115,8 +147,10 @@ class EvidentialRegressionLoss(Loss):
             # 3. Compute Loss R: Evidential Regularizer
             loss_reg_elem = self.nig_reg_tensor(labels, gamma, v, alpha)
 
+            loss_u = self.nig_reg_U_tensor(labels, gamma, v, alpha, beta)
+
             # 4. Total Loss L = L_NLL + lambda * L_R
-            loss_elem = loss_nll_elem + self.reg_coeff * loss_reg_elem  # (B, T)
+            loss_elem = loss_nll_elem + self.reg_coeff_r * loss_reg_elem + self.reg_coeff_u * loss_u  # (B, T)
 
             # mean over tasks → shape (B,) (per-sample)
             loss_per_sample = torch.mean(loss_elem, dim=-1)
@@ -134,10 +168,10 @@ class DenseNormalGamma(nn.Module):
         # self.dense = nn.Linear(self.in_dim, 4 * self.out_dim)
 
         self.dense = nn.Sequential(
+            # nn.Linear(self.in_dim, 128),
+            # nn.ReLU(),
             nn.Linear(self.in_dim, 64),
             nn.ReLU(),
-            # nn.Linear(128, 64),
-            # nn.ReLU(),
             nn.Linear(64, 4 * self.out_dim),
         )
 
@@ -153,7 +187,7 @@ class DenseNormalGamma(nn.Module):
         v = self.evidence(logv)
         v = torch.clamp(v, min=eps)
         alpha = self.evidence(logalpha) + 1
-        alpha = torch.clamp(alpha, min=eps, max=MAX_ALPHA)
+        alpha = torch.clamp(alpha, min=eps + 1, max=MAX_ALPHA)
         beta = self.evidence(logbeta)
         beta = torch.clamp(beta, min=eps)
 
@@ -593,7 +627,7 @@ class GradientClippingCallback:
 # dc_model.fit(train_dc, nb_epoch=100, callbacks=[clip_callback])
 
 
-def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1.00, alpha=0.05, run_id=0):
+def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run_id=0):
     """
     Train Deep Evidential Regression (DER) NN and:
       - compute MSE with the analytical mean prediction (gamma)
@@ -651,11 +685,12 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1.00, alpha=0.05, 
     # The total predictive variance Var[y] is the sum of aleatoric and epistemic variance.
     # Var[y] = E[sigma^2] + Var[mu]
     total_var_test = aleatoric_test.cpu().numpy() + epistemic_test.cpu().numpy()
+    print(params_test.cpu().numpy())
     std_test = np.sqrt(total_var_test)
 
     # --- 4. Calculate MSE (using the deterministic mean prediction, gamma) ---
     # Ensure prediction shape matches for MSE calculation
-    mu_test = mu_test.cpu()
+    mu_test = mu_test.cpu().numpy()
     if mu_test.ndim == 1:
         mu_test = mu_test.reshape(-1, 1)
 

@@ -755,7 +755,7 @@ def main_nn(dataset_name: str = "delaney",
             std = float(vals.std(ddof=0))
             print(f"  {m}: mean={mean:.5g}, std={std:.5g}")
 
-    save_summary_to_csv(all_results, n_runs, "./data/NN_evd_{}.csv".format(dataset_name))
+    save_summary_to_csv(all_results, n_runs, "./data/NN_evd_uloss_{}.csv".format(dataset_name))
 
 
 def run_once_gp(dataset_name: str,
