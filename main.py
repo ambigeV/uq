@@ -1,6 +1,6 @@
 import deepchem as dc
 from data_utils import prepare_datasets, evaluate_uq_metrics_from_interval
-from nn_baseline import train_nn_baseline, train_nn_deep_ensemble, train_nn_mc_dropout
+from nn_baseline import train_nn_baseline, train_nn_deep_ensemble, train_nn_mc_dropout, train_evd_baseline
 from deepchem.molnet import load_qm7, load_delaney, load_qm8, load_qm9, load_lipo, load_freesolv
 
 import torch
@@ -712,10 +712,11 @@ def run_once_nn(dataset_name: str,
 
     print(f"\n=== Run with seed={seed} on dataset={dataset_name}")
     results = {}
-    if dataset_name not in ["qm8"]:
-        results["nn_baseline"] = train_nn_baseline(train_dc, valid_dc, test_dc)
-    results["nn_mc_dropout"] = train_nn_mc_dropout(train_dc, valid_dc, test_dc)
-    results["nn_deep_ensemble"] = train_nn_deep_ensemble(train_dc, valid_dc, test_dc)
+    results["nn_evd"] = train_evd_baseline(train_dc, valid_dc, test_dc)
+    # if dataset_name not in ["qm8"]:
+    #     results["nn_baseline"] = train_nn_baseline(train_dc, valid_dc, test_dc)
+    # results["nn_mc_dropout"] = train_nn_mc_dropout(train_dc, valid_dc, test_dc)
+    # results["nn_deep_ensemble"] = train_nn_deep_ensemble(train_dc, valid_dc, test_dc)
 
     return results
 
@@ -754,7 +755,7 @@ def main_nn(dataset_name: str = "delaney",
             std = float(vals.std(ddof=0))
             print(f"  {m}: mean={mean:.5g}, std={std:.5g}")
 
-    save_summary_to_csv(all_results, n_runs, "./data/NN_{}.csv".format(dataset_name))
+    save_summary_to_csv(all_results, n_runs, "./data/NN_evd_{}.csv".format(dataset_name))
 
 
 def run_once_gp(dataset_name: str,
@@ -866,6 +867,6 @@ if __name__ == "__main__":
             n_runs=args.n_runs,
             base_seed=args.base_seed)
     
-    main_gp_all(dataset_name=args.dataset,
-                n_runs=args.n_runs,
-                base_seed=args.base_seed)
+    # main_gp_all(dataset_name=args.dataset,
+    #             n_runs=args.n_runs,
+    #             base_seed=args.base_seed)
