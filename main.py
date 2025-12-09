@@ -717,7 +717,6 @@ def run_once_nn(dataset_name: str,
     #     results["nn_baseline"] = train_nn_baseline(train_dc, valid_dc, test_dc)
     # results["nn_mc_dropout"] = train_nn_mc_dropout(train_dc, valid_dc, test_dc)
     # results["nn_deep_ensemble"] = train_nn_deep_ensemble(train_dc, valid_dc, test_dc)
-
     return results
 
 

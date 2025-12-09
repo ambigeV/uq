@@ -73,41 +73,41 @@ class EvidentialRegressionLoss(Loss):
     and L_R is the evidential regularizer.
     """
 
-    def __init__(self, reg_coeff=1.0, reg_coeff_u=1.0, **kwargs):
+    def __init__(self, reg_coeff=0.01, reg_coeff_u=0, **kwargs):
         self.reg_coeff_r = reg_coeff
         self.reg_coeff_u = reg_coeff_u
         # super(EvidentialRegressionLoss, self).__init__(**kwargs)
 
     def nig_reg_U_tensor(self, y, gamma, v, alpha, beta):
 
-        log_arg = torch.exp(alpha - 1) - 1
+        # log_arg = torch.exp(alpha - 1) - 1
+        #
+        # # 3. Calculate the log-evidence factor
+        # log_factor = torch.log(log_arg)
+        #
+        # # 4. Calculate the prediction error
+        # error_factor = torch.abs(y - gamma)
+        #
+        # # L_U = -|y - gamma| * log_factor
+        # loss_u = -error_factor * log_factor
+        #
+        # return loss_u
+
+        # The term nu(alpha - 1) is in the numerator
+        numerator_factor = v * (alpha - 1)
         
-        # 3. Calculate the log-evidence factor
-        log_factor = torch.log(log_arg)
+        # The term beta(nu + 1) is in the denominator
+        denominator_factor = beta * (v + 1)
         
-        # 4. Calculate the prediction error
-        error_factor = torch.abs(y - gamma)
+        # Calculate the inverse of Total Uncertainty
+        inv_total_unc = numerator_factor / denominator_factor
         
-        # L_U = -|y - gamma| * log_factor
-        loss_u = -error_factor * log_factor
+        # L_U = (y - gamma)^2 * (Inverse of Total Uncertainty)
+        squared_error = (y - gamma) ** 2
+        
+        loss_u = squared_error * inv_total_unc
         
         return loss_u
-
-        # # The term nu(alpha - 1) is in the numerator
-        # numerator_factor = v * (alpha - 1)
-        
-        # # The term beta(nu + 1) is in the denominator
-        # denominator_factor = beta * (v + 1)
-        
-        # # Calculate the inverse of Total Uncertainty
-        # inv_total_unc = numerator_factor / denominator_factor
-        
-        # # L_U = (y - gamma)^2 * (Inverse of Total Uncertainty) 
-        # squared_error = (y - gamma) ** 2
-        
-        # loss_u = squared_error * inv_total_unc
-        
-        # return loss_u
 
     def nig_nll_tensor(self, y, gamma, v, alpha, beta):
         twoBlambda = 2 * beta * (1 + v)
@@ -165,15 +165,15 @@ class DenseNormalGamma(nn.Module):
         self.in_dim = int(in_dim)
         self.out_dim = int(out_dim)
 
-        # self.dense = nn.Linear(self.in_dim, 4 * self.out_dim)
+        self.dense = nn.Linear(self.in_dim, 4 * self.out_dim)
 
-        self.dense = nn.Sequential(
-            # nn.Linear(self.in_dim, 128),
-            # nn.ReLU(),
-            nn.Linear(self.in_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 4 * self.out_dim),
-        )
+        # self.dense = nn.Sequential(
+        #     # nn.Linear(self.in_dim, 128),
+        #     # nn.ReLU(),
+        #     nn.Linear(self.in_dim, 64),
+        #     nn.ReLU(),
+        #     nn.Linear(64, 4 * self.out_dim),
+        # )
 
     def evidence(self, x):
         return F.softplus(x)
