@@ -167,6 +167,32 @@ class DenseNormalGamma(nn.Module):
 
         self.dense = nn.Linear(self.in_dim, 4 * self.out_dim)
 
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+
+        # Define the dimensions for the hidden layers
+        HIDDEN_DIM_1 = 128
+        HIDDEN_DIM_2 = 64
+
+        self.dense = nn.Sequential(
+            # --- Layer 1: in_dim -> HIDDEN_DIM_1 (e.g., 128) ---
+            nn.Linear(self.in_dim, HIDDEN_DIM_1),
+            # Add BatchNorm *before* the activation for the first hidden layer
+            nn.BatchNorm1d(HIDDEN_DIM_1), 
+            nn.ReLU(),
+            
+            # --- Layer 2: HIDDEN_DIM_1 -> HIDDEN_DIM_2 (e.g., 64) ---
+            nn.Linear(HIDDEN_DIM_1, HIDDEN_DIM_2),
+            # Add BatchNorm *before* the activation for the second hidden layer
+            nn.BatchNorm1d(HIDDEN_DIM_2), 
+            nn.ReLU(),
+            
+            # --- Output Layer: HIDDEN_DIM_2 -> 4 * out_dim ---
+            # No BatchNorm needed here, as the output is directly passed for 
+            # parameter splitting and transformation (softplus)
+            nn.Linear(HIDDEN_DIM_2, 4 * self.out_dim),
+        )
+
         # self.dense = nn.Sequential(
         #     # nn.Linear(self.in_dim, 128),
         #     # nn.ReLU(),
