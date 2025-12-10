@@ -123,7 +123,7 @@ def main_nngp_exact(train_dc, valid_dc, test_dc, device: str = "cpu", run_id=0):
     )
 
     # 4) Train
-    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    dev = "cpu"
     trainer = GPTrainer(
         model=nngp_exact,
         train_dataset=train_dc,
@@ -289,7 +289,7 @@ def main_nngp_svgp(train_dc, valid_dc, test_dc, device: str = "cpu", run_id=0):
     )
 
     # 4) Train (SVGP branch uses NGD(q) + Adam(others) in your GPTrainer)
-    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    dev = "cpu"
     trainer = GPTrainer(
         model=nngp_svgp,
         train_dataset=train_dc,
@@ -332,7 +332,7 @@ def main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc, E=5, run_id=0
 
     device = "cpu"
     # 4) Train
-    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    dev = device
 
     # ---------------- 2) Build K base models ----------------
     folds = np.array_split(np.arange(N), E)
@@ -936,12 +936,14 @@ if __name__ == "__main__":
                         choices=["random", "scaffold"])
     args = parser.parse_args()
 
-    main_nn(dataset_name=args.dataset,
-            n_runs=args.n_runs,
-            split=args.split,
-            base_seed=args.base_seed)
+    
     
     main_gp_all(dataset_name=args.dataset,
                 n_runs=args.n_runs,
                 split=args.split,
                 base_seed=args.base_seed)
+    
+    main_nn(dataset_name=args.dataset,
+            n_runs=args.n_runs,
+            split=args.split,
+            base_seed=args.base_seed)
