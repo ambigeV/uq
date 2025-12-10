@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import deepchem as dc
 from scipy.stats import norm
-from data_utils import evaluate_uq_metrics_from_interval
+from data_utils import evaluate_uq_metrics_from_interval, calculate_cutoff_error_data
 from deepchem.models.losses import Loss, _make_pytorch_shapes_consistent
 
 
@@ -364,38 +364,38 @@ class DeepEnsembleRegressor:
 # ------------------------------
 # Baseline NN (no UQ)
 # ------------------------------
-def train_nn_baseline(train_dc, valid_dc, test_dc):
-    n_tasks = train_dc.y.shape[1]
-    n_features = train_dc.X.shape[1]
+# def train_nn_baseline(train_dc, valid_dc, test_dc):
+#     n_tasks = train_dc.y.shape[1]
+#     n_features = train_dc.X.shape[1]
 
-    model = MyTorchRegressor(n_features, n_tasks)
-    loss = dc.models.losses.L2Loss()
+#     model = MyTorchRegressor(n_features, n_tasks)
+#     loss = dc.models.losses.L2Loss()
 
-    dc_model = dc.models.TorchModel(
-        model=model,
-        loss=loss,
-        output_types=['prediction'],
-        batch_size=64,
-        learning_rate=1e-3,
-        mode='regression',
-    )
+#     dc_model = dc.models.TorchModel(
+#         model=model,
+#         loss=loss,
+#         output_types=['prediction'],
+#         batch_size=64,
+#         learning_rate=1e-3,
+#         mode='regression',
+#     )
 
-    dc_model.fit(train_dc, nb_epoch=30)
+#     dc_model.fit(train_dc, nb_epoch=30)
 
-    metric = dc.metrics.Metric(dc.metrics.mean_squared_error)
-    valid_score = dc_model.evaluate(valid_dc, [metric])
-    test_score  = dc_model.evaluate(test_dc,  [metric])
+#     metric = dc.metrics.Metric(dc.metrics.mean_squared_error)
+#     valid_score = dc_model.evaluate(valid_dc, [metric])
+#     test_score  = dc_model.evaluate(test_dc,  [metric])
 
-    print("[NN Baseline] Validation MSE:", valid_score[metric.name])
-    print("[NN Baseline] Test MSE:",        test_score[metric.name])
+#     print("[NN Baseline] Validation MSE:", valid_score[metric.name])
+#     print("[NN Baseline] Test MSE:",        test_score[metric.name])
 
-    return {"MSE": test_score[metric.name]}
+#     return {"MSE": test_score[metric.name]}
 
 
 # ------------------------------
 # Deep Ensemble
 # ------------------------------
-def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5):
+def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0):
     n_tasks = train_dc.y.shape[1]
     n_features = train_dc.X.shape[1]
 
@@ -421,6 +421,7 @@ def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5):
     # Evaluate using ensemble mean
     mean_valid, _, _ = ensemble.predict_interval(valid_dc)
     mean_test,  lower_test, upper_test = ensemble.predict_interval(test_dc)
+    cutoff_error_df = calculate_cutoff_error_data(mean_test, upper_test-lower_test, test_dc.y)
     test_error = mse_from_mean_prediction(mean_test,  test_dc)
 
     print("[Deep Ensemble] Validation MSE:", mse_from_mean_prediction(mean_valid, valid_dc))
@@ -437,7 +438,7 @@ def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5):
 
     print("UQ (Deep Ensemble):", uq_metrics)
 
-    return uq_metrics
+    return uq_metrics, cutoff_error_df
 
 
 # ------------------------------
@@ -551,7 +552,7 @@ class MCDropoutRegressorRefined:
         return mean_pred, total_std
 
 
-def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05):
+def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, run_id=0):
     """
     Train heteroscedastic MC-dropout NN and:
       - compute MSE with deterministic predictions (eval mode, no dropout)
@@ -587,6 +588,7 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05):
     if mean_test.ndim == 1:
         mean_test = mean_test.reshape(-1, 1)
 
+    cutoff_error_df = calculate_cutoff_error_data(mean_test, std_test, test_dc.y)
     # Calculate MSE (Should now be ~0.67)
     test_mse = mse_from_mean_prediction(mean_test, test_dc)
 
@@ -613,7 +615,7 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05):
     print(f"[NN MC-DROPOUT] Test MSE: {test_mse:.6f}")
     print(f"[NN MC-DROPOUT] UQ Metrics: {uq_metrics}")
 
-    return uq_metrics
+    return uq_metrics, cutoff_error_df
 
 
 class GradientClippingCallback:
@@ -711,7 +713,6 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
     # The total predictive variance Var[y] is the sum of aleatoric and epistemic variance.
     # Var[y] = E[sigma^2] + Var[mu]
     total_var_test = aleatoric_test.cpu().numpy() + epistemic_test.cpu().numpy()
-    print(params_test.cpu().numpy())
     std_test = np.sqrt(total_var_test)
 
     # --- 4. Calculate MSE (using the deterministic mean prediction, gamma) ---
@@ -719,6 +720,8 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
     mu_test = mu_test.cpu().numpy()
     if mu_test.ndim == 1:
         mu_test = mu_test.reshape(-1, 1)
+
+    cutoff_error_df = calculate_cutoff_error_data(mu_test, total_var_test, test_dc.y)
 
     test_mse = mse_from_mean_prediction(mu_test, test_dc)
 
@@ -745,7 +748,7 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
     print(f"\n[EVIDENTIAL REGRESSION] Test MSE: {test_mse:.6f}")
     print(f"[EVIDENTIAL REGRESSION] UQ Metrics: {uq_metrics}")
 
-    return uq_metrics
+    return uq_metrics, cutoff_error_df
 
 
 class MyTorchRegressor(nn.Module):
@@ -763,7 +766,7 @@ class MyTorchRegressor(nn.Module):
         return self.net(x)
 
 
-def train_nn_baseline(train_dc, valid_dc, test_dc):
+def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0):
     n_tasks = train_dc.y.shape[1]
     n_features = train_dc.X.shape[1]
 

@@ -1,6 +1,12 @@
 # data_utils.py
 import deepchem as dc
 from typing import Tuple
+import math
+import numpy as np
+import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_squared_error
+
 
 def _flatten_if_needed(dataset: dc.data.NumpyDataset) -> dc.data.NumpyDataset:
     """
@@ -43,8 +49,63 @@ def prepare_datasets(
         test = _flatten_if_needed(test)
         return train, valid, test
 
-import math
-import numpy as np
+
+def calculate_cutoff_error_data(mean_test, var_test, y_true):
+    """
+    Calculates the Root Mean Squared Error (RMSE) for subsets of the data
+    based on confidence percentile cutoffs (lowest variance first).
+
+    Args:
+        mean_test (np.ndarray): The model's mean predictions (gamma).
+        var_test (np.ndarray): The total predictive variance (aleatoric + epistemic).
+        y_true (np.ndarray): The true ground truth labels.
+
+    Returns:
+        pd.DataFrame: A DataFrame with columns 'Confidence_Cutoff'
+                      (fraction of data kept, sorted by confidence) and 'RMSE'.
+    """
+    # 1. Combine data into a DataFrame for easy handling
+    # Flattens all arrays to 1D, assuming aggregation over tasks if multi-task.
+    mean_test = mean_test.flatten()
+    var_test = var_test.flatten()
+    y_true = y_true.flatten()
+    
+    data = pd.DataFrame({
+        'y_true': y_true,
+        'y_pred': mean_test,
+        'uncertainty': var_test
+    })
+
+    # 2. Sort by uncertainty (Total Variance) in ascending order (Highest Confidence first)
+    data = data.sort_values(by='uncertainty', ascending=True).reset_index(drop=True)
+    
+    N = len(data)
+    
+    # 3. Define cutoff points (fractions of the data to include: 0.05, 0.10, ..., 1.00)
+    cutoffs = np.arange(0.05, 1.05, 0.05)
+    
+    results = []
+    
+    # 4. Iterate through cutoffs and calculate error
+    for cutoff_fraction in cutoffs:
+        # Determine the number of top confident samples to keep
+        n_keep = int(np.ceil(N * cutoff_fraction))
+        
+        # Select the top n_keep most confident samples
+        subset = data.iloc[:n_keep]
+        
+        # Calculate RMSE for the subset
+        mse = mean_squared_error(subset['y_true'], subset['y_pred'])
+        rmse = np.sqrt(mse)
+        
+        results.append({
+            'Confidence_Cutoff': cutoff_fraction,
+            'RMSE': rmse,
+            'MSE': mse,
+            'N_Samples': n_keep
+        })
+
+    return pd.DataFrame(results)
 
 
 def _to_1d(a):

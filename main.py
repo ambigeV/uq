@@ -8,6 +8,7 @@ import gpytorch
 from gp_single import GPyTorchRegressor, SVGPModel, FeatureNet, \
     DeepFeatureKernel, NNGPExactGPModel, NNSVGPLearnedInducing
 from gp_trainer import GPTrainer, EnsembleGPTrainer
+from data_utils import calculate_cutoff_error_data
 import numpy as np
 import csv
 import random
@@ -44,23 +45,23 @@ def save_summary_to_csv(all_results, n_runs, out_path: str):
         writer.writerows(rows)
 
 
-def load_dataset(dataset_name: str = "delaney"):
+def load_dataset(dataset_name: str = "delaney", split: str = "random"):
     """
     dataset_name: one of {"qm7", "qm8", "delaney", "lipo"}
     featurizer_name: "ecfp" or "coulomb" (depending on dataset)
     """
     if dataset_name == "qm7":
         FEATURIZER = "coulomb"
-        tasks, datasets, transformers = load_qm7()
+        tasks, datasets, transformers = load_qm7(splitter=split)
     elif dataset_name == "qm8":
         FEATURIZER = "coulomb"
-        tasks, datasets, transformers = load_qm8()
+        tasks, datasets, transformers = load_qm8(splitter=split)
     elif dataset_name == "delaney":
         FEATURIZER = "ecfp"
-        tasks, datasets, transformers = load_delaney()
+        tasks, datasets, transformers = load_delaney(splitter=split)
     elif dataset_name == "lipo":
         FEATURIZER = "ecfp"
-        tasks, datasets, transformers = load_lipo()
+        tasks, datasets, transformers = load_lipo(splitter=split)
     else:
         raise ValueError(f"Unknown dataset_name: {dataset_name}")
 
@@ -99,7 +100,7 @@ def _to_torch_xy(dc_dataset):
     return X_t, y_t
 
 
-def main_nngp_exact(train_dc, valid_dc, test_dc, device: str = None):
+def main_nngp_exact(train_dc, valid_dc, test_dc, device: str = "cpu", run_id=0):
     # 1) Load
     print("Train X shape:", train_dc.X.shape)
     print("Train y shape:", train_dc.y.shape)
@@ -141,15 +142,16 @@ def main_nngp_exact(train_dc, valid_dc, test_dc, device: str = None):
 
     # 6) UQ (intervals on test)
     mean_t, lo_t, hi_t = trainer.predict_interval(test_dc, alpha=0.05)
+    cutoff_error_df = calculate_cutoff_error_data(mean_t, hi_t-lo_t, test_dc.y)
     uq = evaluate_uq_metrics_from_interval(
         y_true=test_dc.y, mean=mean_t, lower=lo_t, upper=hi_t, alpha=0.05, test_error=test_mse,
     )
 
     print("UQ (NNGP-Exact):", uq)
-    return uq
+    return uq, cutoff_error_df
 
 
-def main_nngp_exact_ensemble_all(train_dc, valid_dc, test_dc, M=5):
+def main_nngp_exact_ensemble_all(train_dc, valid_dc, test_dc, M=5, run_id=0):
     # ---------------- 1) Load data ----------------
 
     print("Train X shape:", train_dc.X.shape)
@@ -214,6 +216,7 @@ def main_nngp_exact_ensemble_all(train_dc, valid_dc, test_dc, M=5):
     ]
 
     results = []
+    cut_offs = []
     for name, kwargs, _needs_y in strategies:
         # (a) get weights
         if name == "uniform":
@@ -231,6 +234,7 @@ def main_nngp_exact_ensemble_all(train_dc, valid_dc, test_dc, M=5):
 
         # (c) UQ on test via weighted moment-matched mixture
         mean_test, lower_test, upper_test = ens.predict_interval_w(test_dc, alpha=0.05, w=w)
+        cutoff_error_df = calculate_cutoff_error_data(mean_test, upper_test - lower_test, test_dc.y)
         uq_metrics = evaluate_uq_metrics_from_interval(
             y_true=test_dc.y,
             mean=mean_test,
@@ -239,6 +243,7 @@ def main_nngp_exact_ensemble_all(train_dc, valid_dc, test_dc, M=5):
             alpha=0.05,
             test_error=test_mse,
         )
+        cut_offs.append(cutoff_error_df)
         print(f"[{name}] UQ metrics: {uq_metrics}")
 
         results.append({
@@ -255,10 +260,10 @@ def main_nngp_exact_ensemble_all(train_dc, valid_dc, test_dc, M=5):
         w_str = " ".join([f"{x:.3f}" for x in r["weights"]])
         print(f"{r['name']:>9} | valid MSE: {r['valid_mse']:.6f} | test MSE: {r['test_mse']:.6f} | w: [{w_str}]")
 
-    return results
+    return results, cut_offs
 
 
-def main_nngp_svgp(train_dc, valid_dc, test_dc, device: str = None):
+def main_nngp_svgp(train_dc, valid_dc, test_dc, device: str = "cpu", run_id=0):
     print("Train X shape:", train_dc.X.shape)
     N, D = train_dc.X.shape
     print("Train y shape:", train_dc.y.shape)
@@ -307,14 +312,15 @@ def main_nngp_svgp(train_dc, valid_dc, test_dc, device: str = None):
 
     # 6) UQ (intervals on test)
     mean_t, lo_t, hi_t = trainer.predict_interval(test_dc, alpha=0.05)
+    cutoff_error_df = calculate_cutoff_error_data(mean_t, hi_t-lo_t, test_dc.y)
     uq = evaluate_uq_metrics_from_interval(
         y_true=test_dc.y, mean=mean_t, lower=lo_t, upper=hi_t, alpha=0.05, test_error=test_mse
     )
     print("UQ (NNGP-SVGP):", uq)
-    return uq
+    return uq, cutoff_error_df
 
 
-def main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc, E=5):
+def main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc, E=5, run_id=0):
     print("Train X shape:", train_dc.X.shape)
     N, D = train_dc.X.shape
     print("Train y shape:", train_dc.y.shape)
@@ -382,6 +388,7 @@ def main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc, E=5):
     ]
 
     results = []
+    cut_offs = []
     for name, kwargs, _needs_y in strategies:
         # (a) get weights
         if name == "uniform":
@@ -399,6 +406,8 @@ def main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc, E=5):
 
         # (c) UQ on test via weighted moment-matched mixture
         mean_test, lower_test, upper_test = ens.predict_interval_w(test_dc, alpha=0.05, w=w)
+        cutoff_error_df = calculate_cutoff_error_data(mean_test, upper_test-lower_test, test_dc.y)
+        cut_offs.append(cutoff_error_df)
         uq_metrics = evaluate_uq_metrics_from_interval(
             y_true=test_dc.y,
             mean=mean_test,
@@ -423,10 +432,10 @@ def main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc, E=5):
         w_str = " ".join([f"{x:.3f}" for x in r["weights"]])
         print(f"{r['name']:>9} | valid MSE: {r['valid_mse']:.6f} | test MSE: {r['test_mse']:.6f} | w: [{w_str}]")
 
-    return results
+    return results, cut_offs
 
 
-def main_gp(train_dc, valid_dc, test_dc):
+def main_gp(train_dc, valid_dc, test_dc, run_id=0):
     print("Train X shape:", train_dc.X.shape)  # (N, D) after flattening
     print("Train y shape:", train_dc.y.shape)  # (N, 1) or (N,)
 
@@ -460,6 +469,7 @@ def main_gp(train_dc, valid_dc, test_dc):
 
     # 5. Get uncertainty intervals on test set
     mean_test, lower_test, upper_test = trainer.predict_interval(test_dc, alpha=0.05)
+    cutoff_error_df = calculate_cutoff_error_data(mean_test, upper_test-lower_test, test_dc.y)
 
     uq_metrics = evaluate_uq_metrics_from_interval(
         y_true=test_dc.y,
@@ -470,10 +480,10 @@ def main_gp(train_dc, valid_dc, test_dc):
         test_error=test_mse,
     )
     print("UQ:", uq_metrics)
-    return uq_metrics
+    return uq_metrics, cutoff_error_df
 
 
-def main_svgp(train_dc, valid_dc, test_dc):
+def main_svgp(train_dc, valid_dc, test_dc, run_id=0):
     print("Train X shape:", train_dc.X.shape)  # (N, D)
     N, D = train_dc.X.shape
     print("Train y shape:", train_dc.y.shape)  # (N, 1) or (N,)
@@ -513,6 +523,7 @@ def main_svgp(train_dc, valid_dc, test_dc):
 
     # 5. Get uncertainty intervals on test set
     mean_test, lower_test, upper_test = trainer.predict_interval(test_dc, alpha=0.05)
+    cutoff_error_df = calculate_cutoff_error_data(mean_test, upper_test-lower_test, test_dc.y)
 
     uq_metrics = evaluate_uq_metrics_from_interval(
         y_true=test_dc.y,
@@ -522,7 +533,7 @@ def main_svgp(train_dc, valid_dc, test_dc):
         test_error=test_mse,
     )
     print("UQ:", uq_metrics)
-    return uq_metrics
+    return uq_metrics, cutoff_error_df
 
 
 def _subset_numpy_dataset(ds: dc.data.NumpyDataset, idx: np.ndarray) -> dc.data.NumpyDataset:
@@ -540,7 +551,7 @@ def _subset_numpy_dataset(ds: dc.data.NumpyDataset, idx: np.ndarray) -> dc.data.
     return dc.data.NumpyDataset(X=X, y=y, w=w, ids=ids)
 
 
-def main_svgp_ensemble(train_dc, valid_dc, test_dc):
+def main_svgp_ensemble(train_dc, valid_dc, test_dc, run_id=0):
     print("Train X shape:", train_dc.X.shape)
     N, D = train_dc.X.shape
     print("Train y shape:", train_dc.y.shape)
@@ -601,7 +612,7 @@ def main_svgp_ensemble(train_dc, valid_dc, test_dc):
     print("UQ (SVGP-Ens):", uq_metrics)
 
 
-def main_svgp_ensemble_all(train_dc, valid_dc, test_dc):
+def main_svgp_ensemble_all(train_dc, valid_dc, test_dc, run_id=0):
     # ---------------- 1) Load data ----------------
     print("Train X shape:", train_dc.X.shape)
     N, D = train_dc.X.shape
@@ -655,6 +666,7 @@ def main_svgp_ensemble_all(train_dc, valid_dc, test_dc):
     ]
 
     results = []
+    cut_offs = []
     for name, kwargs, _needs_y in strategies:
         # (a) get weights
         if name == "uniform":
@@ -672,6 +684,8 @@ def main_svgp_ensemble_all(train_dc, valid_dc, test_dc):
 
         # (c) UQ on test via weighted moment-matched mixture
         mean_test, lower_test, upper_test = ens.predict_interval_w(test_dc, alpha=0.05, w=w)
+        cutoff_error_df = calculate_cutoff_error_data(mean_test, upper_test-lower_test, test_dc.y)
+        cut_offs.append(cutoff_error_df)
         uq_metrics = evaluate_uq_metrics_from_interval(
             y_true=test_dc.y,
             mean=mean_test,
@@ -696,39 +710,66 @@ def main_svgp_ensemble_all(train_dc, valid_dc, test_dc):
         w_str = " ".join([f"{x:.3f}" for x in r["weights"]])
         print(f"{r['name']:>9} | valid MSE: {r['valid_mse']:.6f} | test MSE: {r['test_mse']:.6f} | w: [{w_str}]")
 
-    return results
+    return results, cut_offs
 
 
 def run_once_nn(dataset_name: str,
-                seed: int = 0):
+                seed: int = 0,
+                run_id: int = 0,
+                split: str = "random"):
     """
     One full run on a given dataset & featurizer with a fixed seed.
     """
     set_global_seed(seed)
 
     tasks, train_dc, valid_dc, test_dc, transformers = load_dataset(
-        dataset_name=dataset_name
+        dataset_name=dataset_name,
+        split=split
     )
 
     print(f"\n=== Run with seed={seed} on dataset={dataset_name}")
     results = {}
-    results["nn_evd"] = train_evd_baseline(train_dc, valid_dc, test_dc)
-    # if dataset_name not in ["qm8"]:
-    #     results["nn_baseline"] = train_nn_baseline(train_dc, valid_dc, test_dc)
-    # results["nn_mc_dropout"] = train_nn_mc_dropout(train_dc, valid_dc, test_dc)
-    # results["nn_deep_ensemble"] = train_nn_deep_ensemble(train_dc, valid_dc, test_dc)
+    all_cutoff_dfs = []
+    results["nn_evd"], cut_off_evd = train_evd_baseline(train_dc, valid_dc, test_dc, run_id=run_id)
+
+    cut_off_evd['Method'] = "nn_evd"
+    all_cutoff_dfs.append(cut_off_evd)
+
+    if dataset_name not in ["qm8"]:
+        results["nn_baseline"] = train_nn_baseline(train_dc, valid_dc, test_dc, run_id=run_id)
+
+    results["nn_mc_dropout"], cut_off_dropout = train_nn_mc_dropout(train_dc, valid_dc, test_dc, run_id=run_id)
+    cut_off_dropout['Method'] = "nn_mc_dropout"
+    all_cutoff_dfs.append(cut_off_dropout)
+
+    results["nn_deep_ensemble"], cut_off_ensemble = train_nn_deep_ensemble(train_dc, valid_dc, test_dc, run_id=run_id)
+    cut_off_ensemble['Method'] = "nn_deep_ensemble"
+    all_cutoff_dfs.append(cut_off_ensemble)
+
+    import pandas as pd
+
+    # Concatenate all DataFrames into a single one
+    combined_cutoff_df = pd.concat(all_cutoff_dfs, ignore_index=True)
+
+    # Define a consistent filename
+    output_filename = f"./data/figure/{split}_{dataset_name}_NN_cutoff_run_{run_id}.csv"
+
+    # Store the final combined data
+    combined_cutoff_df.to_csv(output_filename, index=False)
+
     return results
 
 
 def main_nn(dataset_name: str = "delaney",
             n_runs: int = 5,
+            split: str = "random",
             base_seed: int = 0):
 
     all_results = {}
 
     for run_idx in range(n_runs):
         seed = base_seed + run_idx
-        run_res = run_once_nn(dataset_name=dataset_name, seed=seed)
+        run_res = run_once_nn(dataset_name=dataset_name, seed=seed, run_id=run_idx, split=split)
         for method, uq_dict in run_res.items():
             all_results.setdefault(method, []).append(uq_dict)
 
@@ -754,11 +795,13 @@ def main_nn(dataset_name: str = "delaney",
             std = float(vals.std(ddof=0))
             print(f"  {m}: mean={mean:.5g}, std={std:.5g}")
 
-    save_summary_to_csv(all_results, n_runs, "./data/NN_evd_uloss_{}.csv".format(dataset_name))
+    save_summary_to_csv(all_results, n_runs, "./data/NN_{}_{}.csv".format(split, dataset_name))
 
 
 def run_once_gp(dataset_name: str,
-                seed: int = 0):
+                seed: int = 0,
+                run_id: int = 0,
+                split: str = "random"):
     """
     One full run on a given dataset with a fixed seed,
     running both Exact GP and SVGP in a single shot.
@@ -768,36 +811,65 @@ def run_once_gp(dataset_name: str,
     set_global_seed(seed)
 
     tasks, train_dc, valid_dc, test_dc, transformers = load_dataset(
-        dataset_name=dataset_name
+        dataset_name=dataset_name,
+        split=split
     )
 
     print(f"\n=== [GP] Run with seed={seed} on dataset={dataset_name}")
     results = {}
+    all_cutoff_dfs = []
 
     if dataset_name not in ["qm8"]:
-        results["gp_exact"] = main_gp(train_dc, valid_dc, test_dc)
-        results["gp_nngp"] = main_nngp_exact(train_dc, valid_dc, test_dc)
+        results["gp_exact"], gp_cut_off = main_gp(train_dc, valid_dc, test_dc, run_id)
+        gp_cut_off['Method'] = "gp_exact"
+        all_cutoff_dfs.append(gp_cut_off)
+        results["gp_nngp"], nngp_cut_off = main_nngp_exact(train_dc, valid_dc, test_dc, run_id)
+        nngp_cut_off['Method'] = "gp_nngp"
+        all_cutoff_dfs.append(nngp_cut_off)
 
-    results["gp_svgp"] = main_svgp(train_dc, valid_dc, test_dc)
-    results["gp_nnsvgp"] = main_nngp_svgp(train_dc, valid_dc, test_dc)
+    results["gp_svgp"], svgp_cut_off = main_svgp(train_dc, valid_dc, test_dc, run_id)
+    svgp_cut_off['Method'] = "gp_svgp"
+    all_cutoff_dfs.append(svgp_cut_off)
 
-    result = main_svgp_ensemble_all(train_dc, valid_dc, test_dc)
-    for cur in result:
+    results["gp_nnsvgp"], nnsvgp_cut_off = main_nngp_svgp(train_dc, valid_dc, test_dc, run_id)
+    nnsvgp_cut_off['Method'] = "gp_nnsvgp"
+    all_cutoff_dfs.append(nnsvgp_cut_off)
+
+    result, cut_offs = main_svgp_ensemble_all(train_dc, valid_dc, test_dc, run_id=run_id)
+    for idx, cur in enumerate(result):
         results["svgp_ensemble_{}".format(cur["name"])] = cur["uq_metrics"]
+        cut_offs[idx]['Method'] = "svgp_ensemble_{}".format(cur["name"])
+        all_cutoff_dfs.append(cut_offs[idx])
 
-    result = main_nngp_exact_ensemble_all(train_dc, valid_dc, test_dc)
-    for cur in result:
+    result, cut_offs = main_nngp_exact_ensemble_all(train_dc, valid_dc, test_dc, run_id=run_id)
+    for idx, cur in enumerate(result):
         results["nngp_ensemble_{}".format(cur["name"])] = cur["uq_metrics"]
+        cut_offs[idx]['Method'] = "nngp_ensemble_{}".format(cur["name"])
+        all_cutoff_dfs.append(cut_offs[idx])
 
-    result = main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc)
-    for cur in result:
+    result, cut_offs = main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc, run_id=run_id)
+    for idx, cur in enumerate(result):
         results["nnsvgp_ensemble_{}".format(cur["name"])] = cur["uq_metrics"]
+        cut_offs[idx]['Method'] = "nnsvgp_ensemble_{}".format(cur["name"])
+        all_cutoff_dfs.append(cut_offs[idx])
+    
+    import pandas as pd
+
+    # Concatenate all DataFrames into a single one
+    combined_cutoff_df = pd.concat(all_cutoff_dfs, ignore_index=True)
+
+    # Define a consistent filename
+    output_filename = f"./data/figure/{split}_{dataset_name}_GP_cutoff_run_{run_id}.csv"
+
+    # Store the final combined data
+    combined_cutoff_df.to_csv(output_filename, index=False)
 
     return results
 
 
 def main_gp_all(dataset_name: str = "delaney",
                 n_runs: int = 5,
+                split: str = "random",
                 base_seed: int = 0):
     """
     Multi-run driver for GP + SVGP, analogous to main_nn().
@@ -810,7 +882,7 @@ def main_gp_all(dataset_name: str = "delaney",
 
     for run_idx in range(n_runs):
         seed = base_seed + run_idx
-        run_res = run_once_gp(dataset_name=dataset_name, seed=seed)
+        run_res = run_once_gp(dataset_name=dataset_name, seed=seed, run_id=run_idx, split=split)
 
         for method, uq_dict in run_res.items():
             all_results.setdefault(method, []).append(uq_dict)
@@ -839,7 +911,7 @@ def main_gp_all(dataset_name: str = "delaney",
     save_summary_to_csv(
         all_results,
         n_runs,
-        "./data/GP_{}.csv".format(dataset_name),
+        "./data/GP_{}_{}.csv".format(split, dataset_name),
     )
 
 # if __name__ == "__main__":
@@ -860,12 +932,16 @@ if __name__ == "__main__":
                         choices=["qm7", "qm8", "delaney", "lipo"])
     parser.add_argument("--n_runs", type=int, default=5)
     parser.add_argument("--base_seed", type=int, default=0)
+    parser.add_argument("--split", type=str, default="random",
+                        choices=["random", "scaffold"])
     args = parser.parse_args()
 
     main_nn(dataset_name=args.dataset,
             n_runs=args.n_runs,
+            split=args.split,
             base_seed=args.base_seed)
     
-    # main_gp_all(dataset_name=args.dataset,
-    #             n_runs=args.n_runs,
-    #             base_seed=args.base_seed)
+    main_gp_all(dataset_name=args.dataset,
+                n_runs=args.n_runs,
+                split=args.split,
+                base_seed=args.base_seed)
