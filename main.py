@@ -1,3 +1,4 @@
+import gc
 import deepchem as dc
 from data_utils import prepare_datasets, evaluate_uq_metrics_from_interval
 from nn_baseline import train_nn_baseline, train_nn_deep_ensemble, train_nn_mc_dropout, train_evd_baseline
@@ -752,10 +753,17 @@ def run_once_nn(dataset_name: str,
     combined_cutoff_df = pd.concat(all_cutoff_dfs, ignore_index=True)
 
     # Define a consistent filename
-    output_filename = f"./data/figure/{split}_{dataset_name}_NN_cutoff_run_{run_id}.csv"
+    output_filename = f"./cdata/figure/{split}_{dataset_name}_NN_cutoff_run_{run_id}.csv"
 
     # Store the final combined data
     combined_cutoff_df.to_csv(output_filename, index=False)
+
+    del train_dc, valid_dc, test_dc, tasks, transformers
+    del all_cutoff_dfs
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return results
 
@@ -795,7 +803,7 @@ def main_nn(dataset_name: str = "delaney",
             std = float(vals.std(ddof=0))
             print(f"  {m}: mean={mean:.5g}, std={std:.5g}")
 
-    save_summary_to_csv(all_results, n_runs, "./data/NN_{}_{}.csv".format(split, dataset_name))
+    save_summary_to_csv(all_results, n_runs, "./cdata/NN_{}_{}_c.csv".format(split, dataset_name))
 
 
 def run_once_gp(dataset_name: str,
@@ -859,10 +867,17 @@ def run_once_gp(dataset_name: str,
     combined_cutoff_df = pd.concat(all_cutoff_dfs, ignore_index=True)
 
     # Define a consistent filename
-    output_filename = f"./data/figure/{split}_{dataset_name}_GP_cutoff_run_{run_id}.csv"
+    output_filename = f"./cdata/figure/{split}_{dataset_name}_GP_cutoff_run_{run_id}.csv"
 
     # Store the final combined data
     combined_cutoff_df.to_csv(output_filename, index=False)
+
+    del train_dc, valid_dc, test_dc, tasks, transformers
+    del all_cutoff_dfs
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return results
 
@@ -911,7 +926,7 @@ def main_gp_all(dataset_name: str = "delaney",
     save_summary_to_csv(
         all_results,
         n_runs,
-        "./data/GP_{}_{}.csv".format(split, dataset_name),
+        "./cdata/GP_{}_{}_c.csv".format(split, dataset_name),
     )
 
 # if __name__ == "__main__":
@@ -934,9 +949,7 @@ if __name__ == "__main__":
     parser.add_argument("--base_seed", type=int, default=0)
     parser.add_argument("--split", type=str, default="random",
                         choices=["random", "scaffold"])
-    args = parser.parse_args()
-
-    
+    args = parser.parse_args()    
     
     main_gp_all(dataset_name=args.dataset,
                 n_runs=args.n_runs,

@@ -684,7 +684,7 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
         loss=loss,
         # The output types match the return structure of DenseNormalGamma:
         output_types=['prediction', 'loss', 'var1', 'var2'],
-        batch_size=64,
+        batch_size=128,
         learning_rate=1e-4,
         # wandb=True,  # Set to True
         # model_dir='deep-evidential-regression-run-{}'.format(run_id),
@@ -694,7 +694,7 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
 
     # --- 2. Train ---
     print(f"Training Deep Evidential Regression with lambda (reg_coeff) = {reg_coeff}")
-    dc_model.fit(train_dc, nb_epoch=400, callbacks=[gradientClip])
+    dc_model.fit(train_dc, nb_epoch=300, callbacks=[gradientClip])
     device = next(dc_model.model.parameters()).device
 
     # Convert numpy data to PyTorch tensors (DeepChem .X are typically numpy arrays)
