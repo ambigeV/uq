@@ -5,9 +5,11 @@ import os
 import numpy as np
 
 # --- Configuration (Keep this section the same) ---
-DATASET_NAME = "lipo"  
-SPLIT_TYPE = "scaffold"     
-RUN_IDS = list(range(2)) # List of run indices (e.g., [0, 1, 2, ..., 9] for 10 trials)
+# DATASET_NAME = "delaney"
+DATASET_NAME = "qm8"
+# SPLIT_TYPE = "scaffold"
+SPLIT_TYPE = "random"
+RUN_IDS = list(range(5)) # List of run indices (e.g., [0, 1, 2, ..., 9] for 10 trials)
 ERROR_METRICS = ['RMSE', 'MAE'] 
 BASE_DIR = "./data/figure" 
 
@@ -88,7 +90,7 @@ def plot_confidence_with_bands(df, error_metric, dataset_name, run_id):
 
     # 3. Enhance the plot aesthetics
     num_runs = len(RUN_IDS)
-    plt.title(f'Confidence vs. {error_metric} on {dataset_name} (n={num_runs} runs)', fontsize=16)
+    plt.title(f'Confidence vs. {error_metric} on {dataset_name}', fontsize=16)
     plt.xlabel('Confidence Cutoff (Fraction of Most Confident Data Included)', fontsize=12)
     plt.ylabel(f'Prediction Error ({error_metric})', fontsize=12)
     
