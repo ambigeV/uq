@@ -1,0 +1,2 @@
+MSE_mean,MSE_std,alpha_mean,alpha_std,avg_pred_std_mean,avg_pred_std_std,ce_mean,ce_std,empirical_coverage_mean,empirical_coverage_std,method,nll_mean,nll_std,spearman_err_unc_mean,spearman_err_unc_std
+0.9526139922627603,0.022821066251369062,0.05,0.0,565.5972793986435,22.800858398754574,0.08776096899402688,6.566702129878754e-06,1.0,0.0,nn_evd,7.189716409246462,0.03981835379861669,0.1464386486798223,0.028892320338814566
