@@ -80,19 +80,6 @@ class EvidentialRegressionLoss(Loss):
 
     def nig_reg_U_tensor(self, y, gamma, v, alpha, beta):
 
-        # log_arg = torch.exp(alpha - 1) - 1
-        #
-        # # 3. Calculate the log-evidence factor
-        # log_factor = torch.log(log_arg)
-        #
-        # # 4. Calculate the prediction error
-        # error_factor = torch.abs(y - gamma)
-        #
-        # # L_U = -|y - gamma| * log_factor
-        # loss_u = -error_factor * log_factor
-        #
-        # return loss_u
-
         # The term nu(alpha - 1) is in the numerator
         numerator_factor = v * (alpha - 1)
         
@@ -192,14 +179,6 @@ class DenseNormalGamma(nn.Module):
             # parameter splitting and transformation (softplus)
             nn.Linear(HIDDEN_DIM_2, 4 * self.out_dim),
         )
-
-        # self.dense = nn.Sequential(
-        #     # nn.Linear(self.in_dim, 128),
-        #     # nn.ReLU(),
-        #     nn.Linear(self.in_dim, 64),
-        #     nn.ReLU(),
-        #     nn.Linear(64, 4 * self.out_dim),
-        # )
 
     def evidence(self, x):
         return F.softplus(x)
@@ -749,21 +728,6 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
     print(f"[EVIDENTIAL REGRESSION] UQ Metrics: {uq_metrics}")
 
     return uq_metrics, cutoff_error_df
-
-
-class MyTorchRegressor(nn.Module):
-    def __init__(self, n_features: int, n_tasks: int = 1):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_features, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, n_tasks),
-        )
-
-    def forward(self, x):
-        return self.net(x)
 
 
 def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0):

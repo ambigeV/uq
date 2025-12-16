@@ -6,7 +6,8 @@ import numpy as np
 
 # --- Configuration (Unchanged) ---
 DATASETS = ["delaney", "lipo", 'qm7', 'qm8']
-DATA_DIR = "./data"
+DATA_DIR = "./cdata"
+SPLIT = "scaffold"
 
 METRICS_TO_PLOT = {
     'MSE_mean': 'MSE (Lower is Better)',
@@ -71,13 +72,13 @@ FINAL_LABEL_ORDER = [METHOD_MAP[key] for key in METHOD_ORDER_KEYS]
 
 # --- Data Loading and Cleaning (Modified method_map) ---
 
-def load_and_clean_data(datasets):
+def load_and_clean_data(datasets, split):
     """Loads all NN and GP summary files, combines them, and cleans method names."""
     all_dfs = []
 
     for dataset in datasets:
-        nn_file = os.path.join(DATA_DIR, f"NN_{dataset}.csv")
-        gp_file = os.path.join(DATA_DIR, f"GP_{dataset}.csv")
+        nn_file = os.path.join(DATA_DIR, f"NN_{split}_{dataset}_c.csv")
+        gp_file = os.path.join(DATA_DIR, f"GP_{split}_{dataset}_c.csv")
 
         for file_path in [nn_file, gp_file]:
             try:
@@ -227,7 +228,7 @@ def plot_metrics_per_dataset(df):
 
         # Save the figure
         plt.tight_layout(rect=[0, 0.05, 1.0, 1.0])
-        output_plot_file = os.path.join(DATA_DIR, f"Metrics_Comparison_{dataset.upper()}_Ordered.png")
+        output_plot_file = os.path.join(DATA_DIR, f"Metrics_Comparison_{SPLIT}_{dataset.upper()}_Ordered.png")
         plt.savefig(output_plot_file, bbox_inches='tight')
         print(f"\nFigure saved for {dataset.upper()} to: {output_plot_file}")
         plt.close(fig)
@@ -235,7 +236,7 @@ def plot_metrics_per_dataset(df):
 
 if __name__ == "__main__":
     try:
-        final_df = load_and_clean_data(DATASETS)
+        final_df = load_and_clean_data(DATASETS, SPLIT)
         plot_metrics_per_dataset(final_df)
 
     except Exception as e:

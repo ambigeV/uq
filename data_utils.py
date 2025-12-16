@@ -5,7 +5,36 @@ import math
 import numpy as np
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
 from sklearn.metrics import mean_squared_error
+
+
+def compute_ece(probs, labels, n_bins=10):
+    """
+    Calculates Expected Calibration Error (ECE) for binary classification.
+    UQ Metric for Classification: How well do predicted probabilities match actual accuracy?
+    """
+    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+
+    for i in range(n_bins):
+        # Find points in this bin
+        bin_mask = (probs > bin_boundaries[i]) & (probs <= bin_boundaries[i + 1])
+        bin_count = np.sum(bin_mask)
+
+        if bin_count > 0:
+            # Avg confidence in this bin
+            prob_in_bin = probs[bin_mask]
+            avg_confidence = np.mean(prob_in_bin)
+
+            # Actual accuracy in this bin
+            label_in_bin = labels[bin_mask]
+            avg_accuracy = np.mean(label_in_bin)
+
+            # Weighted difference
+            ece += (bin_count / len(probs)) * np.abs(avg_accuracy - avg_confidence)
+
+    return ece
 
 
 def _flatten_if_needed(dataset: dc.data.NumpyDataset) -> dc.data.NumpyDataset:
@@ -50,7 +79,7 @@ def prepare_datasets(
         return train, valid, test
 
 
-def calculate_cutoff_error_data(mean_test, var_test, y_true):
+def calculate_cutoff_error_data(mean_test, var_test, y_true, weights=None, use_weights=False):
     """
     Calculates the Root Mean Squared Error (RMSE) for subsets of the data
     based on confidence percentile cutoffs (lowest variance first).
@@ -69,21 +98,26 @@ def calculate_cutoff_error_data(mean_test, var_test, y_true):
     mean_test = mean_test.flatten()
     var_test = var_test.flatten()
     y_true = y_true.flatten()
+
+    if use_weights and weights is not None:
+        weights = weights.flatten()
+    else:
+        # If no weights provided or flag is off, use uniform weights (1.0)
+        # This simplifies the logic inside the loop
+        weights = np.ones_like(y_true)
     
     data = pd.DataFrame({
         'y_true': y_true,
         'y_pred': mean_test,
-        'uncertainty': var_test
+        'uncertainty': var_test,
+        'weight': weights
     })
 
     # 2. Sort by uncertainty (Total Variance) in ascending order (Highest Confidence first)
     data = data.sort_values(by='uncertainty', ascending=True).reset_index(drop=True)
     
     N = len(data)
-    
-    # 3. Define cutoff points (fractions of the data to include: 0.05, 0.10, ..., 1.00)
     cutoffs = np.arange(0.05, 1.05, 0.05)
-    
     results = []
     
     # 4. Iterate through cutoffs and calculate error
@@ -93,9 +127,18 @@ def calculate_cutoff_error_data(mean_test, var_test, y_true):
         
         # Select the top n_keep most confident samples
         subset = data.iloc[:n_keep]
-        
-        # Calculate RMSE for the subset
-        mse = mean_squared_error(subset['y_true'], subset['y_pred'])
+
+        # Squared Errors for this subset
+        sq_errors = (subset['y_true'] - subset['y_pred']) ** 2
+
+        # [MODIFIED] Calculate Metric
+        if use_weights:
+            # Weighted MSE: sum(w * error^2) / sum(w)
+            mse = np.average(sq_errors, weights=subset['weight'])
+        else:
+            # Standard MSE
+            mse = np.mean(sq_errors)
+
         rmse = np.sqrt(mse)
         
         results.append({
@@ -151,70 +194,67 @@ def _spearman_rank_corr(x, y):
 
 
 def evaluate_uq_metrics_from_interval(
-    y_true,
-    mean,
-    lower,
-    upper,
-    alpha: float = 0.05,
-    test_error: float = 0,
-    ce_p_grid: np.ndarray | None = None,
+        y_true,
+        mean,
+        lower,
+        upper,
+        alpha: float = 0.05,
+        test_error: float = 0,
+        weights=None,
+        use_weights: bool = False,
+        ce_p_grid: np.ndarray | None = None,
 ):
     """
-    Compute UQ metrics from a single (1 - alpha) predictive interval.
+    Compute UQ metrics.
 
-    Inputs
-    ------
-    y_true : array-like, shape (N,) or (N,1)
-    mean   : array-like, predictive mean
-    lower  : array-like, lower bound of (1 - alpha) interval
-    upper  : array-like, upper bound of (1 - alpha) interval
-    alpha  : miscoverage level (1 - alpha is the nominal coverage)
-    ce_p_grid : np.ndarray or None
-        Grid of probability levels for the calibration error.
-        If None, defaults to 20 points in [0.05, 0.95].
-
-    Returns
-    -------
-    metrics : dict with keys:
-        - n_points
-        - alpha
-        - empirical_coverage          (w.r.t. the given interval)
-        - avg_pred_std                (from reconstructed sigma)
-        - nll                         (Gaussian)
-        - ce                          (calibration error in probability space)
-        - spearman_err_unc            (Spearman(|error|, sigma))
+    NOTE on Weights:
+    - NLL and Avg_Std ARE weighted (if use_weights=True) because they represent
+      optimization objectives/magnitudes.
+    - Coverage and Calibration Error are NOT weighted (per user request)
+      to check global statistical validity.
     """
 
     # --- 0. Make everything 1D ---
     y_true = _to_1d(y_true)
-    mean   = _to_1d(mean)
-    lower  = _to_1d(lower)
-    upper  = _to_1d(upper)
+    mean = _to_1d(mean)
+    lower = _to_1d(lower)
+    upper = _to_1d(upper)
 
-    assert y_true.shape == mean.shape == lower.shape == upper.shape, \
-        f"Shape mismatch: y={y_true.shape}, mean={mean.shape}, " \
-        f"lower={lower.shape}, upper={upper.shape}"
+    assert y_true.shape == mean.shape == lower.shape == upper.shape
 
-    N = y_true.shape[0]
+    # Prepare Weights for NLL calculation
+    if use_weights and weights is not None:
+        w = _to_1d(weights)
+    else:
+        w = np.ones_like(y_true)
 
     # --- 1. Empirical coverage + sigma reconstruction ---
 
     covered = (y_true >= lower) & (y_true <= upper)
+
+    # [UNWEIGHTED] Coverage
+    # We want to know the raw percentage of data captured.
     empirical_coverage = float(covered.mean())
 
-    # Reconstruct predictive std from interval width assuming Gaussian
+    # Reconstruct predictive std
     widths = upper - lower
     z_table = {0.1: 1.644854, 0.05: 1.959964, 0.01: 2.575829}
     z = z_table.get(alpha, 1.96)
     sigma = widths / (2.0 * z)
     sigma = np.clip(sigma, 1e-8, None)
-    avg_pred_std = float(sigma.mean())
+
+    # [WEIGHTED] Avg Std
+    # We care more about the sharpness on important samples.
+    avg_pred_std = np.average(sigma, weights=w)
 
     # --- 2. NLL under Gaussian assumption ---
 
     sq_err = (y_true - mean) ** 2
-    nll_per_point = 0.5 * np.log(2.0 * math.pi * sigma**2) + sq_err / (2.0 * sigma**2)
-    nll = float(nll_per_point.mean())
+    nll_per_point = 0.5 * np.log(2.0 * math.pi * sigma ** 2) + sq_err / (2.0 * sigma ** 2)
+
+    # [WEIGHTED] NLL
+    # This aligns with the training loss objective.
+    nll = np.average(nll_per_point, weights=w)
 
     # --- 3. Calibration error in probability space ---
 
@@ -224,11 +264,19 @@ def evaluate_uq_metrics_from_interval(
 
     # u_i = F_i(y_i) under Gaussian
     z_norm = (y_true - mean) / sigma
-    u = np.array([_standard_normal_cdf(zi) for zi in z_norm])
+    u = norm.cdf(z_norm)
 
-    hat_p = np.array([(u <= p).mean() for p in ce_p_grid])
-    w = np.ones_like(ce_p_grid) / ce_p_grid.size
-    ce = float(np.sum(w * (ce_p_grid - hat_p) ** 2))
+    # [UNWEIGHTED] Calibration Calculation
+    hat_p = []
+    for p in ce_p_grid:
+        # Standard mean: What fraction of ALL data falls below this quantile?
+        fraction_below = (u <= p).mean()
+        hat_p.append(fraction_below)
+    hat_p = np.array(hat_p)
+
+    # L2 Calibration Error
+    grid_w = np.ones_like(ce_p_grid) / ce_p_grid.size
+    ce = float(np.sum(grid_w * (ce_p_grid - hat_p) ** 2))
 
     # --- 4. Spearman(error, uncertainty) ---
 

@@ -1,14 +1,15 @@
 import gc
 import deepchem as dc
-from data_utils import prepare_datasets, evaluate_uq_metrics_from_interval
+from data_utils import prepare_datasets, evaluate_uq_metrics_from_interval, compute_ece
 from nn_baseline import train_nn_baseline, train_nn_deep_ensemble, train_nn_mc_dropout, train_evd_baseline
-from deepchem.molnet import load_qm7, load_delaney, load_qm8, load_qm9, load_lipo, load_freesolv
+from deepchem.molnet import load_qm7, load_delaney, load_qm8, load_qm9, load_lipo, load_freesolv, load_tox21
 
 import torch
 import gpytorch
 from gp_single import GPyTorchRegressor, SVGPModel, FeatureNet, \
-    DeepFeatureKernel, NNGPExactGPModel, NNSVGPLearnedInducing
-from gp_trainer import GPTrainer, EnsembleGPTrainer
+    DeepFeatureKernel, NNGPExactGPModel, NNSVGPLearnedInducing, \
+    GPyTorchClassifier, SVGPClassificationModel
+from gp_trainer import GPTrainer, EnsembleGPTrainer, GPClassificationTrainer
 from data_utils import calculate_cutoff_error_data
 import numpy as np
 import csv
@@ -63,6 +64,9 @@ def load_dataset(dataset_name: str = "delaney", split: str = "random"):
     elif dataset_name == "lipo":
         FEATURIZER = "ecfp"
         tasks, datasets, transformers = load_lipo(splitter=split)
+    elif dataset_name == "tox21":
+        FEATURIZER = "ecfp"
+        tasks, datasets, transformers = load_tox21(splitter=split)
     else:
         raise ValueError(f"Unknown dataset_name: {dataset_name}")
 
@@ -70,6 +74,10 @@ def load_dataset(dataset_name: str = "delaney", split: str = "random"):
         datasets,
         featurizer_name=FEATURIZER
     )
+
+    print("train_dc.w is", train_dc.w.shape)
+    print("train_dc.w is", train_dc.w.shape)
+    print("train_dc.w is", train_dc.w.shape)
 
     # Keep only first task if multi-task
     if train_dc.y.ndim == 2 and train_dc.y.shape[1] > 1:
@@ -436,8 +444,9 @@ def main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc, E=5, run_id=0
     return results, cut_offs
 
 
-def main_gp(train_dc, valid_dc, test_dc, run_id=0):
-    print("Train X shape:", train_dc.X.shape)  # (N, D) after flattening
+def main_gp(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regression"):
+    print("Train X shape:", train_dc.X.shape)  # (N, D)
+    N, D = train_dc.X.shape
     print("Train y shape:", train_dc.y.shape)  # (N, 1) or (N,)
 
     # 2. Build GP model
@@ -448,39 +457,108 @@ def main_gp(train_dc, valid_dc, test_dc, run_id=0):
         y_np = y_np[:, 0]
     y_train_torch = torch.from_numpy(y_np).float()
 
-    gp_model = GPyTorchRegressor(X_train_torch, y_train_torch)
+    train_w_torch = None
+    if use_weights and train_dc.w is not None:
+        print("--> Using per-point precision weights via FixedNoiseGaussianLikelihood")
+        w_np = train_dc.w
+        if w_np.ndim == 2:
+            w_np = w_np[:, 0]
+        train_w_torch = torch.from_numpy(w_np).float()
 
-    # 3. Train GP
-    trainer = GPTrainer(
-        model=gp_model,
-        train_dataset=train_dc,
-        lr=0.05,
-        # num_iters=500,
-        num_iters=200,
-        device="cpu",
-        log_interval=40,
-    )
-    trainer.train()
+    if mode == "regression":
+        gp_model = GPyTorchRegressor(
+            train_x=X_train_torch,
+            train_y=y_train_torch,
+            train_w=train_w_torch,  # <-- pass weights, not noise
+            use_weights=use_weights,  # <-- just a switch; safe if w missing
+            w_min=1e-5,
+            noise_cap=1e6,
+            normalize_noise_by_median=True,  # recommended to make weights “relative”
+        )
 
-    # 4. Evaluate
-    valid_mse = trainer.evaluate_mse(valid_dc)
-    test_mse = trainer.evaluate_mse(test_dc)
-    print("[GP Single-task] Validation MSE:", valid_mse)
-    print("[GP Single-task] Test MSE:",      test_mse)
+        trainer = GPTrainer(
+            model=gp_model,
+            train_dataset=train_dc,
+            lr=0.05,
+            num_iters=200,
+            device="cpu",
+            log_interval=40,
+        )
+        trainer.train()
 
-    # 5. Get uncertainty intervals on test set
-    mean_test, lower_test, upper_test = trainer.predict_interval(test_dc, alpha=0.05)
-    cutoff_error_df = calculate_cutoff_error_data(mean_test, upper_test-lower_test, test_dc.y)
+        # 4. Evaluate
+        valid_mse = trainer.evaluate_mse(valid_dc, use_weights=use_weights)
+        test_mse = trainer.evaluate_mse(test_dc, use_weights=use_weights)
+        print("[GP Single-task] Validation MSE:", valid_mse)
+        print("[GP Single-task] Test MSE:",      test_mse)
 
-    uq_metrics = evaluate_uq_metrics_from_interval(
-        y_true=test_dc.y,
-        mean=mean_test,
-        lower=lower_test,
-        upper=upper_test,
-        alpha=0.05,
-        test_error=test_mse,
-    )
-    print("UQ:", uq_metrics)
+        # 5. Get uncertainty intervals on test set
+        mean_test, lower_test, upper_test = trainer.predict_interval(test_dc, alpha=0.05, use_weights=use_weights)
+        cutoff_error_df = calculate_cutoff_error_data(mean_test, upper_test-lower_test, test_dc.y, use_weights=use_weights)
+
+        uq_metrics = evaluate_uq_metrics_from_interval(
+            y_true=test_dc.y,
+            mean=mean_test,
+            lower=lower_test,
+            upper=upper_test,
+            alpha=0.05,
+            test_error=test_mse,
+            use_weights=use_weights
+        )
+        print("UQ:", uq_metrics)
+    else:
+        # 1. Instantiate Classifier
+        # Note: We do NOT pass train_w here. In classification, weights are used
+        # for evaluation metrics (AUC), not for fixing likelihood noise variance.
+        gp_model = GPyTorchClassifier(
+            train_x=X_train_torch,
+            train_y=y_train_torch,
+            normalize_x="auto",  # Set to True if not using ECFP/Binary features
+            # SVGP Specific Args
+            gp_model_cls=SVGPClassificationModel,
+            num_inducing=max(512, N//10),  # 128 is a good balance for speed/accuracy
+            kernel="matern52"  # usually better than RBF for molecular data
+        )
+
+        # 2. Instantiate Trainer
+        trainer = GPClassificationTrainer(
+            model=gp_model,
+            train_dataset=train_dc,
+            lr=0.01,  # Adam LR (Kernel/Feature Extractor)
+            ngd_lr=0.1,  # Natural Gradient LR (Variational Parameters)
+            num_iters=200,
+            device="cpu",
+            log_interval=40,
+            warmup_iters=5,  # Optional: Increase if using Deep Kernel Learning
+            use_weights=use_weights
+        )
+
+        # 3. Train
+        print("--- Starting GP Classification Training ---")
+        trainer.train()
+
+        # 4. Evaluate (AUC & Accuracy)
+        # The trainer.evaluate() method handles 'use_weights' internally for AUC calculation
+        valid_metrics = trainer.evaluate(valid_dc, use_weights=use_weights)
+        test_metrics = trainer.evaluate(test_dc, use_weights=use_weights)
+
+        print(f"\n[GP Classification] Validation AUC: {valid_metrics['auc']:.4f} | Acc: {valid_metrics['acc']:.4f}")
+        print(f"[GP Classification] Test AUC:       {test_metrics['auc']:.4f} | Acc: {test_metrics['acc']:.4f}")
+
+        # 5. UQ Analysis: Calibration (ECE)
+        # Instead of 'Intervals', we analyze 'Probabilities'
+        test_probs = test_metrics["probs"]
+        test_y = test_metrics["y_true"]
+
+        ece_score = compute_ece(test_probs, test_y, n_bins=20)
+        print(f"[GP Classification] Test ECE (UQ):  {ece_score:.4f}")
+
+        # Optional: If you need data for Cutoff Error plots (Accuracy vs Confidence)
+        # You can treat 'confidence' as abs(prob - 0.5) * 2 or just the max prob.
+        confidence = np.abs(test_probs - 0.5) * 2
+        # You can now pass 'confidence' and 'test_y' to your custom plotting functions
+        uq_metrics, cutoff_error_df = None, None
+
     return uq_metrics, cutoff_error_df
 
 
@@ -827,8 +905,12 @@ def run_once_gp(dataset_name: str,
     results = {}
     all_cutoff_dfs = []
 
+    use_weights = True
+    if dataset_name in ["tox21"]:
+        use_weights = True
+
     if dataset_name not in ["qm8"]:
-        results["gp_exact"], gp_cut_off = main_gp(train_dc, valid_dc, test_dc, run_id)
+        results["gp_exact"], gp_cut_off = main_gp(train_dc, valid_dc, test_dc, run_id, use_weights=use_weights)
         gp_cut_off['Method'] = "gp_exact"
         all_cutoff_dfs.append(gp_cut_off)
         results["gp_nngp"], nngp_cut_off = main_nngp_exact(train_dc, valid_dc, test_dc, run_id)
@@ -929,34 +1011,39 @@ def main_gp_all(dataset_name: str = "delaney",
         "./cdata/GP_{}_{}_c.csv".format(split, dataset_name),
     )
 
-# if __name__ == "__main__":
-#     # main_svgp_ensemble_all()
-#     # main_nngp_exact()
-#     # main_nngp_exact_ensemble_all()
-#     main_nngp_svgp_exact_ensemble_all()
-#     # main_nn()
-#     # main_gp()
-#     # main_svgp()
-
 
 if __name__ == "__main__":
-    import argparse
+    # main_svgp_ensemble_all()
+    # main_nngp_exact()
+    # main_nngp_exact_ensemble_all()
+    # main_nngp_svgp_exact_ensemble_all()
+    # main_nn()
+    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset(
+        dataset_name="tox21",
+        split="random"
+    )
+    main_gp(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc, run_id=0, use_weights=False, mode="classification")
+    # main_svgp()
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="delaney",
-                        choices=["qm7", "qm8", "delaney", "lipo"])
-    parser.add_argument("--n_runs", type=int, default=5)
-    parser.add_argument("--base_seed", type=int, default=0)
-    parser.add_argument("--split", type=str, default="random",
-                        choices=["random", "scaffold"])
-    args = parser.parse_args()    
+
+# if __name__ == "__main__":
+#     import argparse
+#
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument("--dataset", type=str, default="delaney",
+#                         choices=["qm7", "qm8", "delaney", "lipo"])
+#     parser.add_argument("--n_runs", type=int, default=5)
+#     parser.add_argument("--base_seed", type=int, default=0)
+#     parser.add_argument("--split", type=str, default="random",
+#                         choices=["random", "scaffold"])
+#     args = parser.parse_args()
+#
+#     main_gp_all(dataset_name=args.dataset,
+#                 n_runs=args.n_runs,
+#                 split=args.split,
+#                 base_seed=args.base_seed)
     
-    main_gp_all(dataset_name=args.dataset,
-                n_runs=args.n_runs,
-                split=args.split,
-                base_seed=args.base_seed)
-    
-    main_nn(dataset_name=args.dataset,
-            n_runs=args.n_runs,
-            split=args.split,
-            base_seed=args.base_seed)
+    # main_nn(dataset_name=args.dataset,
+    #         n_runs=args.n_runs,
+    #         split=args.split,
+    #         base_seed=args.base_seed)
