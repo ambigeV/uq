@@ -10,32 +10,39 @@ from sklearn.metrics import roc_auc_score, roc_curve, accuracy_score
 
 
 class WeightedVariationalELBO(gpytorch.mlls.VariationalELBO):
-    """
-    A wrapper around VariationalELBO that supports per-sample weighting.
-    Formula: Σ (weight_i * log_prob_i) - KL_Divergence
-    """
-
     def forward(self, variational_dist_f, target, weights=None, **kwargs):
-        # 1. Calculate the KL Divergence term (Regularization)
-        # This is standard GPyTorch logic to handle batching properly
-        kl_divergence = self.model.variational_strategy.kl_divergence().div(
-            self.num_data / target.size(0)
-        )
+        # 1. Determine Batch Size (B)
+        num_batch = variational_dist_f.event_shape[0]
 
-        # 2. Calculate Expected Log Probability (Likelihood) per point
-        # Shape: (batch_size,)
-        log_likelihood = self.likelihood.expected_log_prob(target, variational_dist_f, **kwargs)
+        # 2. Compute Weighted Likelihood Sum
+        #    We perform the sum manually here to inject weights
+        #    Output of expected_log_prob is usually (num_samples, batch_size) or (batch_size,)
+        log_prob = self.likelihood.expected_log_prob(target, variational_dist_f, **kwargs)
 
-        # 3. Apply Weights (Injecting data importance)
+        #    Handle shape mismatch if using MC sampling
         if weights is not None:
-            # Ensure shape match: (N,) * (N,)
-            if weights.shape != log_likelihood.shape:
-                weights = weights.view_as(log_likelihood)
+            if weights.shape != log_prob.shape:
+                # If log_prob has MC dim (S, B) and weights is (B,), broadcast weights
+                if log_prob.ndim > weights.ndim:
+                    weights = weights.expand_as(log_prob)
 
-            log_likelihood = log_likelihood * weights
+            # Apply Weights (Element-wise multiplication)
+            log_prob = log_prob * weights
 
-        # 4. Sum and Combine
-        return log_likelihood.sum() - kl_divergence.sum()
+        #    Sum over the batch (and samples if present) to get a scalar Sum
+        #    Note: .sum(-1) sums over the batch dimension in GPyTorch logic here
+        log_likelihood_sum = log_prob.sum(-1)
+
+        #    Handle MC dimension if it exists (sum over batch, mean over samples)
+        if log_likelihood_sum.ndim > 0:
+            log_likelihood_sum = log_likelihood_sum.mean()
+
+        # 3. Divide by Batch Size (Turn Sum into Mean) -> Matches GPyTorch Scale
+        log_likelihood_mean = log_likelihood_sum.div(num_batch)
+        kl_divergence = self.model.variational_strategy.kl_divergence().div(self.num_data / self.beta)
+
+        # 5. Combine
+        return log_likelihood_mean - kl_divergence
 
 
 class GPTrainer:

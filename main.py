@@ -1,6 +1,7 @@
 import gc
 import deepchem as dc
-from data_utils import prepare_datasets, evaluate_uq_metrics_from_interval, compute_ece
+from data_utils import prepare_datasets, evaluate_uq_metrics_from_interval, \
+    compute_ece, calculate_cutoff_classification_data, evaluate_uq_metrics_classification
 from nn_baseline import train_nn_baseline, train_nn_deep_ensemble, train_nn_mc_dropout, train_evd_baseline
 from deepchem.molnet import load_qm7, load_delaney, load_qm8, load_qm9, load_lipo, load_freesolv, load_tox21
 
@@ -494,7 +495,11 @@ def main_gp(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regr
 
         # 5. Get uncertainty intervals on test set
         mean_test, lower_test, upper_test = trainer.predict_interval(test_dc, alpha=0.05, use_weights=use_weights)
-        cutoff_error_df = calculate_cutoff_error_data(mean_test, upper_test-lower_test, test_dc.y, use_weights=use_weights)
+        cutoff_error_df = calculate_cutoff_error_data(mean_test,
+                                                      upper_test-lower_test,
+                                                      test_dc.y,
+                                                      test_dc.w,
+                                                      use_weights=use_weights)
 
         uq_metrics = evaluate_uq_metrics_from_interval(
             y_true=test_dc.y,
@@ -503,6 +508,7 @@ def main_gp(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regr
             upper=upper_test,
             alpha=0.05,
             test_error=test_mse,
+            weights=test_dc.w,
             use_weights=use_weights
         )
         print("UQ:", uq_metrics)
@@ -529,8 +535,8 @@ def main_gp(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regr
             num_iters=200,
             device="cpu",
             log_interval=40,
-            warmup_iters=5,  # Optional: Increase if using Deep Kernel Learning
-            use_weights=use_weights
+            warmup_iters=5,
+            use_weights=False
         )
 
         # 3. Train
@@ -546,18 +552,25 @@ def main_gp(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regr
         print(f"[GP Classification] Test AUC:       {test_metrics['auc']:.4f} | Acc: {test_metrics['acc']:.4f}")
 
         # 5. UQ Analysis: Calibration (ECE)
-        # Instead of 'Intervals', we analyze 'Probabilities'
         test_probs = test_metrics["probs"]
         test_y = test_metrics["y_true"]
 
         ece_score = compute_ece(test_probs, test_y, n_bins=20)
         print(f"[GP Classification] Test ECE (UQ):  {ece_score:.4f}")
 
-        # Optional: If you need data for Cutoff Error plots (Accuracy vs Confidence)
-        # You can treat 'confidence' as abs(prob - 0.5) * 2 or just the max prob.
-        confidence = np.abs(test_probs - 0.5) * 2
-        # You can now pass 'confidence' and 'test_y' to your custom plotting functions
-        uq_metrics, cutoff_error_df = None, None
+        # mean_test, lower_test, upper_test = trainer.predict_interval(test_dc, alpha=0.05, use_weights=use_weights)
+        cutoff_error_df = calculate_cutoff_classification_data(test_probs,
+                                                               test_dc.y,
+                                                               weights=test_dc.w,
+                                                               use_weights=use_weights)
+        uq_metrics = evaluate_uq_metrics_classification(
+            y_true=test_dc.y,
+            probs=test_probs,
+            weights=test_dc.w,
+            use_weights=use_weights,
+            n_bins=20
+        )
+        print("UQ:", uq_metrics)
 
     return uq_metrics, cutoff_error_df
 
@@ -1023,6 +1036,7 @@ if __name__ == "__main__":
         split="random"
     )
     main_gp(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc, run_id=0, use_weights=False, mode="classification")
+    main_gp(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc, run_id=0, use_weights=True, mode="classification")
     # main_svgp()
 
 

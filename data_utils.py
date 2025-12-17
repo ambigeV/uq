@@ -9,30 +9,98 @@ from scipy.stats import norm
 from sklearn.metrics import mean_squared_error
 
 
-def compute_ece(probs, labels, n_bins=10):
+# def compute_ece(probs, labels, n_bins=10):
+#     """
+#     Calculates Expected Calibration Error (ECE) for binary classification.
+#     UQ Metric for Classification: How well do predicted probabilities match actual accuracy?
+#     """
+#     bin_boundaries = np.linspace(0, 1, n_bins + 1)
+#     ece = 0.0
+#
+#     for i in range(n_bins):
+#         # Find points in this bin
+#         bin_mask = (probs > bin_boundaries[i]) & (probs <= bin_boundaries[i + 1])
+#         bin_count = np.sum(bin_mask)
+#
+#         if bin_count > 0:
+#             # Avg confidence in this bin
+#             prob_in_bin = probs[bin_mask]
+#             avg_confidence = np.mean(prob_in_bin)
+#
+#             # Actual accuracy in this bin
+#             label_in_bin = labels[bin_mask]
+#             avg_accuracy = np.mean(label_in_bin)
+#
+#             # Weighted difference
+#             ece += (bin_count / len(probs)) * np.abs(avg_accuracy - avg_confidence)
+#
+#     return ece
+
+
+def compute_ece(probs, labels, weights=None, n_bins=10):
     """
-    Calculates Expected Calibration Error (ECE) for binary classification.
-    UQ Metric for Classification: How well do predicted probabilities match actual accuracy?
+    Calculates Weighted Expected Calibration Error (ECE) for binary classification.
+
+    Args:
+        probs (np.array): Predicted probabilities (0 to 1).
+        labels (np.array): True binary labels (0 or 1).
+        weights (np.array, optional): Sample weights. Defaults to uniform weights.
+        n_bins (int): Number of bins for calibration.
+
+    Returns:
+        float: The weighted ECE score.
     """
+    probs = np.array(probs).flatten()
+    labels = np.array(labels).flatten()
+
+    # Handle Weights
+    if weights is not None:
+        weights = np.array(weights).flatten()
+        # Basic safety: ensure no negative weights and consistent shape
+        assert weights.shape == probs.shape, "Weights shape must match probs"
+    else:
+        weights = np.ones_like(probs)
+
     bin_boundaries = np.linspace(0, 1, n_bins + 1)
+
     ece = 0.0
+    total_weight = np.sum(weights)
+
+    # Avoid division by zero if total_weight is 0 (edge case)
+    if total_weight == 0:
+        return 0.0
 
     for i in range(n_bins):
-        # Find points in this bin
-        bin_mask = (probs > bin_boundaries[i]) & (probs <= bin_boundaries[i + 1])
-        bin_count = np.sum(bin_mask)
+        # 1. Mask: Find points in this bin
+        # Note: We use > and <= to handle the edges,
+        # but usually the first bin should include 0.0 explicitly if needed.
+        if i == 0:
+            bin_mask = (probs >= bin_boundaries[i]) & (probs <= bin_boundaries[i + 1])
+        else:
+            bin_mask = (probs > bin_boundaries[i]) & (probs <= bin_boundaries[i + 1])
 
-        if bin_count > 0:
-            # Avg confidence in this bin
-            prob_in_bin = probs[bin_mask]
-            avg_confidence = np.mean(prob_in_bin)
+        # If bin is empty, skip
+        if not np.any(bin_mask):
+            continue
 
-            # Actual accuracy in this bin
-            label_in_bin = labels[bin_mask]
-            avg_accuracy = np.mean(label_in_bin)
+        # 2. Extract data for this bin
+        bin_weights = weights[bin_mask]
+        bin_probs = probs[bin_mask]
+        bin_labels = labels[bin_mask]
 
-            # Weighted difference
-            ece += (bin_count / len(probs)) * np.abs(avg_accuracy - avg_confidence)
+        bin_weight_sum = np.sum(bin_weights)
+
+        if bin_weight_sum > 0:
+            # 3. Weighted Stats
+            # Avg Confidence: Weighted Mean of predicted probabilities
+            avg_confidence = np.average(bin_probs, weights=bin_weights)
+
+            # Avg Accuracy: Weighted Mean of actual labels (fraction of positives)
+            avg_accuracy = np.average(bin_labels, weights=bin_weights)
+
+            # 4. Weighted ECE contribution
+            # Contribution = (Bin_Weight / Total_Weight) * |Acc - Conf|
+            ece += (bin_weight_sum / total_weight) * np.abs(avg_accuracy - avg_confidence)
 
     return ece
 
@@ -59,6 +127,7 @@ def _flatten_if_needed(dataset: dc.data.NumpyDataset) -> dc.data.NumpyDataset:
     else:
         raise ValueError(f"Unexpected X shape: {X.shape}")
 
+
 def prepare_datasets(
     datasets: Tuple[dc.data.NumpyDataset, dc.data.NumpyDataset, dc.data.NumpyDataset],
     featurizer_name: str,
@@ -77,6 +146,74 @@ def prepare_datasets(
         valid = _flatten_if_needed(valid)
         test = _flatten_if_needed(test)
         return train, valid, test
+
+
+def calculate_entropy(probs):
+    """
+    Binary Entropy: H(p) = -p*log(p) - (1-p)*log(1-p)
+    Max uncertainty at p=0.5 (Entropy ~ 0.693). Min at 0.0/1.0.
+    """
+    # Clip to avoid log(0)
+    p = np.clip(probs, 1e-7, 1 - 1e-7)
+    entropy = -p * np.log(p) - (1 - p) * np.log(1 - p)
+    return entropy
+
+
+def calculate_cutoff_classification_data(probs, y_true, weights=None, use_weights=False):
+    """
+    Calculates Weighted Accuracy/AUC for subsets of data sorted by confidence.
+    """
+    # 1. Flatten
+    probs = probs.flatten()
+    y_true = y_true.flatten()
+
+    # 2. Define Uncertainty (Entropy)
+    uncertainty = calculate_entropy(probs)
+
+    # 3. Prepare DataFrame
+    if use_weights and weights is not None:
+        w = weights.flatten()
+    else:
+        w = np.ones_like(y_true)
+
+    data = pd.DataFrame({
+        'y_true': y_true,
+        'prob': probs,
+        'uncertainty': uncertainty,
+        'weight': w
+    })
+
+    # 4. Sort by Uncertainty (Lowest Entropy first = Most Confident)
+    data = data.sort_values(by='uncertainty', ascending=True).reset_index(drop=True)
+
+    N = len(data)
+    cutoffs = np.arange(0.05, 1.05, 0.05)
+    results = []
+
+    for cutoff in cutoffs:
+        n_keep = int(np.ceil(N * cutoff))
+        subset = data.iloc[:n_keep]
+
+        # Hard Predictions (Threshold 0.5)
+        preds = (subset['prob'] > 0.5).astype(int)
+
+        # [METRIC 1] Weighted Accuracy
+        correct = (subset['y_true'] == preds).astype(float)
+        acc = np.average(correct, weights=subset['weight'])
+
+        # [METRIC 2] Weighted Brier Score (MSE in prob space)
+        # Brier = mean( (y - p)^2 )
+        sq_err = (subset['y_true'] - subset['prob']) ** 2
+        brier = np.average(sq_err, weights=subset['weight'])
+
+        results.append({
+            'Confidence_Cutoff': cutoff,
+            'Accuracy': acc,
+            'Brier_Score': brier,
+            'N_Samples': n_keep
+        })
+
+    return pd.DataFrame(results)
 
 
 def calculate_cutoff_error_data(mean_test, var_test, y_true, weights=None, use_weights=False):
@@ -291,4 +428,60 @@ def evaluate_uq_metrics_from_interval(
         "nll": nll,
         "ce": ce,
         "spearman_err_unc": spearman_err_unc,
+    }
+
+
+def evaluate_uq_metrics_classification(
+        y_true,
+        probs,
+        weights=None,
+        use_weights=False,
+        n_bins=10
+):
+    """
+    Compute UQ metrics for Classification: ECE, NLL, Brier, Spearman.
+    """
+    y_true = y_true.flatten()
+    probs = probs.flatten()
+
+    if use_weights and weights is not None:
+        w = weights.flatten()
+    else:
+        w = np.ones_like(y_true)
+
+    # --- 1. Sharpness (Avg Entropy) ---
+    # Equivalent to "Avg Pred Std" in regression
+    # Indicates how decisive the model is.
+    entropy = calculate_entropy(probs)
+    avg_entropy = np.average(entropy, weights=w)
+
+    # --- 2. NLL (Log Loss) ---
+    # Equivalent to Gaussian NLL
+    epsilon = 1e-15
+    p_safe = np.clip(probs, epsilon, 1 - epsilon)
+    nll_per_point = -(y_true * np.log(p_safe) + (1 - y_true) * np.log(1 - p_safe))
+    nll = np.average(nll_per_point, weights=w)
+
+    # --- 3. Brier Score ---
+    # Equivalent to MSE in Regression
+    sq_err = (y_true - probs) ** 2
+    brier = np.average(sq_err, weights=w)
+
+    # --- 4. Calibration Error (ECE) ---
+    # Equivalent to "Coverage" (Global statistical check)
+    # We can perform a Weighted ECE if desired.
+    ece = compute_ece(probs, y_true, w, n_bins)
+
+
+    # --- 5. Spearman (Uncertainty vs Error) ---
+    # Do uncertain points actually have higher errors?
+    # Correlate Entropy with Brier Score Error
+    spearman_corr = _spearman_rank_corr(sq_err, entropy)
+
+    return {
+        "NLL": nll,
+        "Brier": brier,
+        "ECE": ece,
+        "Avg_Entropy": avg_entropy,
+        "Spearman_Err_Unc": spearman_corr
     }
