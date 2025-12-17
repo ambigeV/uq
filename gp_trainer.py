@@ -581,13 +581,190 @@ class GPClassificationTrainer:
         except:
             pass
 
-    def _log_step(self, i, loss_val):
+        # --------------------------------------------------------------------------
+        # Refined Logging Helpers (Copy-Paste into GPClassificationTrainer)
+        # --------------------------------------------------------------------------
+
+    def _summ(self, tensor, name, k: int = 5) -> str:
+        """Pretty summary for scalar or vector tensors."""
+        if tensor is None:
+            return f"{name}: N/A"
+        t = tensor.detach().float().cpu()
+        if t.ndim == 0 or t.numel() == 1:
+            return f"{name}: {t.item():.3e}"
+        flat = t.view(-1)
+        head = " ".join(f"{v:.3e}" for v in flat[:k].tolist())
+        return f"{name}[0:{min(k, flat.numel())}]: {head} | mean={flat.mean().item():.3e}"
+
+    def _has_feature_extractor(self) -> bool:
+        """Check if we can access a feature extractor for logging."""
+        # 1. Direct attribute (common in custom classes)
+        if hasattr(self.gp, "feature_extractor"):
+            return True
+        # 2. Deep Kernel wrapper
         try:
-            ls = self.gp.covar_module.base_kernel.lengthscale.mean().item()
-            os = self.gp.covar_module.outputscale.item()
-        except:
-            ls, os = 0.0, 0.0
-        print(f"[Iter {i:03d}] Loss: {loss_val:.3f} | LS: {ls:.3f} | OS: {os:.3f}")
+            if hasattr(self.gp.covar_module, "base_kernel"):
+                _ = self.gp.covar_module.base_kernel.feature_extractor
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _get_bn_module(self):
+        """Return the (first) BatchNorm1d in the feature extractor if present."""
+        feat = None
+        # Locate feature extractor
+        if hasattr(self.gp, "feature_extractor"):
+            feat = self.gp.feature_extractor
+        elif hasattr(self.gp.covar_module, "base_kernel") and hasattr(self.gp.covar_module.base_kernel,
+                                                                      "feature_extractor"):
+            feat = self.gp.covar_module.base_kernel.feature_extractor
+
+        if feat is None: return None
+
+        # Prefer attribute 'post_bn' if exists
+        bn = getattr(feat, "post_bn", None)
+        if isinstance(bn, nn.BatchNorm1d):
+            return bn
+        # Otherwise search modules
+        for m in feat.modules():
+            if isinstance(m, nn.BatchNorm1d):
+                return m
+        return None
+
+    @torch.no_grad()
+    def _feature_stats_str(self, sample_k: int = 4096, k_head: int = 5) -> str:
+        """Summarize φ(X) distribution and BN running stats (if any)."""
+        if not self._has_feature_extractor():
+            return "feat: N/A"
+
+        # Locate feature extractor instance
+        feat = getattr(self.gp, "feature_extractor", None)
+        if feat is None:
+            # Fallback to deep kernel path
+            try:
+                feat = self.gp.covar_module.base_kernel.feature_extractor
+            except:
+                return "feat: N/A"
+
+        N = self.train_x.size(0)
+        if sample_k < N:
+            idx = torch.randperm(N, device=self.train_x.device)[:sample_k]
+            xb = self.train_x[idx]
+        else:
+            xb = self.train_x
+
+        z = feat(xb).detach()  # (n, Dz)
+        # per-dim stats
+        z_mu = z.mean(dim=0)
+        z_sd = z.std(dim=0, unbiased=False)
+
+        mu_abs_mean = z_mu.abs().mean().item()
+        sd_mean = z_sd.mean().item()
+        sd_min = z_sd.min().item()
+        sd_max = z_sd.max().item()
+
+        head_mu = " ".join(f"{v:.2e}" for v in z_mu[:k_head].cpu().tolist())
+        head_sd = " ".join(f"{v:.2e}" for v in z_sd[:k_head].cpu().tolist())
+
+        # BN running stats if available
+        bn = self._get_bn_module()
+        if bn is not None and bn.track_running_stats:
+            rm = bn.running_mean.detach().cpu()
+            rv = bn.running_var.detach().cpu()
+            bn_str = (f" | BNμ(mean)={rm.mean():.2e}, BNσ(mean)={(rv.clamp_min(1e-12).sqrt().mean()):.2e}")
+        else:
+            bn_str = ""
+
+        return (f"feat| μ_abs(avg)={mu_abs_mean:.2e}, σ(avg/min/max)={sd_mean:.2e}/{sd_min:.2e}/{sd_max:.2e} "
+                f"| μ[:{k_head}]={head_mu} | σ[:{k_head}]={head_sd}{bn_str}")
+
+    @torch.no_grad()
+    def _predictive_stats_str(self, output=None, sample_k: int = 4096) -> str:
+        """Summarize predictive distribution (Probabilities for Classification)."""
+        N = self.train_x.size(0)
+
+        # Sampling logic
+        idx = None
+        if sample_k < N:
+            idx = torch.randperm(N, device=self.train_x.device)[:sample_k]
+            xb = self.train_x.index_select(0, idx)
+        else:
+            xb = self.train_x
+
+        # Get Predictions (Probs)
+        # SVGP Classification is safe to eval in train mode generally, but we force eval for consistency
+        with gpytorch.settings.fast_pred_var():
+            # Note: self.model() calls forward -> probs
+            # But here we want the likelihood distribution statistics
+            latent = self.gp(xb)
+            pred_dist = self.likelihood(latent)
+            mean_n = pred_dist.mean  # Bernoulli mean = P(y=1)
+            std_n = pred_dist.stddev
+
+        mean = mean_n.detach().float().cpu().view(-1)
+        std = std_n.detach().float().cpu().view(-1)
+
+        mu_mean, mu_min, mu_max = mean.mean().item(), mean.min().item(), mean.max().item()
+        sd_mean, sd_min, sd_max = std.mean().item(), std.min().item(), std.max().item()
+
+        # Label adjustment
+        label = "probs" if isinstance(self.likelihood, gpytorch.likelihoods.BernoulliLikelihood) else "pred"
+
+        return (f"{label}| μ(mean/min/max)={mu_mean:.3e}/{mu_min:.3e}/{mu_max:.3e} "
+                f"| σ(mean/min/max)={sd_mean:.3e}/{sd_min:.3e}/{sd_max:.3e}")
+
+    def _log_step(self, i, loss_val):
+        """Robust Logging Step that finds parameters even if architecture changes."""
+
+        # 1. ROBUSTLY FIND LENGTHSCALE
+        ls = None
+        # Check 1: Deep Kernel (Scale -> Base -> Lengthscale)
+        if hasattr(self.gp.covar_module, "base_kernel") and hasattr(self.gp.covar_module.base_kernel,
+                                                                    "lengthscale"):
+            ls = self.gp.covar_module.base_kernel.lengthscale
+        # Check 2: Direct Kernel (Matern -> Lengthscale)
+        elif hasattr(self.gp.covar_module, "lengthscale"):
+            ls = self.gp.covar_module.lengthscale
+
+        # 2. ROBUSTLY FIND OUTPUTSCALE
+        os = getattr(self.gp.covar_module, "outputscale", None)
+
+        # 3. ROBUSTLY FIND NOISE
+        # Bernoulli/Softmax usually don't have 'noise'
+        noise = getattr(self.likelihood, "noise", None)
+
+        # 4. Format Strings
+        ls_str = self._summ(ls, "LS")
+        os_str = self._summ(os, "OS")
+
+        if noise is None:
+            noise_str = "noise: N/A"
+        else:
+            n = noise.detach().float().cpu()
+            if n.numel() == 1:
+                noise_str = f"noise: {n.item():.3e}"
+            else:
+                noise_str = f"noise(μ): {n.mean():.2e}"
+
+        # 5. Advanced Stats
+        # (Assuming self.feat_log_sample is set in __init__, e.g. 4096)
+        feat_sample = getattr(self, "feat_log_sample", 4096)
+        feat_str = self._feature_stats_str(sample_k=feat_sample, k_head=5)
+        pred_str = self._predictive_stats_str(sample_k=feat_sample)
+
+        print(
+            f"[Iter {i:03d}] Loss: {loss_val:.3f} | {ls_str} | {os_str} | {noise_str} | "
+            f"{feat_str} | {pred_str}"
+        )
+
+    # def _log_step(self, i, loss_val):
+    #     try:
+    #         ls = self.gp.covar_module.base_kernel.lengthscale.mean().item()
+    #         os = self.gp.covar_module.outputscale.item()
+    #     except:
+    #         ls, os = 0.0, 0.0
+    #     print(f"[Iter {i:03d}] Loss: {loss_val:.3f} | LS: {ls:.3f} | OS: {os:.3f}")
 
     def evaluate(self, dataset: dc.data.NumpyDataset, use_weights: bool = True):
         """

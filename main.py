@@ -110,55 +110,133 @@ def _to_torch_xy(dc_dataset):
     return X_t, y_t
 
 
-def main_nngp_exact(train_dc, valid_dc, test_dc, device: str = "cpu", run_id=0):
+def main_nngp_exact(train_dc, valid_dc, test_dc,
+                    device: str = "cpu", run_id=0, use_weights=False, mode="regression"):
     # 1) Load
     print("Train X shape:", train_dc.X.shape)
     print("Train y shape:", train_dc.y.shape)
+    N, D = train_dc.X.shape
 
     # 2) Torch tensors
     X_train_t, y_train_t = _to_torch_xy(train_dc)
+
+    train_w_torch = None
+    if use_weights and train_dc.w is not None:
+        print("--> Using per-point precision weights via FixedNoiseGaussianLikelihood")
+        w_np = train_dc.w
+        if w_np.ndim == 2:
+            w_np = w_np[:, 0]
+        train_w_torch = torch.from_numpy(w_np).float()
 
     # 3) Build NNGP (Exact)
     in_dim = X_train_t.shape[1]
     feat = FeatureNet(in_dim=in_dim, feat_dim=64, hidden=(128, 64), dropout=0.0)
 
-    nngp_exact = GPyTorchRegressor(
-        train_x=X_train_t,
-        train_y=y_train_t,
-        normalize_x=False,                        # BatchNorm handles scale
-        gp_model_cls=NNGPExactGPModel,
-        likelihood=gpytorch.likelihoods.GaussianLikelihood(),
-        feature_extractor=feat,
-        kernel="matern52",
-    )
+    if mode == "regression":
+        nngp_exact = GPyTorchRegressor(
+            train_x=X_train_t,
+            train_y=y_train_t,
+            train_w=train_w_torch,  # <-- pass weights, not noise
+            use_weights=use_weights,  # <-- just a switch; safe if w missing
+            w_min=1e-5,
+            noise_cap=1e6,
+            normalize_x=False,                        # BatchNorm handles scale
+            gp_model_cls=NNGPExactGPModel,
+            likelihood=gpytorch.likelihoods.GaussianLikelihood(),
+            feature_extractor=feat,
+            kernel="matern52",
+        )
 
-    # 4) Train
-    dev = "cpu"
-    trainer = GPTrainer(
-        model=nngp_exact,
-        train_dataset=train_dc,
-        lr=5e-3,               # smaller LR tends to work better for deep kernels (exact GP uses single Adam)
-        num_iters=300,
-        device=dev,
-        log_interval=40,
-    )
-    trainer.train()
+        # 4) Train
+        dev = "cpu"
+        trainer = GPTrainer(
+            model=nngp_exact,
+            train_dataset=train_dc,
+            lr=5e-3,               # smaller LR tends to work better for deep kernels (exact GP uses single Adam)
+            num_iters=300,
+            device=dev,
+            log_interval=40,
+        )
+        trainer.train()
 
-    # 5) Eval
-    valid_mse = trainer.evaluate_mse(valid_dc)
-    test_mse  = trainer.evaluate_mse(test_dc)
-    print("[NNGP-Exact] Validation MSE:", valid_mse)
-    print("[NNGP-Exact] Test MSE:",      test_mse)
+        # 5) Eval
+        valid_mse = trainer.evaluate_mse(valid_dc, use_weights=use_weights)
+        test_mse  = trainer.evaluate_mse(test_dc, use_weights=use_weights)
+        print("[NNGP-Exact] Validation MSE:", valid_mse)
+        print("[NNGP-Exact] Test MSE:",      test_mse)
 
-    # 6) UQ (intervals on test)
-    mean_t, lo_t, hi_t = trainer.predict_interval(test_dc, alpha=0.05)
-    cutoff_error_df = calculate_cutoff_error_data(mean_t, hi_t-lo_t, test_dc.y)
-    uq = evaluate_uq_metrics_from_interval(
-        y_true=test_dc.y, mean=mean_t, lower=lo_t, upper=hi_t, alpha=0.05, test_error=test_mse,
-    )
+        # 6) UQ (intervals on test)
+        mean_t, lo_t, hi_t = trainer.predict_interval(test_dc, alpha=0.05, use_weights=use_weights)
+        cutoff_error_df = calculate_cutoff_error_data(mean_t,
+                                                      hi_t-lo_t,
+                                                      test_dc.y,
+                                                      weights=test_dc.w,
+                                                      use_weights=use_weights)
+        uq = evaluate_uq_metrics_from_interval(
+            y_true=test_dc.y,
+            mean=mean_t,
+            lower=lo_t,
+            upper=hi_t,
+            alpha=0.05,
+            test_error=test_mse,
+            weights=test_dc.w,
+            use_weights=use_weights
+        )
 
-    print("UQ (NNGP-Exact):", uq)
-    return uq, cutoff_error_df
+        print("UQ (NNGP-Exact):", uq)
+    else:
+        M = max(512, N//10)
+        nngp_classifier = GPyTorchClassifier(
+            train_x=X_train_t,
+            train_y=y_train_t,
+            normalize_x=False,  # NN handles raw data
+            gp_model_cls=NNSVGPLearnedInducing,  # <--- REUSE SAME CLASS
+            feature_extractor=feat,  # Pass the NN
+            num_inducing=M,  # Pass SVGP params
+            kernel="matern52",
+            # likelihood=... (Defaults to BernoulliLikelihood in the wrapper)
+        )
+
+        # 4) Train
+        dev = "cpu"
+        trainer = GPClassificationTrainer(
+            model=nngp_classifier,
+            train_dataset=train_dc,
+            lr=5e-3,  # <--- Aligned with your regression settings
+            nn_lr=1e-3,  # <--- Aligned with your regression settings
+            ngd_lr=0.02,  # <--- Aligned with your regression settings
+            warmup_iters=5,
+            clip_grad=1.0,
+            num_iters=50,
+            device=device,
+            log_interval=40,
+            use_weights=use_weights  # (Supported via the patch in previous turn)
+        )
+
+        trainer.train()
+
+        # 4. Evaluate (AUC/Accuracy)
+        valid_metrics = trainer.evaluate(valid_dc, use_weights=use_weights)
+        test_metrics = trainer.evaluate(test_dc, use_weights=use_weights)
+
+        print(f"[NN-SVGP Classif] Valid AUC: {valid_metrics['auc']:.4f}")
+        print(f"[NN-SVGP Classif] Test AUC:  {test_metrics['auc']:.4f}")
+
+        # 5. UQ Analysis
+        test_probs = test_metrics["probs"]
+
+        # Calculate Cutoff Data for Classification
+        cutoff_error_df = calculate_cutoff_classification_data(
+            test_probs, test_dc.y, weights=test_dc.w, use_weights=use_weights
+        )
+
+        uq_metrics = evaluate_uq_metrics_classification(
+            y_true=test_dc.y, probs=test_probs, weights=test_dc.w,
+            use_weights=use_weights, n_bins=20
+        )
+        print("UQ (NN-SVGP Classif):", uq_metrics)
+
+    return uq_metrics, cutoff_error_df
 
 
 def main_nngp_exact_ensemble_all(train_dc, valid_dc, test_dc, M=5, run_id=0):
@@ -1035,8 +1113,10 @@ if __name__ == "__main__":
         dataset_name="tox21",
         split="random"
     )
-    main_gp(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc, run_id=0, use_weights=False, mode="classification")
-    main_gp(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc, run_id=0, use_weights=True, mode="classification")
+    main_nngp_exact(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc,
+                    run_id=0, use_weights=False, mode="classification")
+    main_nngp_exact(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc,
+                    run_id=0, use_weights=True, mode="classification")
     # main_svgp()
 
 
