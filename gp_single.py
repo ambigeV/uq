@@ -517,6 +517,8 @@ class GPyTorchRegressor(nn.Module):
         train_x_norm = (train_x - self.x_mean) / self.x_std if self.normalize_x else train_x
         self.register_buffer("train_x_norm", train_x_norm)
 
+        self.register_buffer("train_w", train_w)
+
         # keep these hyperparams for weight->noise
         self.use_weights = bool(use_weights)
         self.w_min = float(w_min)

@@ -70,6 +70,7 @@ class GPTrainer:
         self.feat_log_sample = 4096  # default for feature/predictive logging
 
         self.train_x, self.train_y = self._dc_to_torch(train_dataset)
+        self.train_w = None
 
         if hasattr(self.model, "train_y_norm"):
             self.train_y = self.model.train_y_norm
@@ -78,9 +79,20 @@ class GPTrainer:
         if hasattr(self.gp, "variational_strategy"):
             # SVGP path
             self.is_svgp = True
-            self.mll = gpytorch.mlls.VariationalELBO(
-                self.likelihood, self.gp, num_data=self.train_x.size(0)
-            )
+            
+            if self.model.use_weights:
+                w_mean = 1e-8 + torch.mean(self.model.train_w)
+                self.train_w = self.model.train_w / w_mean
+                self.train_w = self.train_w.to(self.device)
+                self.mll = WeightedVariationalELBO(
+                    self.likelihood, self.gp, num_data=self.train_x.size(0)
+                )
+
+            else:
+                self.mll = gpytorch.mlls.VariationalELBO(
+                    self.likelihood, self.gp, num_data=self.train_x.size(0)
+                )
+
             # --------- [MODIFIED] Optimizers: NGD(q) + Adam(other params) ----------
             self.opt_ngd = NGD(
                 self.gp.variational_parameters(),
@@ -296,7 +308,10 @@ class GPTrainer:
                 with gpytorch.settings.cholesky_jitter(1e-4):
                     output = self.gp(self.train_x)
 
-                loss = -self.mll(output, self.train_y)
+                if self.model.use_weights:
+                    loss = -self.mll(output, self.train_y, weights=self.train_w)
+                else:
+                    loss = -self.mll(output, self.train_y)
 
                 # --------- [MODIFIED] optional MAP term if you registered priors ----------
                 if getattr(self, "add_prior_term", False):
@@ -758,14 +773,6 @@ class GPClassificationTrainer:
             f"{feat_str} | {pred_str}"
         )
 
-    # def _log_step(self, i, loss_val):
-    #     try:
-    #         ls = self.gp.covar_module.base_kernel.lengthscale.mean().item()
-    #         os = self.gp.covar_module.outputscale.item()
-    #     except:
-    #         ls, os = 0.0, 0.0
-    #     print(f"[Iter {i:03d}] Loss: {loss_val:.3f} | LS: {ls:.3f} | OS: {os:.3f}")
-
     def evaluate(self, dataset: dc.data.NumpyDataset, use_weights: bool = True):
         """
         Evaluate and return AUC and Accuracy.
@@ -821,7 +828,7 @@ class EnsembleGPTrainer:
     Train multiple GP models (ExactGP or SVGP) potentially on different datasets.
     Aggregates predictions as an equal-weight mixture of Gaussians using moment matching.
     """
-    def __init__(self, items, device: str = "cpu"):
+    def __init__(self, items, device: str = "cpu", mode = "regression", use_weights = False):
         """
         items: list of dicts, each like
           {
@@ -835,20 +842,38 @@ class EnsembleGPTrainer:
         """
         self.device = device
         self.trainers = []
-        for k, it in enumerate(items):
-            trainer = GPTrainer(
-                model=it["model"],
-                train_dataset=it["train_dataset"],
-                lr=it.get("lr", 0.1),
-                num_iters=it.get("num_iters", 100),
-                device=device,
-                log_interval=it.get("log_interval", 10),
-                nn_lr=it.get("nn_lr", 1e-3),
-                ngd_lr=it.get("ngd_lr", 0.02),
-                warmup_iters=it.get("warmup_iters", 0),
-                clip_grad=it.get("clip_grad", 1.0),
-            )
-            self.trainers.append(trainer)
+        self.mode = mode
+        self.use_weights = use_weights
+        if self.mode == "regression":
+            for k, it in enumerate(items):
+                trainer = GPTrainer(
+                    model=it["model"],
+                    train_dataset=it["train_dataset"],
+                    lr=it.get("lr", 0.1),
+                    num_iters=it.get("num_iters", 100),
+                    device=device,
+                    log_interval=it.get("log_interval", 10),
+                    nn_lr=it.get("nn_lr", 1e-3),
+                    ngd_lr=it.get("ngd_lr", 0.02),
+                    warmup_iters=it.get("warmup_iters", 0),
+                    clip_grad=it.get("clip_grad", 1.0),
+                )
+                self.trainers.append(trainer)
+        else:
+            for k, it in enumerate(items):
+                trainer = GPClassificationTrainer(
+                    model=it["model"],
+                    train_dataset=it["train_dataset"],
+                    lr=it.get("lr", 0.1),
+                    num_iters=it.get("num_iters", 100),
+                    device=device,
+                    log_interval=it.get("log_interval", 10),
+                    nn_lr=it.get("nn_lr", 1e-3),
+                    ngd_lr=it.get("ngd_lr", 0.02),
+                    warmup_iters=it.get("warmup_iters", 0),
+                    clip_grad=it.get("clip_grad", 1.0),
+                )
+                self.trainers.append(trainer)
 
     def train(self):
         for i, t in enumerate(self.trainers, 1):
@@ -858,30 +883,72 @@ class EnsembleGPTrainer:
     def _dc_to_torch(self, dataset: dc.data.NumpyDataset):
         X = torch.from_numpy(dataset.X).float().to(self.device)
         y = torch.from_numpy(dataset.y).float().to(self.device)
+        w = torch.from_numpy(dataset.w).float().to(self.device)
         if y.ndim == 2 and y.shape[1] == 1:
             y = y.squeeze(-1)
-        return X, y
+        if w.ndim == 2 and w.shape[1] == 1:
+            w = w.squeeze(-1)
+        return X, y, w
 
-    # ----- store / normalize weights ----------------------------------------
     def set_weights(self, w):
         w = np.asarray(w, dtype=float)
         w = np.maximum(w, 0)
         w = w / (w.sum() + 1e-12)
         self.weights_ = w
 
-    # ----- collect per-model mean/var on ORIGINAL y-scale --------------------
+    def _collect_probs(self, dataset):
+        X, _, w_batch = self._dc_to_torch(dataset)
+        Probs = []
+        
+        # Collect p(y=1) from each model
+        for t in self.trainers:
+            t.model.eval()
+            with torch.no_grad():
+                out = t.model(X)
+                # If output is logits, apply sigmoid:
+                if hasattr(out, 'mean'): 
+                    # For GP classification, mean is usually prob (Bernoulli likelihood)
+                    p = out.mean 
+                else:
+                    p = out
+                
+            Probs.append(p.detach().cpu().numpy().reshape(-1))
+            
+        P = np.stack(Probs, axis=0)  # Shape (K, N)
+        
+        # Get labels
+        y = dataset.y.reshape(-1) if getattr(dataset, "y", None) is not None else None
+        
+        # Get data weights (sw)
+        if w_batch is not None:
+            sw = w_batch.detach().cpu().numpy().reshape(-1)
+            if sw.sum() > 0: sw = sw / sw.mean() # Normalize to mean 1.0
+        else:
+            sw = np.ones(P.shape[1])
+            
+        return P, y, sw
+
     def _collect_means_vars(self, dataset):
-        X, _ = self._dc_to_torch(dataset)
+        X, _, w_batch = self._dc_to_torch(dataset)
         Ms, Vs = [], []
         for t in self.trainers:
             m, v = self._component_mean_var(t.model, X)
             Ms.append(m.detach().cpu().numpy().reshape(-1))
             Vs.append(v.detach().cpu().numpy().reshape(-1))
+        
         M = np.stack(Ms, axis=0)  # (K, N)
         V = np.clip(np.stack(Vs, axis=0), 1e-12, None)  # (K, N)
         y = dataset.y.reshape(-1) if getattr(dataset, "y", None) is not None else None
-        return M, V, y
-
+        
+        # --- NEW: Extract and handle weights ---
+        if w_batch is not None:
+            sw = w_batch.detach().cpu().numpy().reshape(-1)
+            # Normalize sw to have mean 1.0 so L2 reg scale is preserved
+            if sw.sum() > 0: sw = sw / sw.mean() 
+        else:
+            sw = np.ones(M.shape[1])
+            
+        return M, V, y, sw
     # ----- moment-matched Gaussian for arbitrary weights ---------------------
     @staticmethod
     def _mixture_moment_match(M, V, w):
@@ -897,23 +964,28 @@ class EnsembleGPTrainer:
         prec = (1.0 / np.clip(V, 1e-12, None)).mean(axis=1)  # (K,)
         w = prec ** float(tau)
         return w / (w.sum() + 1e-12)
-
+    
     @staticmethod
-    def _precision_mse_hybrid(M, V, y, tau=1.0, lam=1.0):
-        prec = (1.0 / np.clip(V, 1e-12, None)).mean(axis=1)  # (K,)
-        mse = ((M - y[None, :]) ** 2).mean(axis=1)  # (K,)
+    def _precision_mse_hybrid(M, V, y, sw, tau=1.0, lam=1.0):
+        prec = (1.0 / np.clip(V, 1e-12, None)).mean(axis=1)
+        
+        # CHANGE: Weighted MSE calculation
+        # Broadcast sw (N,) against M (K,N)
+        mse = (((M - y[None, :]) ** 2) * sw[None, :]).mean(axis=1) 
+        
         score = prec / (1.0 + float(lam) * mse)
         score = np.maximum(score, 1e-12)
         return score / score.sum()
 
     # ===== Strategy 2: Log-likelihood stacking (proper) ======================
     @staticmethod
-    def _fit_nll_weights(M, V, y, l2=1e-3, dirichlet_alpha=1.0,
+    def _fit_nll_weights(M, V, y, sw, l2=1e-3, dirichlet_alpha=1.0,
                          max_iters=200, tol=1e-7):
 
         M = torch.as_tensor(M, dtype=torch.double)
         V = torch.as_tensor(np.clip(V, 1e-12, None), dtype=torch.double)
         y = torch.as_tensor(y, dtype=torch.double)
+        sw = torch.as_tensor(sw, dtype=torch.double) # Convert sw to tensor
 
         K, N = M.shape
         logits = torch.nn.Parameter(torch.zeros(K, dtype=torch.double))
@@ -923,11 +995,14 @@ class EnsembleGPTrainer:
 
         def closure():
             opt.zero_grad()
-            w = torch.softmax(logits, dim=0)  # (K,)
-            log_norm = -0.5 * (torch.log(2 * torch.pi * (V + eps))
-                               + (y[None, :] - M) ** 2 / (V + eps))  # (K,N)
+            w = torch.softmax(logits, dim=0)
+            log_norm = -0.5 * (torch.log(2 * torch.pi * (V + eps)) 
+                               + (y[None, :] - M) ** 2 / (V + eps))
             log_mix = torch.logsumexp(torch.log(w + eps)[:, None] + log_norm, dim=0)
-            nll = -log_mix.mean()
+            
+            # CHANGE: Weighted NLL
+            nll = -(log_mix * sw).mean() 
+            
             reg = 0.5 * l2 * (logits ** 2).sum() / max(N, 1)
             if dirichlet_alpha != 1.0:
                 reg = reg - (dirichlet_alpha - 1.0) * torch.log(
@@ -950,10 +1025,11 @@ class EnsembleGPTrainer:
     # ===== Strategy 3: Flexible validation-based =============================
     # (a) Mean-only MSE stacking
     @staticmethod
-    def _fit_mse_weights(M, y, l2=1e-3):
+    def _fit_mse_weights(M, y, sw, l2=1e-3):
 
         M = torch.as_tensor(M, dtype=torch.double)
         y = torch.as_tensor(y, dtype=torch.double)
+        sw = torch.as_tensor(sw, dtype=torch.double)
         K, N = M.shape
 
         # center to avoid explicit intercept
@@ -968,7 +1044,7 @@ class EnsembleGPTrainer:
             opt.zero_grad()
             w = torch.softmax(logits, dim=0)
             yhat = (w[:, None] * M_c).sum(dim=0) + y_mu
-            loss = ((yhat - y) ** 2).mean() + 0.5 * l2 * (logits ** 2).sum() / max(N, 1)
+            loss = ((sw * (yhat - y) ** 2)).mean() + 0.5 * l2 * (logits ** 2).sum() / max(N, 1)
             loss.backward()
             return loss
 
@@ -983,11 +1059,12 @@ class EnsembleGPTrainer:
 
     # (b) CRPS stacking (probabilistic) using moment-matched Gaussian
     @staticmethod
-    def _fit_crps_weights(M, V, y, l2=1e-3):
+    def _fit_crps_weights(M, V, y, sw, l2=1e-3):
         import math
         M = torch.as_tensor(M, dtype=torch.double)
         V = torch.as_tensor(np.clip(V, 1e-12, None), dtype=torch.double)
         y = torch.as_tensor(y, dtype=torch.double)
+        sw = torch.as_tensor(sw, dtype=torch.double)
         K, N = M.shape
 
         logits = torch.nn.Parameter(torch.zeros(K, dtype=torch.double))
@@ -1006,7 +1083,9 @@ class EnsembleGPTrainer:
             Phi = 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
             phi = torch.exp(-0.5 * z ** 2) / math.sqrt(2 * math.pi)
             crps = std * (z * (2 * Phi - 1.0) + 2 * phi - 1.0 / math.sqrt(math.pi))
-            loss = crps.mean() + 0.5 * l2 * (logits ** 2).sum() / max(N, 1)
+            # loss = crps.mean() + 0.5 * l2 * (logits ** 2).sum() / max(N, 1)
+            # <--- NEW: Weighted Mean of CRPS
+            loss = (crps * sw).mean() + 0.5 * l2 * (logits ** 2).sum() / max(N, 1)
             loss.backward()
             return loss
 
@@ -1021,38 +1100,133 @@ class EnsembleGPTrainer:
 
     # Public API: learn weights on a calibration/validation set
     def calibrate_weights(self, calib_dc, method="nll", **kwargs):
-        """
-        method ∈ {"precision", "precision_hybrid", "nll", "mse", "crps"}
-        - precision:           label-free; w ∝ mean_i (1/var_{k,i})^tau
-        - precision_hybrid:    uses y to downweight overconfident-but-wrong models
-        - nll:                 proper probabilistic stacking (mixture log-likelihood)
-        - mse:                 mean-only stacking (minimize MSE)
-        - crps:                probabilistic, minimize Gaussian CRPS of moment-matched mixture
-        """
-        M, V, y = self._collect_means_vars(calib_dc)
+        # Unpack sw here
+        M, V, y, sw = self._collect_means_vars(calib_dc)
 
         if method == "precision":
+            # Precision is label-free, so we usually ignore data weights
             w = self._precision_weights(V, tau=kwargs.get("tau", 1.0))
         elif method == "precision_hybrid":
             if y is None: raise ValueError("precision_hybrid requires labels (y).")
-            w = self._precision_mse_hybrid(M, V, y,
+            # Pass sw to hybrid
+            w = self._precision_mse_hybrid(M, V, y, sw,
                                            tau=kwargs.get("tau", 1.0),
                                            lam=kwargs.get("lam", 1.0))
         elif method == "nll":
             if y is None: raise ValueError("nll stacking requires labels (y).")
-            w = self._fit_nll_weights(M, V, y,
+            # Pass sw to NLL
+            w = self._fit_nll_weights(M, V, y, sw,
                                       l2=kwargs.get("l2", 1e-3),
                                       dirichlet_alpha=kwargs.get("dirichlet_alpha", 1.0),
                                       max_iters=kwargs.get("max_iters", 200),
                                       tol=kwargs.get("tol", 1e-7))
         elif method == "mse":
             if y is None: raise ValueError("mse stacking requires labels (y).")
-            w = self._fit_mse_weights(M, y, l2=kwargs.get("l2", 1e-3))
+            # Pass sw to MSE
+            w = self._fit_mse_weights(M, y, sw, l2=kwargs.get("l2", 1e-3))
         elif method == "crps":
             if y is None: raise ValueError("crps stacking requires labels (y).")
-            w = self._fit_crps_weights(M, V, y, l2=kwargs.get("l2", 1e-3))
+            # Pass sw to CRPS
+            w = self._fit_crps_weights(M, V, y, sw, l2=kwargs.get("l2", 1e-3))
         else:
             raise ValueError(f"Unknown method: {method}")
+
+        self.set_weights(w)
+        return self.weights_
+
+    # (a) Brier Score Stacking (Equivalent to MSE for probabilities)
+    @staticmethod
+    def _fit_brier_weights(P, y, sw, l2=1e-3):
+        P = torch.as_tensor(P, dtype=torch.double)
+        y = torch.as_tensor(y, dtype=torch.double)
+        sw = torch.as_tensor(sw, dtype=torch.double)
+        K, N = P.shape
+
+        logits = torch.nn.Parameter(torch.zeros(K, dtype=torch.double))
+        opt = torch.optim.LBFGS([logits], lr=1.0, max_iter=60, line_search_fn='strong_wolfe')
+
+        def closure():
+            opt.zero_grad()
+            w = torch.softmax(logits, dim=0)
+            # Linear Pool: P_ens = sum(w_k * P_k)
+            p_ens = (w[:, None] * P).sum(dim=0)
+            
+            # Weighted Brier Score: sw * (y - p)^2
+            loss = (sw * (y - p_ens) ** 2).mean() + 0.5 * l2 * (logits ** 2).sum() / max(N, 1)
+            loss.backward()
+            return loss
+
+        # ... (optimization loop same as before) ...
+        prev = float('inf')
+        for _ in range(200):
+            loss = opt.step(closure)
+            if abs(prev - loss.item()) < 1e-7: break
+            prev = loss.item()
+            
+        with torch.no_grad():
+            w = torch.softmax(logits, dim=0).cpu().numpy()
+        return w
+
+    @staticmethod
+    def _fit_nll_class_weights(P, y, sw, l2=1e-3):
+        P = torch.as_tensor(P, dtype=torch.double)
+        y = torch.as_tensor(y, dtype=torch.double)
+        sw = torch.as_tensor(sw, dtype=torch.double)
+        K, N = P.shape
+        eps = 1e-15
+
+        logits = torch.nn.Parameter(torch.zeros(K, dtype=torch.double))
+        opt = torch.optim.LBFGS([logits], lr=1.0, max_iter=60, line_search_fn='strong_wolfe')
+
+        def closure():
+            opt.zero_grad()
+            w = torch.softmax(logits, dim=0)
+            p_ens = (w[:, None] * P).sum(dim=0)
+            p_safe = torch.clamp(p_ens, eps, 1.0 - eps)
+            
+            # Weighted Binary Cross Entropy
+            bce = -(y * torch.log(p_safe) + (1 - y) * torch.log(1 - p_safe))
+            loss = (sw * bce).mean() + 0.5 * l2 * (logits ** 2).sum() / max(N, 1)
+            
+            loss.backward()
+            return loss
+
+        # ... (optimization loop same as before) ...
+        prev = float('inf')
+        for _ in range(200):
+            loss = opt.step(closure)
+            if abs(prev - loss.item()) < 1e-7: break
+            prev = loss.item()
+
+        with torch.no_grad():
+            w = torch.softmax(logits, dim=0).cpu().numpy()
+        return w
+
+    def calibrate_class_weights(self, calib_dc, method="nll", **kwargs):
+        """
+        Classification Calibration
+        - precision: Inverse Entropy weighting (heuristic)
+        - mse:       Minimizes Brier Score (Weighted)
+        - nll:       Minimizes Binary Cross Entropy (Weighted)
+        """
+        # 1. Collect Probabilities and Sample Weights
+        P, y, sw = self._collect_probs(calib_dc)
+
+        if method == "uniform":
+            K = P.shape[0]
+            w = np.ones(K) / K
+            
+        elif method == "mse" or method == "brier":
+            if y is None: raise ValueError("mse/brier calibration requires labels (y).")
+            # "mse" in classification is Brier Score
+            w = self._fit_brier_weights(P, y, sw, l2=kwargs.get("l2", 1e-3))
+            
+        elif method == "nll":
+            if y is None: raise ValueError("nll calibration requires labels (y).")
+            w = self._fit_nll_class_weights(P, y, sw, l2=kwargs.get("l2", 1e-3))
+            
+        else:
+            raise ValueError(f"Unknown classification calibration method: {method}")
 
         self.set_weights(w)
         return self.weights_
@@ -1065,7 +1239,7 @@ class EnsembleGPTrainer:
         return self.weights_
 
     def predict_mixture_moments_w(self, dataset, w=None):
-        M, V, _ = self._collect_means_vars(dataset)
+        M, V, _, _ = self._collect_means_vars(dataset)
         w = self._get_weights_or_uniform() if w is None else np.asarray(w, dtype=float)
         return self._mixture_moment_match(M, V, w)
 
@@ -1086,7 +1260,53 @@ class EnsembleGPTrainer:
     def evaluate_mse_w(self, dataset, w=None):
         mu, _ = self.predict_mixture_moments_w(dataset, w=w)
         y = dataset.y.reshape(-1)
-        return float(np.mean((mu - y) ** 2))
+        
+        squared_errors = (mu - y) ** 2
+        
+        # Check if we should use sample weights and if they exist
+        if getattr(self, "use_weights", False) and dataset.w is not None:
+            wei = dataset.w.reshape(-1)
+            # np.average handles the division by sum of weights
+            return float(np.average(squared_errors, weights=wei))
+        else:
+            return float(np.mean(squared_errors))
+
+    def evaluate_auc_w(self, dataset, w=None, use_weights=False):
+        """
+        Evaluate AUC and Accuracy, respecting sample weights if requested.
+        """
+        # 1. Get Ensemble Probabilities
+        # (This uses the previously defined _collect_probs logic internally or similar)
+        # We assume self.predict(dataset) returns the weighted ensemble probability
+        probs, _ = self.predict(dataset) 
+        
+        # 2. Get Ground Truth and Weights
+        y_true = dataset.y.flatten()
+        
+        if use_weights and dataset.w is not None:
+            sample_weights = dataset.w.flatten()
+            # Normalize for stability (optional but recommended)
+            if sample_weights.sum() > 0:
+                sample_weights = sample_weights / sample_weights.mean()
+        else:
+            sample_weights = None  # sklearn handles None as uniform weights
+        
+        try:
+            auc = roc_auc_score(y_true, probs, sample_weight=sample_weights)
+        except ValueError:
+            # Handle edge case: only one class present in y_true
+            auc = 0.5
+
+        # 4. Compute Accuracy (Weighted)
+        preds = (probs > 0.5).astype(int)
+        acc = accuracy_score(y_true, preds, sample_weight=sample_weights)
+
+        return {
+            "auc": auc,
+            "acc": acc,
+            "probs": probs,
+            "y_true": y_true
+        }
 
     @staticmethod
     def _get_y_stats(model, device):
@@ -1116,12 +1336,11 @@ class EnsembleGPTrainer:
         var  = var_n  * (y_std ** 2)
         return mean, var  # tensors shape (N,)
 
-    # ---------- evaluation / prediction ----------
     def evaluate_mse(self, dataset: dc.data.NumpyDataset) -> float:
         """
         Compute MSE between mixture mean and true y (original units).
         """
-        X, y_true = self._dc_to_torch(dataset)
+        X, y_true, w = self._dc_to_torch(dataset)
 
         means = []
         for t in self.trainers:
@@ -1129,14 +1348,25 @@ class EnsembleGPTrainer:
             means.append(m)
 
         mean_mix = torch.stack(means, dim=0).mean(dim=0)  # (N,)
-        mse = torch.mean((mean_mix - y_true) ** 2).item()
-        return mse
+        
+        # Calculate squared errors
+        squared_errors = (mean_mix - y_true) ** 2
+
+        # --- NEW: Weighted Logic ---
+        if getattr(self, "use_weights", False) and w is not None:
+            w_flat = w.view(-1)
+            mse = torch.sum(squared_errors * w_flat) / torch.sum(w_flat)
+        else:
+            mse = torch.mean(squared_errors)
+        # ---------------------------
+
+        return mse.item()
 
     def predict_mean(self, dataset: dc.data.NumpyDataset) -> np.ndarray:
         """
         Mixture mean (equal weight), original units.
         """
-        X, _ = self._dc_to_torch(dataset)
+        X, _, _ = self._dc_to_torch(dataset)
         means = []
         for t in self.trainers:
             m, _ = self._component_mean_var(t.model, X)

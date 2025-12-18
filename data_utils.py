@@ -9,33 +9,6 @@ from scipy.stats import norm
 from sklearn.metrics import mean_squared_error
 
 
-# def compute_ece(probs, labels, n_bins=10):
-#     """
-#     Calculates Expected Calibration Error (ECE) for binary classification.
-#     UQ Metric for Classification: How well do predicted probabilities match actual accuracy?
-#     """
-#     bin_boundaries = np.linspace(0, 1, n_bins + 1)
-#     ece = 0.0
-#
-#     for i in range(n_bins):
-#         # Find points in this bin
-#         bin_mask = (probs > bin_boundaries[i]) & (probs <= bin_boundaries[i + 1])
-#         bin_count = np.sum(bin_mask)
-#
-#         if bin_count > 0:
-#             # Avg confidence in this bin
-#             prob_in_bin = probs[bin_mask]
-#             avg_confidence = np.mean(prob_in_bin)
-#
-#             # Actual accuracy in this bin
-#             label_in_bin = labels[bin_mask]
-#             avg_accuracy = np.mean(label_in_bin)
-#
-#             # Weighted difference
-#             ece += (bin_count / len(probs)) * np.abs(avg_accuracy - avg_confidence)
-#
-#     return ece
-
 
 def compute_ece(probs, labels, weights=None, n_bins=10):
     """
