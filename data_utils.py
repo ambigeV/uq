@@ -6,7 +6,7 @@ import numpy as np
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, roc_auc_score
 
 
 
@@ -134,14 +134,16 @@ def calculate_entropy(probs):
 
 def calculate_cutoff_classification_data(probs, y_true, weights=None, use_weights=False):
     """
-    Calculates Weighted Accuracy/AUC for subsets of data sorted by confidence.
+    Calculates Weighted AUC and Brier Score for subsets of data sorted by confidence.
     """
     # 1. Flatten
     probs = probs.flatten()
     y_true = y_true.flatten()
 
     # 2. Define Uncertainty (Entropy)
-    uncertainty = calculate_entropy(probs)
+    # Assuming calculate_entropy is defined elsewhere or imported
+    # If not, use: uncertainty = - (probs * np.log(probs + 1e-9) + (1-probs) * np.log(1-probs + 1e-9))
+    uncertainty = calculate_entropy(probs) 
 
     # 3. Prepare DataFrame
     if use_weights and weights is not None:
@@ -167,21 +169,25 @@ def calculate_cutoff_classification_data(probs, y_true, weights=None, use_weight
         n_keep = int(np.ceil(N * cutoff))
         subset = data.iloc[:n_keep]
 
-        # Hard Predictions (Threshold 0.5)
-        preds = (subset['prob'] > 0.5).astype(int)
+        # Extract columns for clarity
+        sub_y = subset['y_true']
+        sub_probs = subset['prob']
+        sub_weights = subset['weight']
 
-        # [METRIC 1] Weighted Accuracy
-        correct = (subset['y_true'] == preds).astype(float)
-        acc = np.average(correct, weights=subset['weight'])
+        # [METRIC 1] Weighted AUC (Replaces Accuracy)
+        # Safety Check: AUC is undefined if only 1 class is present in the subset
+        if len(np.unique(sub_y)) > 1:
+            auc = roc_auc_score(sub_y, sub_probs, sample_weight=sub_weights)
+        else:
+            auc = np.nan  # Handle single-class subsets gracefully
 
         # [METRIC 2] Weighted Brier Score (MSE in prob space)
-        # Brier = mean( (y - p)^2 )
-        sq_err = (subset['y_true'] - subset['prob']) ** 2
-        brier = np.average(sq_err, weights=subset['weight'])
+        sq_err = (sub_y - sub_probs) ** 2
+        brier = np.average(sq_err, weights=sub_weights)
 
         results.append({
             'Confidence_Cutoff': cutoff,
-            'Accuracy': acc,
+            'AUC': auc,           # Changed from 'Accuracy'
             'Brier_Score': brier,
             'N_Samples': n_keep
         })
