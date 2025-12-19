@@ -198,6 +198,8 @@ def main_nngp_exact(train_dc, valid_dc, test_dc, device: str = "cpu", run_id=0, 
 
         # 4) Train
         dev = "cpu"
+        print(f"DEBUG CHECK: Variable 'dev' is {dev}")
+        print(f"DEBUG CHECK: Variable 'device' is {device}") # I suspect this will print 'cuda:X'
         trainer = GPClassificationTrainer(
             model=nngp_classifier,
             train_dataset=train_dc,
@@ -207,7 +209,7 @@ def main_nngp_exact(train_dc, valid_dc, test_dc, device: str = "cpu", run_id=0, 
             warmup_iters=5,
             clip_grad=1.0,
             num_iters=50,
-            device=device,
+            device=dev,
             log_interval=40,
             use_weights=use_weights  
         )
@@ -442,88 +444,193 @@ def main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc, E=5, run_id=0
             y_np = y_np[:, 0]
         y_train_torch = torch.from_numpy(y_np).float()
 
+        train_w_torch = None
+        if use_weights and train_dc.w is not None:
+            print("--> Using per-point precision weights via NN-SVGP")
+            w_np = ds_i.w
+            if w_np.ndim == 2:
+                w_np = w_np[:, 0]
+            train_w_torch = torch.from_numpy(w_np).float()
+        
+        Ni = X_train_torch.shape[0]
+
         # Ni = X_train_torch.shape[0]
-        feat = FeatureNet(in_dim=in_dim, feat_dim=64, hidden=(128, 64), dropout=0.0)
-        gp_model_i = GPyTorchRegressor(
-            train_x=X_train_torch,
-            train_y=y_train_torch,
-            normalize_x=False,                        # BatchNorm handles scale
-            gp_model_cls=NNSVGPLearnedInducing,
-            likelihood=gpytorch.likelihoods.GaussianLikelihood(),
-            feature_extractor=feat,
-            num_inducing=M,
-            kernel="matern52")
+        if mode == "regression":
+            feat = FeatureNet(in_dim=in_dim, feat_dim=64, hidden=(128, 64), dropout=0.0)
+            gp_model_i = GPyTorchRegressor(
+                train_x=X_train_torch,
+                train_y=y_train_torch,
+                normalize_x=False,                        # BatchNorm handles scale
+                gp_model_cls=NNSVGPLearnedInducing,
+                likelihood=gpytorch.likelihoods.GaussianLikelihood(),
+                feature_extractor=feat,
+                num_inducing=M,
+                kernel="matern52")
 
-        items.append({
-            "model": gp_model_i,
-            "train_dataset": ds_i,
-            "lr": 5e-3,
-            "nn_lr": 1e-3,
-            "ngd_lr": 0.02,
-            "warmup_iters": 5,
-            "clip_grad": 1.0,
-            "num_iters": 500,
-            "log_interval": 40,
-        })
-
-    # ---------------- 3) Train ensemble once ----------------
-    ens = EnsembleGPTrainer(items, device="cpu")
-    ens.train()
-    K = len(ens.trainers)
-
-    # ---------------- 4) Loop over weighting strategies ----------------
-    strategies = [
-        # name, kwargs, needs_labels?
-        ("uniform", {}, False),
-        ("precision", {"tau": 1.0}, False),
-        ("mse",       {"l2": 1e-3}, True),
-        ("nll",       {"l2": 1e-3, "dirichlet_alpha": 1.05}, True),
-    ]
-
-    results = []
-    cut_offs = []
-    for name, kwargs, _needs_y in strategies:
-        # (a) get weights
-        if name == "uniform":
-            w = np.ones(K, dtype=float) / K
-            print(f"\n[Calib:{name}] Using uniform weights.")
+            items.append({
+                "model": gp_model_i,
+                "train_dataset": ds_i,
+                "lr": 5e-3,
+                "nn_lr": 1e-3,
+                "ngd_lr": 0.02,
+                "warmup_iters": 5,
+                "clip_grad": 1.0,
+                "num_iters": 500,
+                "log_interval": 40,
+            })
         else:
-            w = ens.calibrate_weights(valid_dc, method=name, **kwargs)
-            print(f"\n[Calib:{name}] Weights: {np.round(w, 4)}")
+            feat = FeatureNet(in_dim=in_dim, feat_dim=64, hidden=(128, 64), dropout=0.0)
+            gp_model_i = GPyTorchClassifier(
+                train_x=X_train_torch,
+                train_y=y_train_torch,
+                normalize_x=False,
+                gp_model_cls=NNSVGPLearnedInducing,
+                feature_extractor=feat,
+                num_inducing = max(512, Ni//10),
+                kernel="matern52"
+            )
+            items.append({
+                "model": gp_model_i,
+                "train_dataset": ds_i,
+                "lr": 0.01,
+                "nn_lr": 1e-3,
+                "ngd_lr": 0.02,
+                "warmup_iters": 5,
+                "clip_grad": 1.0,
+                "num_iters": 500,
+                "log_interval": 40,
+            })
 
-        # (b) evaluate on valid/test with these weights
-        valid_mse = ens.evaluate_mse_w(valid_dc, w=w)
-        test_mse  = ens.evaluate_mse_w(test_dc,  w=w)
-        print(f"[{name}] Validation MSE: {valid_mse:.6f}")
-        print(f"[{name}] Test MSE:       {test_mse:.6f}")
+    if mode == "regression":
+        # ---------------- 3) Train ensemble once ----------------
+        ens = EnsembleGPTrainer(items, device="cpu", use_weights=use_weights)
+        ens.train()
+        K = len(ens.trainers)
 
-        # (c) UQ on test via weighted moment-matched mixture
-        mean_test, lower_test, upper_test = ens.predict_interval_w(test_dc, alpha=0.05, w=w)
-        cutoff_error_df = calculate_cutoff_error_data(mean_test, upper_test-lower_test, test_dc.y)
-        cut_offs.append(cutoff_error_df)
-        uq_metrics = evaluate_uq_metrics_from_interval(
-            y_true=test_dc.y,
-            mean=mean_test,
-            lower=lower_test,
-            upper=upper_test,
-            alpha=0.05,
-            test_error=test_mse,
-        )
-        print(f"[{name}] UQ metrics: {uq_metrics}")
+        # ---------------- 4) Loop over weighting strategies ----------------
+        strategies = [
+            # name, kwargs, needs_labels?
+            ("uniform", {}, False),
+            ("precision", {"tau": 1.0}, False),
+            ("mse",       {"l2": 1e-3}, True),
+            ("nll",       {"l2": 1e-3, "dirichlet_alpha": 1.05}, True),
+        ]
 
-        results.append({
-            "name": name,
-            "weights": w,
-            "valid_mse": valid_mse,
-            "test_mse": test_mse,
-            "uq_metrics": uq_metrics,
-        })
+        results = []
+        cut_offs = []
+        for name, kwargs, _needs_y in strategies:
+            # (a) get weights
+            if name == "uniform":
+                w = np.ones(K, dtype=float) / K
+                print(f"\n[Calib:{name}] Using uniform weights.")
+            else:
+                w = ens.calibrate_weights(valid_dc, method=name, **kwargs)
+                print(f"\n[Calib:{name}] Weights: {np.round(w, 4)}")
 
-    # ---------------- 5) Pretty summary ----------------
-    print("\n===== Summary over weighting strategies =====")
-    for r in results:
-        w_str = " ".join([f"{x:.3f}" for x in r["weights"]])
-        print(f"{r['name']:>9} | valid MSE: {r['valid_mse']:.6f} | test MSE: {r['test_mse']:.6f} | w: [{w_str}]")
+            # (b) evaluate on valid/test with these weights
+            valid_mse = ens.evaluate_mse_w(valid_dc, w=w)
+            test_mse  = ens.evaluate_mse_w(test_dc,  w=w)
+            print(f"[{name}] Validation MSE: {valid_mse:.6f}")
+            print(f"[{name}] Test MSE:       {test_mse:.6f}")
+
+            # (c) UQ on test via weighted moment-matched mixture
+            mean_test, lower_test, upper_test = ens.predict_interval_w(test_dc, alpha=0.05, w=w)
+            cutoff_error_df = calculate_cutoff_error_data(mean_test, upper_test-lower_test, test_dc.y, test_dc.w, use_weights)
+            cut_offs.append(cutoff_error_df)
+            uq_metrics = evaluate_uq_metrics_from_interval(
+                y_true=test_dc.y,
+                mean=mean_test,
+                lower=lower_test,
+                upper=upper_test,
+                alpha=0.05,
+                test_error=test_mse,
+                weights=test_dc.w,
+                use_weights=use_weights
+            )
+            print(f"[{name}] UQ metrics: {uq_metrics}")
+
+            results.append({
+                "name": name,
+                "weights": w,
+                "valid_mse": valid_mse,
+                "test_mse": test_mse,
+                "uq_metrics": uq_metrics,
+            })
+
+        # ---------------- 5) Pretty summary ----------------
+        print("\n===== Summary over weighting strategies =====")
+        for r in results:
+            w_str = " ".join([f"{x:.3f}" for x in r["weights"]])
+            print(f"{r['name']:>9} | valid MSE: {r['valid_mse']:.6f} | test MSE: {r['test_mse']:.6f} | w: [{w_str}]")
+    
+    else:
+        # ---------------- 3) Train ensemble once ----------------
+        ens = EnsembleGPTrainer(items, device="cpu", mode=mode, use_weights=use_weights)
+        ens.train()
+        K = len(ens.trainers)
+
+        # ---------------- 4) Loop over weighting strategies ----------------
+        strategies = [
+            # name, kwargs, needs_labels?
+            ("uniform", {}, False),
+            ("mse",       {"l2": 1e-3}, True),
+            ("nll",       {"l2": 1e-3, "dirichlet_alpha": 1.05}, True),
+        ]
+
+        results = []
+        cut_offs = []
+
+        for name, kwargs, _needs_y in strategies:
+            # (a) get weights
+            if name == "uniform":
+                w = np.ones(K, dtype=float) / K
+                print(f"\n[Calib:{name}] Using uniform weights.")
+            else:
+                w = ens.calibrate_class_weights(valid_dc, method=name, **kwargs)
+                print(f"\n[Calib:{name}] Weights: {np.round(w, 4)}")
+
+            # (b) evaluate on valid/test with these weights
+            valid_metrics = ens.evaluate_auc_w(valid_dc, w=w)
+            test_metrics  = ens.evaluate_auc_w(test_dc,  w=w)
+            print(f"\n[GP Classification] Validation AUC: {valid_metrics['auc']:.4f} | Acc: {valid_metrics['acc']:.4f}")
+            print(f"[GP Classification] Test AUC:       {test_metrics['auc']:.4f} | Acc: {test_metrics['acc']:.4f}")
+
+            # 5. UQ Analysis: Calibration (ECE)
+            test_probs = test_metrics["probs"]
+            test_y = test_metrics["y_true"]
+
+            ece_score = compute_ece(test_probs, test_y, n_bins=20)
+            print(f"[GP Classification] Test ECE (UQ):  {ece_score:.4f}")
+
+            # mean_test, lower_test, upper_test = trainer.predict_interval(test_dc, alpha=0.05, use_weights=use_weights)
+            cutoff_error_df = calculate_cutoff_classification_data(test_probs,
+                                                                   test_dc.y,
+                                                                   weights=test_dc.w,
+                                                                   use_weights=use_weights)
+            cut_offs.append(cutoff_error_df)
+            uq_metrics = evaluate_uq_metrics_classification(
+                y_true=test_dc.y,
+                probs=test_probs,
+                weights=test_dc.w,
+                use_weights=use_weights,
+                n_bins=20
+            )
+            print(f"[{name}] UQ metrics: {uq_metrics}")
+            
+
+            results.append({
+                "name": name,
+                "weights": w,
+                "valid_auc": valid_metrics['auc'],
+                "test_auc": test_metrics['auc'],
+                "uq_metrics": uq_metrics,
+            })
+
+        # ---------------- 5) Pretty summary ----------------
+        print("\n===== Summary over weighting strategies =====")
+        for r in results:
+            w_str = " ".join([f"{x:.3f}" for x in r["weights"]])
+            print(f"{r['name']:>9} | valid MSE: {r['valid_auc']:.6f} | test MSE: {r['test_auc']:.6f} | w: [{w_str}]")
 
     return results, cut_offs
 
@@ -1090,7 +1197,9 @@ def main_nn(dataset_name: str = "delaney",
 def run_once_gp(dataset_name: str,
                 seed: int = 0,
                 run_id: int = 0,
-                split: str = "random"):
+                split: str = "random",
+                mode: str = "regression",
+                use_weights: bool = False):
     """
     One full run on a given dataset with a fixed seed,
     running both Exact GP and SVGP in a single shot.
@@ -1108,39 +1217,40 @@ def run_once_gp(dataset_name: str,
     results = {}
     all_cutoff_dfs = []
 
-    use_weights = True
+    use_weights = False
     if dataset_name in ["tox21"]:
         use_weights = True
 
     if dataset_name not in ["qm8"]:
-        results["gp_exact"], gp_cut_off = main_gp(train_dc, valid_dc, test_dc, run_id, use_weights=use_weights)
+        results["gp_exact"], gp_cut_off = main_gp(train_dc, valid_dc, test_dc, run_id, use_weights=use_weights, mode=mode)
         gp_cut_off['Method'] = "gp_exact"
         all_cutoff_dfs.append(gp_cut_off)
-        results["gp_nngp"], nngp_cut_off = main_nngp_exact(train_dc, valid_dc, test_dc, run_id)
+        results["gp_nngp"], nngp_cut_off = main_nngp_exact(train_dc, valid_dc, test_dc, run_id, use_weights=use_weights, mode=mode)
         nngp_cut_off['Method'] = "gp_nngp"
         all_cutoff_dfs.append(nngp_cut_off)
 
-    results["gp_svgp"], svgp_cut_off = main_svgp(train_dc, valid_dc, test_dc, run_id)
-    svgp_cut_off['Method'] = "gp_svgp"
-    all_cutoff_dfs.append(svgp_cut_off)
+    if mode == "regression":
+        results["gp_svgp"], svgp_cut_off = main_svgp(train_dc, valid_dc, test_dc, run_id)
+        svgp_cut_off['Method'] = "gp_svgp"
+        all_cutoff_dfs.append(svgp_cut_off)
 
-    results["gp_nnsvgp"], nnsvgp_cut_off = main_nngp_svgp(train_dc, valid_dc, test_dc, run_id)
-    nnsvgp_cut_off['Method'] = "gp_nnsvgp"
-    all_cutoff_dfs.append(nnsvgp_cut_off)
+        results["gp_nnsvgp"], nnsvgp_cut_off = main_nngp_svgp(train_dc, valid_dc, test_dc, run_id)
+        nnsvgp_cut_off['Method'] = "gp_nnsvgp"
+        all_cutoff_dfs.append(nnsvgp_cut_off)
 
-    result, cut_offs = main_svgp_ensemble_all(train_dc, valid_dc, test_dc, run_id=run_id)
+        result, cut_offs = main_nngp_exact_ensemble_all(train_dc, valid_dc, test_dc, run_id=run_id)
+        for idx, cur in enumerate(result):
+            results["nngp_ensemble_{}".format(cur["name"])] = cur["uq_metrics"]
+            cut_offs[idx]['Method'] = "nngp_ensemble_{}".format(cur["name"])
+            all_cutoff_dfs.append(cut_offs[idx])
+
+    result, cut_offs = main_svgp_ensemble_all(train_dc, valid_dc, test_dc, run_id=run_id, use_weights=use_weights, mode=mode)
     for idx, cur in enumerate(result):
         results["svgp_ensemble_{}".format(cur["name"])] = cur["uq_metrics"]
         cut_offs[idx]['Method'] = "svgp_ensemble_{}".format(cur["name"])
-        all_cutoff_dfs.append(cut_offs[idx])
+        all_cutoff_dfs.append(cut_offs[idx])    
 
-    result, cut_offs = main_nngp_exact_ensemble_all(train_dc, valid_dc, test_dc, run_id=run_id)
-    for idx, cur in enumerate(result):
-        results["nngp_ensemble_{}".format(cur["name"])] = cur["uq_metrics"]
-        cut_offs[idx]['Method'] = "nngp_ensemble_{}".format(cur["name"])
-        all_cutoff_dfs.append(cut_offs[idx])
-
-    result, cut_offs = main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc, run_id=run_id)
+    result, cut_offs = main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc, run_id=run_id, use_weights=use_weights, mode=mode)
     for idx, cur in enumerate(result):
         results["nnsvgp_ensemble_{}".format(cur["name"])] = cur["uq_metrics"]
         cut_offs[idx]['Method'] = "nnsvgp_ensemble_{}".format(cur["name"])
@@ -1152,7 +1262,7 @@ def run_once_gp(dataset_name: str,
     combined_cutoff_df = pd.concat(all_cutoff_dfs, ignore_index=True)
 
     # Define a consistent filename
-    output_filename = f"./cdata/figure/{split}_{dataset_name}_GP_cutoff_run_{run_id}.csv"
+    output_filename = f"./cdata_{mode}/figure/{split}_{dataset_name}_GP_cutoff_run_{run_id}.csv"
 
     # Store the final combined data
     combined_cutoff_df.to_csv(output_filename, index=False)
@@ -1170,7 +1280,9 @@ def run_once_gp(dataset_name: str,
 def main_gp_all(dataset_name: str = "delaney",
                 n_runs: int = 5,
                 split: str = "random",
-                base_seed: int = 0):
+                base_seed: int = 0,
+                mode: str = "regression",
+                use_weights: bool = False):
     """
     Multi-run driver for GP + SVGP, analogous to main_nn().
 
@@ -1182,7 +1294,7 @@ def main_gp_all(dataset_name: str = "delaney",
 
     for run_idx in range(n_runs):
         seed = base_seed + run_idx
-        run_res = run_once_gp(dataset_name=dataset_name, seed=seed, run_id=run_idx, split=split)
+        run_res = run_once_gp(dataset_name=dataset_name, seed=seed, run_id=run_idx, split=split, mode=mode, use_weights=use_weights)
 
         for method, uq_dict in run_res.items():
             all_results.setdefault(method, []).append(uq_dict)
@@ -1211,42 +1323,46 @@ def main_gp_all(dataset_name: str = "delaney",
     save_summary_to_csv(
         all_results,
         n_runs,
-        "./cdata/GP_{}_{}_c.csv".format(split, dataset_name),
+        "./cdata_{}/GP_{}_{}_c.csv".format(mode, split, dataset_name),
     )
-
-
-if __name__ == "__main__":
-    # main_svgp_ensemble_all()
-    # main_nngp_exact()
-    # main_nngp_exact_ensemble_all()
-    # main_nngp_svgp_exact_ensemble_all()
-    # main_nn()
-    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset(
-        dataset_name="delaney",
-        split="random"
-    )
-    main_svgp_ensemble_all(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc,
-                    run_id=0, use_weights=False, mode="regression")
-    main_svgp_ensemble_all(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc,
-                    run_id=0, use_weights=True, mode="regression")
 
 
 # if __name__ == "__main__":
-#     import argparse
-#
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument("--dataset", type=str, default="delaney",
-#                         choices=["qm7", "qm8", "delaney", "lipo"])
-#     parser.add_argument("--n_runs", type=int, default=5)
-#     parser.add_argument("--base_seed", type=int, default=0)
-#     parser.add_argument("--split", type=str, default="random",
-#                         choices=["random", "scaffold"])
-#     args = parser.parse_args()
-#
-#     main_gp_all(dataset_name=args.dataset,
-#                 n_runs=args.n_runs,
-#                 split=args.split,
-#                 base_seed=args.base_seed)
+#     # main_svgp_ensemble_all()
+#     # main_nngp_exact()
+#     # main_nngp_exact_ensemble_all()
+#     # main_nngp_svgp_exact_ensemble_all()
+#     # main_nn()
+#     tasks, train_dc, valid_dc, test_dc, transformers = load_dataset(
+#         dataset_name="tox21",
+#         split="random"
+#     )
+#     main_svgp_ensemble_all(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc,
+#                     run_id=0, use_weights=False, mode="classification")
+#     main_svgp_ensemble_all(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc,
+#                     run_id=0, use_weights=True, mode="classification")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, default="delaney",
+                        choices=["qm7", "qm8", "delaney", "lipo", "tox21"])
+    parser.add_argument("--n_runs", type=int, default=5)
+    parser.add_argument("--base_seed", type=int, default=0)
+    parser.add_argument("--split", type=str, default="random",
+                        choices=["random", "scaffold"])
+    parser.add_argument("--mode", type=str, default="regression",
+                        choices=["regression", "classification"])
+    args = parser.parse_args()
+
+    main_gp_all(dataset_name=args.dataset,
+                n_runs=args.n_runs,
+                split=args.split,
+                base_seed=args.base_seed,
+                mode = args.mode,
+                use_weights = (args.mode == "classification"))
     
     # main_nn(dataset_name=args.dataset,
     #         n_runs=args.n_runs,

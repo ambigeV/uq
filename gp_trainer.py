@@ -907,8 +907,7 @@ class EnsembleGPTrainer:
                 out = t.model(X)
                 # If output is logits, apply sigmoid:
                 if hasattr(out, 'mean'): 
-                    # For GP classification, mean is usually prob (Bernoulli likelihood)
-                    p = out.mean 
+                    p = out 
                 else:
                     p = out
                 
@@ -957,6 +956,22 @@ class EnsembleGPTrainer:
         second = (w[:, None] * (V + M ** 2)).sum(axis=0)
         var = np.maximum(second - mu ** 2, 1e-12)
         return mu, var
+
+    def predict_mixture_probs_w(self, dataset, w=None):
+        # 1. Collect raw probabilities from all models
+        # (Using the _collect_probs we defined earlier)
+        P, _, _ = self._collect_probs(dataset)
+
+        # 2. Determine ensemble weights
+        # (Assuming you have this helper, otherwise use self.weights_)
+        w = self._get_weights_or_uniform() if w is None else np.asarray(w, dtype=float)
+        
+        # 3. Linear Opinion Pool (Weighted Average of Probabilities)
+        # P shape: (K, N), w shape: (K,)
+        # Broadcast w over the rows of P and sum
+        probs_ensemble = (w[:, None] * P).sum(axis=0)
+        
+        return probs_ensemble
 
     # ===== Strategy 1: Precision-only =======================================
     @staticmethod
@@ -1271,35 +1286,40 @@ class EnsembleGPTrainer:
         else:
             return float(np.mean(squared_errors))
 
-    def evaluate_auc_w(self, dataset, w=None, use_weights=False):
+    def evaluate_auc_w(self, dataset, w=None, use_weights=None):
         """
-        Evaluate AUC and Accuracy, respecting sample weights if requested.
+        Computes AUC and Accuracy, respecting sample weights if configured.
         """
-        # 1. Get Ensemble Probabilities
-        # (This uses the previously defined _collect_probs logic internally or similar)
-        # We assume self.predict(dataset) returns the weighted ensemble probability
-        probs, _ = self.predict(dataset) 
-        
-        # 2. Get Ground Truth and Weights
+        # 1. Get Ensemble Predictions (Probabilities)
+        probs = self.predict_mixture_probs_w(dataset, w=w)
         y_true = dataset.y.flatten()
-        
-        if use_weights and dataset.w is not None:
-            sample_weights = dataset.w.flatten()
-            # Normalize for stability (optional but recommended)
-            if sample_weights.sum() > 0:
-                sample_weights = sample_weights / sample_weights.mean()
-        else:
-            sample_weights = None  # sklearn handles None as uniform weights
-        
-        try:
-            auc = roc_auc_score(y_true, probs, sample_weight=sample_weights)
-        except ValueError:
-            # Handle edge case: only one class present in y_true
-            auc = 0.5
 
-        # 4. Compute Accuracy (Weighted)
+        # 2. Handle Data Weights (Data-Awareness)
+        # Allow overriding use_weights arg, otherwise fallback to class attribute
+        if use_weights is None:
+            use_weights = getattr(self, "use_weights", False)
+
+        if use_weights and dataset.w is not None:
+            wei = dataset.w.flatten()
+            # Normalize weights for stability in sklearn metrics
+            if wei.sum() > 0:
+                wei = wei / wei.mean()
+        else:
+            wei = None # sklearn treats None as uniform weights
+
+        # 3. Compute Metrics
+        from sklearn.metrics import roc_auc_score, accuracy_score
+        
+        # AUC
+        try:
+            auc = roc_auc_score(y_true, probs, sample_weight=wei)
+        except ValueError:
+            # Handles edge case: only one class present in batch
+            auc = 0.5
+            
+        # Accuracy (Threshold 0.5)
         preds = (probs > 0.5).astype(int)
-        acc = accuracy_score(y_true, preds, sample_weight=sample_weights)
+        acc = accuracy_score(y_true, preds, sample_weight=wei)
 
         return {
             "auc": auc,
@@ -1307,7 +1327,7 @@ class EnsembleGPTrainer:
             "probs": probs,
             "y_true": y_true
         }
-
+    
     @staticmethod
     def _get_y_stats(model, device):
         # y_std/y_mean may be registered buffers in your wrapper; fall back to (1,0)
