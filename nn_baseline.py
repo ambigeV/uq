@@ -64,6 +64,124 @@ class HeteroscedasticL2Loss(Loss):
         return loss
 
 
+class EvidentialClassificationLoss(Loss):
+    """
+    Deep Evidential Classification Loss wrapper for DeepChem.
+    
+    Implements the loss function L = L_risk + lambda * L_reg (KL Divergence).
+    Designed to work with a model that outputs Dirichlet parameters (alpha).
+    """
+    def __init__(self, mode='mse', num_classes=2, annealing_step=10, epoch_tracker=None):
+        """
+        Args:
+            mode (str): The loss variant - 'mse', 'log', or 'digamma'.
+                        'mse' is generally the most stable for EDL.
+            num_classes (int): Number of classes. For Binary, this MUST be 2.
+            annealing_step (int): The number of epochs over which to ramp up the KL penalty.
+            epoch_tracker (list): A mutable list containing the current epoch number (e.g., [0]).
+                                  This allows the loss to access the training progress since 
+                                  DeepChem's loss signature is stateless.
+        """
+        self.mode = mode
+        self.num_classes = num_classes
+        self.annealing_step = annealing_step
+        # Default to full penalty (epoch=100) if no tracker is provided
+        self.epoch_tracker = epoch_tracker if epoch_tracker is not None else [100]
+        super(EvidentialClassificationLoss, self).__init__()
+
+    def _create_pytorch_loss(self):
+        
+        # --- 1. Internal Helper: KL Divergence for Dirichlet ---
+        def kl_divergence(alpha, num_classes):
+            ones = torch.ones([1, num_classes], dtype=torch.float32, device=alpha.device)
+            sum_alpha = torch.sum(alpha, dim=1, keepdim=True)
+            first_term = (
+                torch.lgamma(sum_alpha)
+                - torch.lgamma(alpha).sum(dim=1, keepdim=True)
+                + torch.lgamma(ones).sum(dim=1, keepdim=True)
+                - torch.lgamma(ones.sum(dim=1, keepdim=True))
+            )
+            second_term = (
+                (alpha - ones)
+                .mul(torch.digamma(alpha) - torch.digamma(sum_alpha))
+                .sum(dim=1, keepdim=True)
+            )
+            return first_term + second_term
+
+        def get_annealing_coef(epoch, annealing_step):
+            # Linearly increase from 0 to 1 over 'annealing_step' epochs
+            return torch.min(
+                torch.tensor(1.0, dtype=torch.float32),
+                torch.tensor(epoch / annealing_step, dtype=torch.float32),
+            )
+
+        # --- 3. The Main Loss Function ---
+        def loss(output, labels):
+            # A. Tuple Handling
+            # If the model returns (prob, alpha, ale, epi), DeepChem routes 'alpha' here.
+            # However, if configurations change, we safeguard against receiving the tuple.
+            # if isinstance(output, (tuple, list)):
+            #     # "prediction" is index 0, "loss" (alpha) is index 1
+            #     output = output[1] 
+
+            # B. Shape Consistency
+            output, labels = _make_pytorch_shapes_consistent(output, labels)
+            
+            # C. Define Alpha (Evidence + 1)
+            # We assume the model layer 'DenseDirichlet' has already returned alpha.
+            alpha = output 
+
+            # D. Label Handling (One-Hot Encoding)
+            # DeepChem binary labels are often shape (Batch, 1) or (Batch, Tasks) with values 0/1.
+            # EDL requires One-Hot: (Batch, 2) i.e., [Evidence_Class0, Evidence_Class1]
+            if labels.shape[-1] == 1: 
+                # Squeeze the last dim to get indices, then one_hot encode
+                # Ensure labels are LongTensor for one_hot
+                y_onehot = F.one_hot(labels.long().squeeze(-1), num_classes=self.num_classes).float()
+            else:
+                # Assume already one-hot or proper shape
+                y_onehot = labels.float()
+
+            # E. Calculate Risk Loss (MSE / Log / Digamma)
+            S = torch.sum(alpha, dim=1, keepdim=True)
+            
+            if self.mode == 'mse':
+                # Expected Mean Squared Error + Variance term
+                pred_prob = alpha / S
+                loss_err = torch.sum((y_onehot - pred_prob) ** 2, dim=1, keepdim=True)
+                loss_var = torch.sum(
+                    alpha * (S - alpha) / (S * S * (S + 1)), dim=1, keepdim=True
+                )
+                base_loss = loss_err + loss_var
+
+            elif self.mode == 'log':
+                # Negative Log of the Expected Likelihood
+                base_loss = torch.sum(y_onehot * (torch.log(S) - torch.log(alpha)), dim=1, keepdim=True)
+
+            elif self.mode == 'digamma':
+                # Expected Cross Entropy (using Digamma)
+                base_loss = torch.sum(y_onehot * (torch.digamma(S) - torch.digamma(alpha)), dim=1, keepdim=True)
+
+            else:
+                raise ValueError(f"Unknown mode: {self.mode}")
+
+            # F. Calculate Regularization (KL Divergence)
+            # Penalize divergence from uniform Dirichlet (alpha=1) for non-target classes
+            kl_alpha = (alpha - 1) * (1 - y_onehot) + 1
+            
+            current_epoch_val = self.epoch_tracker[0] 
+            annealing_coef = get_annealing_coef(current_epoch_val, self.annealing_step)
+            
+            kl = annealing_coef * kl_divergence(kl_alpha, self.num_classes)
+            
+            # G. Combine and Return Mean
+            total_loss_per_sample = base_loss + kl
+            
+            return torch.mean(total_loss_per_sample)
+
+        return loss
+
+
 class EvidentialRegressionLoss(Loss):
     """
     Deep Evidential Regression Loss (NIG distribution):
@@ -144,6 +262,66 @@ class EvidentialRegressionLoss(Loss):
             return loss_per_sample
 
         return loss
+
+
+class DenseDirichlet(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        """
+        Args:
+            in_dim: Input feature dimension.
+            out_dim: Number of classes (usually 2 for binary classification tasks).
+        """
+        super(DenseDirichlet, self).__init__()
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+
+        # Define the dimensions for the hidden layers (Matching your Regression Style)
+        HIDDEN_DIM_1 = 128
+        HIDDEN_DIM_2 = 64
+
+        self.dense = nn.Sequential(
+            # --- Layer 1 ---
+            nn.Linear(self.in_dim, HIDDEN_DIM_1),
+            nn.BatchNorm1d(HIDDEN_DIM_1), 
+            nn.ReLU(),
+            
+            # --- Layer 2 ---
+            nn.Linear(HIDDEN_DIM_1, HIDDEN_DIM_2),
+            nn.BatchNorm1d(HIDDEN_DIM_2), 
+            nn.ReLU(),
+            
+            # --- Output Layer ---
+            # Output dimension is just 'out_dim' (number of classes), not 4x
+            nn.Linear(HIDDEN_DIM_2, self.out_dim),
+        )
+
+    def forward(self, x):
+        logits = self.dense(x)
+        
+        # Evidence is typically exp(logits) or softplus(logits)
+        # Using exp ensures evidence > 0. Adding 1 ensures alpha >= 1.
+        evidence = torch.exp(logits) 
+        alpha = evidence + 1
+
+        # Calculate S (sum of alphas) - Strength of the Dirichlet distribution
+        S = torch.sum(alpha, dim=1, keepdim=True)
+        K = self.out_dim
+
+        # 1. Prediction (Expected Probability): alpha_k / S
+        prob = alpha / S
+
+        # 2. Epistemic Uncertainty: K / S (inversely related to total evidence)
+        epistemic = K / S
+
+        # 3. Aleatoric Uncertainty: Entropy of the expected probability
+        # calculate entropy H(p) = - sum(p * log(p))
+        aleatoric = -torch.sum(prob * torch.log(prob + 1e-8), dim=1, keepdim=True)
+
+        # RETURN ORDER MATTERS FOR DEEPCHEM:
+        # 1. prob  -> For Metric evaluation (AUC, Accuracy)
+        # 2. alpha -> For Loss calculation (Evidential Loss)
+        # 3/4. Uncertainties -> For analysis
+        return prob, alpha, aleatoric, epistemic
 
 
 class DenseNormalGamma(nn.Module):
@@ -298,78 +476,6 @@ class DeepEnsembleRegressor:
         upper = mean + z * std
 
         return mean, lower, upper
-
-
-# ============================================================
-# 4. MC Dropout Wrapper
-# ============================================================
-
-# class MCDropoutRegressor:
-#     """
-#     Wrapper for MC-Dropout inference.
-#     Calls model.model.train() to activate dropout at inference.
-#     """
-#     def __init__(self, dc_model, n_samples=30):
-#         self.model = dc_model
-#         self.n_samples = n_samples
-#
-#     def predict_samples(self, dataset):
-#         preds = []
-#
-#         self.model.model.train()
-#
-#         for _ in range(self.n_samples):
-#             p = self.model.predict(dataset)[:, 0]  # (N,)
-#             preds.append(p)
-#
-#         return np.stack(preds, axis=0)        # (S, N)
-#
-#     def predict_interval(self, dataset, alpha=0.05):
-#         Y = self.predict_samples(dataset)     # (S, N)
-#         mean = Y.mean(axis=0)
-#         std  = Y.std(axis=0) + 1e-8
-#
-#         z = norm.ppf(1 - alpha/2)
-#         lower = mean - z * std
-#         upper = mean + z * std
-#
-#         return mean, lower, upper
-
-
-# ============================================================
-# 5. TRAINING FUNCTIONS
-# ============================================================
-
-# ------------------------------
-# Baseline NN (no UQ)
-# ------------------------------
-# def train_nn_baseline(train_dc, valid_dc, test_dc):
-#     n_tasks = train_dc.y.shape[1]
-#     n_features = train_dc.X.shape[1]
-
-#     model = MyTorchRegressor(n_features, n_tasks)
-#     loss = dc.models.losses.L2Loss()
-
-#     dc_model = dc.models.TorchModel(
-#         model=model,
-#         loss=loss,
-#         output_types=['prediction'],
-#         batch_size=64,
-#         learning_rate=1e-3,
-#         mode='regression',
-#     )
-
-#     dc_model.fit(train_dc, nb_epoch=30)
-
-#     metric = dc.metrics.Metric(dc.metrics.mean_squared_error)
-#     valid_score = dc_model.evaluate(valid_dc, [metric])
-#     test_score  = dc_model.evaluate(test_dc,  [metric])
-
-#     print("[NN Baseline] Validation MSE:", valid_score[metric.name])
-#     print("[NN Baseline] Test MSE:",        test_score[metric.name])
-
-#     return {"MSE": test_score[metric.name]}
-
 
 # ------------------------------
 # Deep Ensemble
@@ -634,7 +740,7 @@ class GradientClippingCallback:
 # dc_model.fit(train_dc, nb_epoch=100, callbacks=[clip_callback])
 
 
-def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run_id=0):
+def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run_id=0, use_weights=False, mode="regression"):
     """
     Train Deep Evidential Regression (DER) NN and:
       - compute MSE with the analytical mean prediction (gamma)
@@ -648,86 +754,165 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
     n_tasks = train_dc.y.shape[1]
     n_features = train_dc.X.shape[1]
 
-    # --- 1. Build Model & DeepChem wrapper (Using the structure from the second code block) ---
-    # The model outputs 4 parameters (gamma, v, alpha, beta) for each task.
-    # We assume 'DenseNormalGamma' is the model structure (mu, v, alpha, beta)
-    model = DenseNormalGamma(n_features, n_tasks)
+    if mode == "regression":
+        # --- 1. Build Model & DeepChem wrapper (Using the structure from the second code block) ---
+        # The model outputs 4 parameters (gamma, v, alpha, beta) for each task.
+        # We assume 'DenseNormalGamma' is the model structure (mu, v, alpha, beta)
+        model = DenseNormalGamma(n_features, n_tasks)
 
-    # The custom evidential loss func(y_true, evidential_output)
-    loss = EvidentialRegressionLoss(coeff=reg_coeff)
+        # The custom evidential loss func(y_true, evidential_output)
+        loss = EvidentialRegressionLoss(coeff=reg_coeff)
+    else:
+        model = DenseDirichlet(n_features, n_tasks * 2)
+
+        loss = EvidentialClassificationLoss()
 
     gradientClip = GradientClippingCallback()
 
-    dc_model = dc.models.TorchModel(
-        model=model,
-        loss=loss,
-        # The output types match the return structure of DenseNormalGamma:
-        output_types=['prediction', 'loss', 'var1', 'var2'],
-        batch_size=128,
-        learning_rate=1e-4,
-        # wandb=True,  # Set to True
-        # model_dir='deep-evidential-regression-run-{}'.format(run_id),
-        log_frequency=40,
-        mode='regression'
-    )
+    if mode == "regression":
+        dc_model = dc.models.TorchModel(
+            model=model,
+            loss=loss,
+            # The output types match the return structure of DenseNormalGamma:
+            output_types=['prediction', 'loss', 'var1', 'var2'],
+            batch_size=128,
+            learning_rate=1e-4,
+            # wandb=True,  # Set to True
+            # model_dir='deep-evidential-regression-run-{}'.format(run_id),
+            log_frequency=40,
+            mode='regression'
+        )
 
-    # --- 2. Train ---
-    print(f"Training Deep Evidential Regression with lambda (reg_coeff) = {reg_coeff}")
-    dc_model.fit(train_dc, nb_epoch=300, callbacks=[gradientClip])
-    device = next(dc_model.model.parameters()).device
+        # --- 2. Train ---
+        print(f"Training Deep Evidential Regression with lambda (reg_coeff) = {reg_coeff}")
+        dc_model.fit(train_dc, nb_epoch=300, callbacks=[gradientClip])
+        device = next(dc_model.model.parameters()).device
 
-    # Convert numpy data to PyTorch tensors (DeepChem .X are typically numpy arrays)
-    valid_X_tensor = torch.from_numpy(valid_dc.X).float().to(device)
-    test_X_tensor = torch.from_numpy(test_dc.X).float().to(device)
+        # Convert numpy data to PyTorch tensors (DeepChem .X are typically numpy arrays)
+        valid_X_tensor = torch.from_numpy(valid_dc.X).float().to(device)
+        test_X_tensor = torch.from_numpy(test_dc.X).float().to(device)
 
-    # Get predictions for the validation set
-    with torch.no_grad():
-        mu_valid, params_valid, aleatoric_valid, epistemic_valid = dc_model.model(valid_X_tensor)
+        # Get predictions for the validation set
+        with torch.no_grad():
+            mu_valid, params_valid, aleatoric_valid, epistemic_valid = dc_model.model(valid_X_tensor)
 
-    # Get predictions for the test set
-    with torch.no_grad():
-        mu_test, params_test, aleatoric_test, epistemic_test = dc_model.model(test_X_tensor)
+        # Get predictions for the test set
+        with torch.no_grad():
+            mu_test, params_test, aleatoric_test, epistemic_test = dc_model.model(test_X_tensor)
 
 
-    # The total predictive variance Var[y] is the sum of aleatoric and epistemic variance.
-    # Var[y] = E[sigma^2] + Var[mu]
-    total_var_test = aleatoric_test.cpu().numpy() + epistemic_test.cpu().numpy()
-    std_test = np.sqrt(total_var_test)
+        # The total predictive variance Var[y] is the sum of aleatoric and epistemic variance.
+        # Var[y] = E[sigma^2] + Var[mu]
+        total_var_test = aleatoric_test.cpu().numpy() + epistemic_test.cpu().numpy()
+        std_test = np.sqrt(total_var_test)
 
-    # --- 4. Calculate MSE (using the deterministic mean prediction, gamma) ---
-    # Ensure prediction shape matches for MSE calculation
-    mu_test = mu_test.cpu().numpy()
-    if mu_test.ndim == 1:
-        mu_test = mu_test.reshape(-1, 1)
+        # --- 4. Calculate MSE (using the deterministic mean prediction, gamma) ---
+        # Ensure prediction shape matches for MSE calculation
+        mu_test = mu_test.cpu().numpy()
+        if mu_test.ndim == 1:
+            mu_test = mu_test.reshape(-1, 1)
 
-    cutoff_error_df = calculate_cutoff_error_data(mu_test, total_var_test, test_dc.y)
+        cutoff_error_df = calculate_cutoff_error_data(mu_test, total_var_test, test_dc.y)
 
-    test_mse = mse_from_mean_prediction(mu_test, test_dc)
+        test_mse = mse_from_mean_prediction(mu_test, test_dc)
 
-    # --- 5. Calculate UQ Metrics ---
-    z = norm.ppf(1 - alpha / 2.0)
+        # --- 5. Calculate UQ Metrics ---
+        z = norm.ppf(1 - alpha / 2.0)
 
-    # Confidence interval: mean ± z * standard_deviation
-    lower = mu_test - z * std_test
-    upper = mu_test + z * std_test
+        # Confidence interval: mean ± z * standard_deviation
+        lower = mu_test - z * std_test
+        upper = mu_test + z * std_test
 
-    # Ensure std_test is broadcastable.
-    if std_test.ndim == 1:
-        std_test = std_test.reshape(-1, 1)
+        # Ensure std_test is broadcastable.
+        if std_test.ndim == 1:
+            std_test = std_test.reshape(-1, 1)
 
-    uq_metrics = evaluate_uq_metrics_from_interval(
-        y_true=test_dc.y,
-        mean=mu_test,
-        lower=lower,
-        upper=upper,
-        alpha=alpha,
-        test_error=test_mse
-    )
+        uq_metrics = evaluate_uq_metrics_from_interval(
+            y_true=test_dc.y,
+            mean=mu_test,
+            lower=lower,
+            upper=upper,
+            alpha=alpha,
+            test_error=test_mse
+        )
 
-    print(f"\n[EVIDENTIAL REGRESSION] Test MSE: {test_mse:.6f}")
-    print(f"[EVIDENTIAL REGRESSION] UQ Metrics: {uq_metrics}")
+        print(f"\n[EVIDENTIAL REGRESSION] Test MSE: {test_mse:.6f}")
+        print(f"[EVIDENTIAL REGRESSION] UQ Metrics: {uq_metrics}")
 
-    return uq_metrics, cutoff_error_df
+        return uq_metrics, cutoff_error_df
+    else:
+        dc_model = dc.models.TorchModel(
+            model=model,
+            loss=loss,
+            # The output types match the return structure of DenseNormalGamma:
+            output_types=['prediction', 'loss', 'var1', 'var2'],
+            batch_size=128,
+            learning_rate=1e-4,
+            # wandb=True,  # Set to True
+            # model_dir='deep-evidential-regression-run-{}'.format(run_id),
+            log_frequency=40,
+            mode='regression'
+        )
+
+        # --- 2. Train ---
+        print(f"Training Deep Evidential Regression with lambda (reg_coeff) = {reg_coeff}")
+        dc_model.fit(train_dc, nb_epoch=300, callbacks=[gradientClip])
+        device = next(dc_model.model.parameters()).device
+
+        # Convert numpy data to PyTorch tensors (DeepChem .X are typically numpy arrays)
+        valid_X_tensor = torch.from_numpy(valid_dc.X).float().to(device)
+        test_X_tensor = torch.from_numpy(test_dc.X).float().to(device)
+
+        # Get predictions for the validation set
+        with torch.no_grad():
+            mu_valid, params_valid, aleatoric_valid, epistemic_valid = dc_model.model(valid_X_tensor)
+
+        # Get predictions for the test set
+        with torch.no_grad():
+            mu_test, params_test, aleatoric_test, epistemic_test = dc_model.model(test_X_tensor)
+
+
+        # The total predictive variance Var[y] is the sum of aleatoric and epistemic variance.
+        # Var[y] = E[sigma^2] + Var[mu]
+        total_var_test = aleatoric_test.cpu().numpy() + epistemic_test.cpu().numpy()
+        std_test = np.sqrt(total_var_test)
+
+        # --- 4. Calculate MSE (using the deterministic mean prediction, gamma) ---
+        # Ensure prediction shape matches for MSE calculation
+        mu_test = mu_test.cpu().numpy()
+        if mu_test.ndim == 1:
+            mu_test = mu_test.reshape(-1, 1)
+
+        cutoff_error_df = calculate_cutoff_error_data(mu_test, total_var_test, test_dc.y)
+
+        test_mse = mse_from_mean_prediction(mu_test, test_dc)
+
+        # --- 5. Calculate UQ Metrics ---
+        z = norm.ppf(1 - alpha / 2.0)
+
+        # Confidence interval: mean ± z * standard_deviation
+        lower = mu_test - z * std_test
+        upper = mu_test + z * std_test
+
+        # Ensure std_test is broadcastable.
+        if std_test.ndim == 1:
+            std_test = std_test.reshape(-1, 1)
+
+        uq_metrics = evaluate_uq_metrics_from_interval(
+            y_true=test_dc.y,
+            mean=mu_test,
+            lower=lower,
+            upper=upper,
+            alpha=alpha,
+            test_error=test_mse
+        )
+
+        print(f"\n[EVIDENTIAL REGRESSION] Test MSE: {test_mse:.6f}")
+        print(f"[EVIDENTIAL REGRESSION] UQ Metrics: {uq_metrics}")
+
+        return uq_metrics, cutoff_error_df
+    
+        
 
 
 def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regression"):

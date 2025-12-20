@@ -237,6 +237,7 @@ def main_nngp_exact(train_dc, valid_dc, test_dc, device: str = "cpu", run_id=0, 
         uq_metrics = evaluate_uq_metrics_classification(
             y_true=test_dc.y, 
             probs=test_probs, 
+            auc=test_metrics['auc'],
             weights=test_dc.w,
             use_weights=use_weights, 
             n_bins=20
@@ -611,6 +612,7 @@ def main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc, E=5, run_id=0
             uq_metrics = evaluate_uq_metrics_classification(
                 y_true=test_dc.y,
                 probs=test_probs,
+                auc=test_metrics['auc'],
                 weights=test_dc.w,
                 use_weights=use_weights,
                 n_bins=20
@@ -756,6 +758,7 @@ def main_gp(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regr
         uq_metrics = evaluate_uq_metrics_classification(
             y_true=test_dc.y,
             probs=test_probs,
+            auc=test_metrics['auc'],
             weights=test_dc.w,
             use_weights=use_weights,
             n_bins=20
@@ -1078,6 +1081,7 @@ def main_svgp_ensemble_all(train_dc, valid_dc, test_dc, run_id=0, use_weights=Fa
             uq_metrics = evaluate_uq_metrics_classification(
                 y_true=test_dc.y,
                 probs=test_probs,
+                auc=test_metrics['auc'],
                 weights=test_dc.w,
                 use_weights=use_weights,
                 n_bins=20
@@ -1151,7 +1155,7 @@ def run_once_nn(dataset_name: str,
     combined_cutoff_df = pd.concat(all_cutoff_dfs, ignore_index=True)
 
     # Define a consistent filename
-    output_filename = f"./cdata/figure/{split}_{dataset_name}_NN_cutoff_run_{run_id}.csv"
+    output_filename = f"./cdata_{mode}/figure/{split}_{dataset_name}_NN_cutoff_run_{run_id}.csv"
 
     # Store the final combined data
     combined_cutoff_df.to_csv(output_filename, index=False)
@@ -1204,7 +1208,9 @@ def main_nn(dataset_name: str = "delaney",
             std = float(vals.std(ddof=0))
             print(f"  {m}: mean={mean:.5g}, std={std:.5g}")
 
-    save_summary_to_csv(all_results, n_runs, "./cdata/NN_{}_{}_c.csv".format(split, dataset_name))
+    save_summary_to_csv(all_results, 
+                        n_runs, 
+                        "./cdata_{}/NN_{}_{}_c.csv".format(mode, split, dataset_name))
 
 
 def run_once_gp(dataset_name: str,

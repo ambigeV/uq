@@ -414,55 +414,73 @@ def evaluate_uq_metrics_classification(
         y_true,
         probs,
         auc,
+        uncertainty=None,  # <--- NEW ARGUMENT
         weights=None,
         use_weights=False,
         n_bins=10
 ):
     """
-    Compute UQ metrics for Classification: ECE, NLL, Brier, Spearman.
+    Compute UQ metrics for Classification.
+    
+    If 'uncertainty' (u) is provided (from Deep Evidential Learning), it is used 
+    as the primary metric for Sharpness and Error-Correlation. 
+    Otherwise, Entropy is used as a proxy.
     """
     y_true = y_true.flatten()
     probs = probs.flatten()
-
+    
+    # Handle weights
     if use_weights and weights is not None:
         w = weights.flatten()
     else:
         w = np.ones_like(y_true)
 
-    # --- 1. Sharpness (Avg Entropy) ---
-    # Equivalent to "Avg Pred Std" in regression
-    # Indicates how decisive the model is.
-    entropy = calculate_entropy(probs)
-    avg_entropy = np.average(entropy, weights=w)
-
-    # --- 2. NLL (Log Loss) ---
-    # Equivalent to Gaussian NLL
+    # --- 1. Probability-Based Metrics (NLL, Brier, ECE) ---
+    # These rely on the expected class probabilities E[p], not the uncertainty mass u.
+    
+    # NLL (Log Loss)
     epsilon = 1e-15
     p_safe = np.clip(probs, epsilon, 1 - epsilon)
     nll_per_point = -(y_true * np.log(p_safe) + (1 - y_true) * np.log(1 - p_safe))
     nll = np.average(nll_per_point, weights=w)
 
-    # --- 3. Brier Score ---
-    # Equivalent to MSE in Regression
+    # Brier Score (MSE)
     sq_err = (y_true - probs) ** 2
     brier = np.average(sq_err, weights=w)
 
-    # --- 4. Calibration Error (ECE) ---
-    # Equivalent to "Coverage" (Global statistical check)
-    # We can perform a Weighted ECE if desired.
+    # Calibration Error (ECE)
     ece = compute_ece(probs, y_true, w, n_bins)
+    
+    # --- 2. Uncertainty-Based Metrics (Sharpness, Spearman) ---
+    
+    # Calculate Entropy regardless (useful for comparison or as fallback)
+    entropy = calculate_entropy(probs) # Assumes this returns element-wise entropy
+    
+    # Determine which metric to use for UQ evaluation
+    if uncertainty is not None:
+        # Use explicit Uncertainty Mass (u) from EDL 
+        uq_measure = uncertainty.flatten()
+        metric_name = "Uncertainty_Mass"
+    else:
+        # Fallback to Entropy if u is not available [cite: 229]
+        uq_measure = entropy
+        metric_name = "Entropy"
 
+    # Sharpness (Average Uncertainty)
+    # If using EDL, this is the average "I don't know" mass (u)
+    avg_uq = np.average(uq_measure, weights=w)
 
-    # --- 5. Spearman (Uncertainty vs Error) ---
-    # Do uncertain points actually have higher errors?
-    # Correlate Entropy with Brier Score Error
-    spearman_corr = _spearman_rank_corr(sq_err, entropy)
+    # Spearman (Uncertainty vs Error)
+    # Correlate the chosen UQ measure with the squared error.
+    # Ideally, high u (or entropy) should correlate with high error.
+    spearman_corr = _spearman_rank_corr(sq_err, uq_measure)
 
     return {
         "AUC": auc,
         "NLL": nll,
         "Brier": brier,
         "ECE": ece,
-        "Avg_Entropy": avg_entropy,
-        "Spearman_Err_Unc": spearman_corr
+        "Avg_Entropy": np.average(entropy, weights=w), # Keep for reference
+        f"Avg_{metric_name}": avg_uq,                  # The primary sharpness metric
+        "Spearman_Err_Unc": spearman_corr              # Computed using u if available
     }
