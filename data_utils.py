@@ -413,6 +413,7 @@ def evaluate_uq_metrics_from_interval(
 def evaluate_uq_metrics_classification(
         y_true,
         probs,
+        auc,
         weights=None,
         use_weights=False,
         n_bins=10
@@ -458,6 +459,7 @@ def evaluate_uq_metrics_classification(
     spearman_corr = _spearman_rank_corr(sq_err, entropy)
 
     return {
+        "AUC": auc,
         "NLL": nll,
         "Brier": brier,
         "ECE": ece,

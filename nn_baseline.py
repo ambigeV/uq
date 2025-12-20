@@ -730,38 +730,70 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
     return uq_metrics, cutoff_error_df
 
 
-def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0):
+def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regression"):
     n_tasks = train_dc.y.shape[1]
     n_features = train_dc.X.shape[1]
 
     model = MyTorchRegressor(n_features, n_tasks)
-    loss = dc.models.losses.L2Loss()
+    if mode == "regression":
+        loss = dc.models.losses.L2Loss()
 
-    dc_model = dc.models.TorchModel(
-        model=model,
-        loss=loss,
-        output_types=['prediction'],
-        batch_size=64,
-        learning_rate=1e-3,
-        mode='regression',
-    )
+        dc_model = dc.models.TorchModel(
+            model=model,
+            loss=loss,
+            output_types=['prediction'],
+            batch_size=64,
+            learning_rate=1e-3,
+            mode='regression',
+        )
+    else:
+        loss = dc.models.losses.BinaryCrossEntropy()
 
-    dc_model.fit(train_dc, nb_epoch=30)
+        dc_model = dc.models.TorchModel(
+            model=model,
+            loss=loss,
+            output_types=['prediction'],
+            batch_size=64,
+            learning_rate=1e-3,
+            mode='regression',
+        )
 
-    metric = dc.metrics.Metric(dc.metrics.mean_squared_error)
-    valid_scores = dc_model.evaluate(valid_dc, [metric])
-    test_scores = dc_model.evaluate(test_dc, [metric])
+    if mode == "regression":
+        dc_model.fit(train_dc, nb_epoch=80)
 
-    print("[NN Baseline] Validation MSE:", valid_scores[metric.name])
-    print("[NN Baseline] Test MSE:",      test_scores[metric.name])
-    mse_test = test_scores[metric.name]
+        metric = dc.metrics.Metric(dc.metrics.mean_squared_error)
+        valid_scores = dc_model.evaluate(valid_dc, [metric], use_sample_weights=use_weights)
+        test_scores = dc_model.evaluate(test_dc, [metric], use_sample_weights=use_weights)
 
-    return {
-        "alpha": None,
-        "empirical_coverage": None,
-        "avg_pred_std": None,
-        "nll": None,
-        "ce": None,
-        "spearman_err_unc": None,
-        "MSE": float(mse_test),
-    }
+        print("[NN Baseline] Validation MSE:", valid_scores[metric.name])
+        print("[NN Baseline] Test MSE:",      test_scores[metric.name])
+        mse_test = test_scores[metric.name]
+
+        return {
+            "alpha": None,
+            "empirical_coverage": None,
+            "avg_pred_std": None,
+            "nll": None,
+            "ce": None,
+            "spearman_err_unc": None,
+            "MSE": float(mse_test),
+        }
+    else:
+        dc_model.fit(train_dc, nb_epoch=80)
+
+        metric = dc.metrics.Metric(dc.metrics.roc_auc_score)
+        valid_scores = dc_model.evaluate(valid_dc, [metric], use_sample_weights=use_weights)
+        test_scores = dc_model.evaluate(test_dc, [metric], use_sample_weights=use_weights)
+
+        print("[NN Baseline] Validation AUC:", valid_scores[metric.name])
+        print("[NN Baseline] Test AUC:", test_scores[metric.name])
+        mse_test = test_scores[metric.name]
+
+        return {
+            "AUC": float(mse_test),
+            "NLL": None,
+            "Brier": None,
+            "ECE": None,
+            "Avg_Entropy": None,
+            "spearman_err_unc": None,
+        }

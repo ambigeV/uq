@@ -1105,7 +1105,9 @@ def main_svgp_ensemble_all(train_dc, valid_dc, test_dc, run_id=0, use_weights=Fa
 def run_once_nn(dataset_name: str,
                 seed: int = 0,
                 run_id: int = 0,
-                split: str = "random"):
+                split: str = "random",
+                mode: str = "regression",
+                use_weights: bool = False):
     """
     One full run on a given dataset & featurizer with a fixed seed.
     """
@@ -1116,22 +1118,30 @@ def run_once_nn(dataset_name: str,
         split=split
     )
 
+    use_weights = False
+    if dataset_name in ["tox21"]:
+        use_weights = True
+
     print(f"\n=== Run with seed={seed} on dataset={dataset_name}")
     results = {}
     all_cutoff_dfs = []
-    results["nn_evd"], cut_off_evd = train_evd_baseline(train_dc, valid_dc, test_dc, run_id=run_id)
+    results["nn_evd"], cut_off_evd = train_evd_baseline(train_dc, valid_dc, test_dc,
+                                                        run_id=run_id, use_weights=use_weights, mode=mode)
 
     cut_off_evd['Method'] = "nn_evd"
     all_cutoff_dfs.append(cut_off_evd)
 
     if dataset_name not in ["qm8"]:
-        results["nn_baseline"] = train_nn_baseline(train_dc, valid_dc, test_dc, run_id=run_id)
+        results["nn_baseline"] = train_nn_baseline(train_dc, valid_dc, test_dc,
+                                                   run_id=run_id, use_weights=use_weights, mode=mode)
 
-    results["nn_mc_dropout"], cut_off_dropout = train_nn_mc_dropout(train_dc, valid_dc, test_dc, run_id=run_id)
+    results["nn_mc_dropout"], cut_off_dropout = train_nn_mc_dropout(train_dc, valid_dc, test_dc,
+                                                                    run_id=run_id, use_weights=use_weights, mode=mode)
     cut_off_dropout['Method'] = "nn_mc_dropout"
     all_cutoff_dfs.append(cut_off_dropout)
 
-    results["nn_deep_ensemble"], cut_off_ensemble = train_nn_deep_ensemble(train_dc, valid_dc, test_dc, run_id=run_id)
+    results["nn_deep_ensemble"], cut_off_ensemble = train_nn_deep_ensemble(train_dc, valid_dc, test_dc,
+                                                                           run_id=run_id, use_weights=use_weights, mode=mode)
     cut_off_ensemble['Method'] = "nn_deep_ensemble"
     all_cutoff_dfs.append(cut_off_ensemble)
 
@@ -1159,13 +1169,16 @@ def run_once_nn(dataset_name: str,
 def main_nn(dataset_name: str = "delaney",
             n_runs: int = 5,
             split: str = "random",
-            base_seed: int = 0):
+            base_seed: int = 0,
+            mode: str = "regression",
+            use_weights: bool = False):
 
     all_results = {}
 
     for run_idx in range(n_runs):
         seed = base_seed + run_idx
-        run_res = run_once_nn(dataset_name=dataset_name, seed=seed, run_id=run_idx, split=split)
+        run_res = run_once_nn(dataset_name=dataset_name, seed=seed, run_id=run_idx,
+                              split=split, mode=mode, use_weights=use_weights)
         for method, uq_dict in run_res.items():
             all_results.setdefault(method, []).append(uq_dict)
 
@@ -1222,19 +1235,21 @@ def run_once_gp(dataset_name: str,
         use_weights = True
 
     if dataset_name not in ["qm8"]:
-        results["gp_exact"], gp_cut_off = main_gp(train_dc, valid_dc, test_dc, run_id, use_weights=use_weights, mode=mode)
+        results["gp_exact"], gp_cut_off = main_gp(train_dc, valid_dc, test_dc, run_id=run_id,
+                                                  use_weights=use_weights, mode=mode)
         gp_cut_off['Method'] = "gp_exact"
         all_cutoff_dfs.append(gp_cut_off)
-        results["gp_nngp"], nngp_cut_off = main_nngp_exact(train_dc, valid_dc, test_dc, run_id, use_weights=use_weights, mode=mode)
+        results["gp_nngp"], nngp_cut_off = main_nngp_exact(train_dc, valid_dc, test_dc, run_id=run_id,
+                                                           use_weights=use_weights, mode=mode)
         nngp_cut_off['Method'] = "gp_nngp"
         all_cutoff_dfs.append(nngp_cut_off)
 
     if mode == "regression":
-        results["gp_svgp"], svgp_cut_off = main_svgp(train_dc, valid_dc, test_dc, run_id)
+        results["gp_svgp"], svgp_cut_off = main_svgp(train_dc, valid_dc, test_dc, run_id=run_id)
         svgp_cut_off['Method'] = "gp_svgp"
         all_cutoff_dfs.append(svgp_cut_off)
 
-        results["gp_nnsvgp"], nnsvgp_cut_off = main_nngp_svgp(train_dc, valid_dc, test_dc, run_id)
+        results["gp_nnsvgp"], nnsvgp_cut_off = main_nngp_svgp(train_dc, valid_dc, test_dc, run_id=run_id)
         nnsvgp_cut_off['Method'] = "gp_nnsvgp"
         all_cutoff_dfs.append(nnsvgp_cut_off)
 
@@ -1244,13 +1259,15 @@ def run_once_gp(dataset_name: str,
             cut_offs[idx]['Method'] = "nngp_ensemble_{}".format(cur["name"])
             all_cutoff_dfs.append(cut_offs[idx])
 
-    result, cut_offs = main_svgp_ensemble_all(train_dc, valid_dc, test_dc, run_id=run_id, use_weights=use_weights, mode=mode)
+    result, cut_offs = main_svgp_ensemble_all(train_dc, valid_dc, test_dc,
+                                              run_id=run_id, use_weights=use_weights, mode=mode)
     for idx, cur in enumerate(result):
         results["svgp_ensemble_{}".format(cur["name"])] = cur["uq_metrics"]
         cut_offs[idx]['Method'] = "svgp_ensemble_{}".format(cur["name"])
         all_cutoff_dfs.append(cut_offs[idx])    
 
-    result, cut_offs = main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc, run_id=run_id, use_weights=use_weights, mode=mode)
+    result, cut_offs = main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc,
+                                                         run_id=run_id, use_weights=use_weights, mode=mode)
     for idx, cur in enumerate(result):
         results["nnsvgp_ensemble_{}".format(cur["name"])] = cur["uq_metrics"]
         cut_offs[idx]['Method'] = "nnsvgp_ensemble_{}".format(cur["name"])
@@ -1327,44 +1344,50 @@ def main_gp_all(dataset_name: str = "delaney",
     )
 
 
-# if __name__ == "__main__":
-#     # main_svgp_ensemble_all()
-#     # main_nngp_exact()
-#     # main_nngp_exact_ensemble_all()
-#     # main_nngp_svgp_exact_ensemble_all()
-#     # main_nn()
-#     tasks, train_dc, valid_dc, test_dc, transformers = load_dataset(
-#         dataset_name="tox21",
-#         split="random"
-#     )
-#     main_svgp_ensemble_all(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc,
-#                     run_id=0, use_weights=False, mode="classification")
-#     main_svgp_ensemble_all(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc,
-#                     run_id=0, use_weights=True, mode="classification")
-
-
 if __name__ == "__main__":
-    import argparse
+    # main_svgp_ensemble_all()
+    # main_nngp_exact()
+    # main_nngp_exact_ensemble_all()
+    # main_nngp_svgp_exact_ensemble_all()
+    # main_nn()
+    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset(
+        dataset_name="tox21",
+        split="random"
+    )
+    train_nn_baseline(train_dc, valid_dc, test_dc,
+                      run_id=0, use_weights=False, mode="classification")
+    train_nn_baseline(train_dc, valid_dc, test_dc,
+                      run_id=0, use_weights=True, mode="classification")
+    # main_svgp_ensemble_all(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc,
+    #                 run_id=0, use_weights=False, mode="classification")
+    # main_svgp_ensemble_all(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc,
+    #                 run_id=0, use_weights=True, mode="classification")
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="delaney",
-                        choices=["qm7", "qm8", "delaney", "lipo", "tox21"])
-    parser.add_argument("--n_runs", type=int, default=5)
-    parser.add_argument("--base_seed", type=int, default=0)
-    parser.add_argument("--split", type=str, default="random",
-                        choices=["random", "scaffold"])
-    parser.add_argument("--mode", type=str, default="regression",
-                        choices=["regression", "classification"])
-    args = parser.parse_args()
-
-    main_gp_all(dataset_name=args.dataset,
-                n_runs=args.n_runs,
-                split=args.split,
-                base_seed=args.base_seed,
-                mode = args.mode,
-                use_weights = (args.mode == "classification"))
-    
-    # main_nn(dataset_name=args.dataset,
-    #         n_runs=args.n_runs,
-    #         split=args.split,
-    #         base_seed=args.base_seed)
+#
+# if __name__ == "__main__":
+#     import argparse
+#
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument("--dataset", type=str, default="delaney",
+#                         choices=["qm7", "qm8", "delaney", "lipo", "tox21"])
+#     parser.add_argument("--n_runs", type=int, default=5)
+#     parser.add_argument("--base_seed", type=int, default=0)
+#     parser.add_argument("--split", type=str, default="random",
+#                         choices=["random", "scaffold"])
+#     parser.add_argument("--mode", type=str, default="regression",
+#                         choices=["regression", "classification"])
+#     args = parser.parse_args()
+#
+#     # main_gp_all(dataset_name=args.dataset,
+#     #             n_runs=args.n_runs,
+#     #             split=args.split,
+#     #             base_seed=args.base_seed,
+#     #             mode = args.mode,
+#     #             use_weights = (args.mode == "classification"))
+#
+#     main_nn(dataset_name=args.dataset,
+#             n_runs=args.n_runs,
+#             split=args.split,
+#             base_seed=args.base_seed,
+#             mode = args.mode,
+#             use_weights = (args.mode == "classification"))
