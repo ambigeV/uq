@@ -1350,50 +1350,64 @@ def main_gp_all(dataset_name: str = "delaney",
     )
 
 
-if __name__ == "__main__":
-    # main_svgp_ensemble_all()
-    # main_nngp_exact()
-    # main_nngp_exact_ensemble_all()
-    # main_nngp_svgp_exact_ensemble_all()
-    # main_nn()
-    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset(
-        dataset_name="tox21",
-        split="random"
-    )
-    train_nn_baseline(train_dc, valid_dc, test_dc,
-                      run_id=0, use_weights=False, mode="classification")
-    train_nn_baseline(train_dc, valid_dc, test_dc,
-                      run_id=0, use_weights=True, mode="classification")
+# if __name__ == "__main__":
+#     # main_svgp_ensemble_all()
+#     # main_nngp_exact()
+#     # main_nngp_exact_ensemble_all()
+#     # main_nngp_svgp_exact_ensemble_all()
+#     # main_nn()
+#     tasks, train_dc, valid_dc, test_dc, transformers = load_dataset(
+#         dataset_name="tox21",
+#         split="random"
+#     )
+
+    # train_nn_baseline(train_dc, valid_dc, test_dc,
+    #                   run_id=0, use_weights=False, mode="classification")
+    # train_nn_baseline(train_dc, valid_dc, test_dc,
+    #                   run_id=0, use_weights=True, mode="classification")
+    # train_nn_mc_dropout(train_dc, valid_dc, test_dc,
+    #                   run_id=0, use_weights=False, mode="classification")
+    # train_nn_mc_dropout(train_dc, valid_dc, test_dc,
+    #                   run_id=0, use_weights=True, mode="classification")
+    # train_evd_baseline(train_dc, valid_dc, test_dc,
+    #                   run_id=0, use_weights=False, mode="classification")
+    # train_evd_baseline(train_dc, valid_dc, test_dc,
+    #                   run_id=0, use_weights=True, mode="classification")
+    # train_nn_deep_ensemble(train_dc, valid_dc, test_dc,
+    #                   run_id=0, use_weights=False, mode="classification")
+    # train_nn_deep_ensemble(train_dc, valid_dc, test_dc,
+    #                   run_id=0, use_weights=True, mode="classification")
+    
     # main_svgp_ensemble_all(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc,
     #                 run_id=0, use_weights=False, mode="classification")
     # main_svgp_ensemble_all(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc,
     #                 run_id=0, use_weights=True, mode="classification")
 
 #
-# if __name__ == "__main__":
-#     import argparse
-#
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument("--dataset", type=str, default="delaney",
-#                         choices=["qm7", "qm8", "delaney", "lipo", "tox21"])
-#     parser.add_argument("--n_runs", type=int, default=5)
-#     parser.add_argument("--base_seed", type=int, default=0)
-#     parser.add_argument("--split", type=str, default="random",
-#                         choices=["random", "scaffold"])
-#     parser.add_argument("--mode", type=str, default="regression",
-#                         choices=["regression", "classification"])
-#     args = parser.parse_args()
-#
-#     # main_gp_all(dataset_name=args.dataset,
-#     #             n_runs=args.n_runs,
-#     #             split=args.split,
-#     #             base_seed=args.base_seed,
-#     #             mode = args.mode,
-#     #             use_weights = (args.mode == "classification"))
-#
-#     main_nn(dataset_name=args.dataset,
-#             n_runs=args.n_runs,
-#             split=args.split,
-#             base_seed=args.base_seed,
-#             mode = args.mode,
-#             use_weights = (args.mode == "classification"))
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, default="delaney",
+                        choices=["qm7", "qm8", "delaney", "lipo", "tox21"])
+    parser.add_argument("--n_runs", type=int, default=5)
+    parser.add_argument("--base_seed", type=int, default=0)
+    parser.add_argument("--split", type=str, default="random",
+                        choices=["random", "scaffold"])
+    parser.add_argument("--mode", type=str, default="regression",
+                        choices=["regression", "classification"])
+    args = parser.parse_args()
+
+    main_gp_all(dataset_name=args.dataset,
+                n_runs=args.n_runs,
+                split=args.split,
+                base_seed=args.base_seed,
+                mode = args.mode,
+                use_weights = (args.mode == "classification"))
+
+    main_nn(dataset_name=args.dataset,
+            n_runs=args.n_runs,
+            split=args.split,
+            base_seed=args.base_seed,
+            mode = args.mode,
+            use_weights = (args.mode == "classification"))

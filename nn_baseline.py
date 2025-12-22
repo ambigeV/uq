@@ -5,7 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import deepchem as dc
 from scipy.stats import norm
-from data_utils import evaluate_uq_metrics_from_interval, calculate_cutoff_error_data
+from data_utils import evaluate_uq_metrics_from_interval, evaluate_uq_metrics_classification, \
+    calculate_cutoff_error_data, calculate_cutoff_classification_data, roc_auc_score
 from deepchem.models.losses import Loss, _make_pytorch_shapes_consistent
 
 
@@ -27,6 +28,98 @@ class MyTorchRegressor(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+
+class MyTorchClassifier(nn.Module):
+    """Standard feed-forward NN for binary classification (sigmoid output)."""
+    def __init__(self, n_features: int, n_tasks: int = 1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_features, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, n_tasks),
+        )
+
+    def forward(self, x):
+        logits = self.net(x)          # (B, n_tasks)
+        probs = torch.sigmoid(logits) # (B, n_tasks) in [0,1]
+        return probs
+
+
+class HeteroscedasticClassificationLoss(Loss):
+    """
+    Implements Eq. 12:
+      L = - log( (1/T) * sum_t exp( log p_t(y|x) ) )
+    where logits_t = mu + std * eps, eps ~ N(0, I),
+    and p_t computed via softmax(logits_t).
+    """
+
+    def __init__(
+        self,
+        n_samples: int = 20,
+        clamp_log_var=(-10.0, 10.0),
+        reduction: str = "mean",
+        eps: float = 1e-8,
+    ):
+        super().__init__()
+        self.n_samples = int(n_samples)
+        self.clamp_log_var = clamp_log_var
+        self.reduction = reduction
+        self.eps = float(eps)
+
+    def _create_pytorch_loss(self):
+        def loss(output, labels):
+            output, labels = _make_pytorch_shapes_consistent(output, labels)
+
+            if output.shape[-1] % 2 != 0:
+                raise ValueError(f"Expected output last dim = 2*n_classes, got {output.shape[-1]}.")
+
+            n_classes = output.shape[-1] // 2
+            if n_classes < 2:
+                raise ValueError("HeteroscedasticClassificationLoss expects n_classes >= 2.")
+
+            mu = output[..., :n_classes]      # (B, C)
+            log_var = output[..., n_classes:] # (B, C)
+
+            if self.clamp_log_var is not None:
+                lo, hi = self.clamp_log_var
+                log_var = log_var.clamp(min=lo, max=hi)
+
+            std = torch.exp(0.5 * log_var)    # (B, C)
+
+            # labels -> indices
+            if labels.ndim > 1 and labels.shape[-1] == n_classes:
+                y = labels.argmax(dim=-1)
+            else:
+                y = labels.long()
+            if y.ndim > 1:
+                y = y.squeeze(-1)  # (B,)
+
+            # Vectorized MC: (T, B, C)
+            T = self.n_samples
+            eps = torch.randn((T,) + mu.shape, device=mu.device, dtype=mu.dtype)
+            logits_s = mu.unsqueeze(0) + std.unsqueeze(0) * eps  # (T,B,C)
+
+            # log softmax
+            log_probs_s = logits_s - torch.logsumexp(logits_s, dim=-1, keepdim=True)  # (T,B,C)
+
+            # gather true class log-prob
+            y_idx = y.unsqueeze(0).unsqueeze(-1).expand(T, -1, 1)                      # (T,B,1)
+            log_p_true = log_probs_s.gather(dim=-1, index=y_idx).squeeze(-1)           # (T,B)
+
+            import math
+            log_mean_p = torch.logsumexp(log_p_true, dim=0) - math.log(T)              # (B,)
+            per_example = -log_mean_p                                                  # (B,)
+
+            if self.reduction == "none":
+                return per_example
+            if self.reduction == "sum":
+                return per_example.sum()
+            return per_example.mean()
+
+        return loss
 
 
 class HeteroscedasticL2Loss(Loss):
@@ -318,9 +411,6 @@ class DenseDirichlet(nn.Module):
         aleatoric = -torch.sum(prob * torch.log(prob + 1e-8), dim=1, keepdim=True)
 
         # RETURN ORDER MATTERS FOR DEEPCHEM:
-        # 1. prob  -> For Metric evaluation (AUC, Accuracy)
-        # 2. alpha -> For Loss calculation (Evidential Loss)
-        # 3/4. Uncertainties -> For analysis
         return prob, alpha, aleatoric, epistemic
 
 
@@ -425,12 +515,7 @@ class MyTorchRegressorMC(nn.Module):
 # 2. Helper Evaluation
 # ============================================================
 
-def mse_from_mean_prediction(mean, dataset):
-    """
-    Robust MSE calculation that handles:
-    1. Multi-column outputs (e.g., [Prediction, Variance]) by slicing col 0.
-    2. Shape mismatches (e.g., (N,1) vs (N,)) by flattening both.
-    """
+def mse_from_mean_prediction(mean, dataset, use_weights=False):
     # 1. Always flatten the True Labels to (N,)
     y_true = dataset.y.reshape(-1)
 
@@ -443,8 +528,29 @@ def mse_from_mean_prediction(mean, dataset):
     # 3. Flatten prediction to (N,) to guarantee 1-to-1 subtraction
     mean = mean.reshape(-1)
 
-    # 4. Calculate MSE
-    return ((mean - y_true) ** 2).mean()
+    # 4. Calculate Squared Errors
+    sq_error = (mean - y_true) ** 2
+
+    # 5. Handle Weighting
+    if use_weights:
+        # Attempt to grab weights from the dataset (standard in DeepChem/many loaders)
+        if hasattr(dataset, 'w') and dataset.w is not None:
+            w = dataset.w.reshape(-1)
+            
+            # Safety check: ensure weights match data length
+            if len(w) != len(y_true):
+                # Fallback or strict error depending on preference. 
+                # Here we warn and fallback to unweighted to avoid crashing.
+                print(f"Warning: Weight shape {w.shape} mismatch with labels {y_true.shape}. Using unweighted MSE.")
+                return sq_error.mean()
+                
+            return np.average(sq_error, weights=w)
+        else:
+            # If use_weights is True but no weights found, usually default to unweighted
+            pass
+
+    # Standard unweighted MSE
+    return sq_error.mean()
 
 
 # ============================================================
@@ -477,10 +583,78 @@ class DeepEnsembleRegressor:
 
         return mean, lower, upper
 
+
+class DeepEnsembleClassifier:
+    def __init__(self, models):
+        self.models = models
+
+    def predict_raw(self, dataset):
+        """
+        Returns stacked raw predictions:
+          regression: raw preds (M, N, T)
+          classification: raw logits (M, N, T)
+        """
+        preds = []
+        for m in self.models:
+            out = m.predict(dataset)  # (N, T)
+            preds.append(out)
+        return np.stack(preds, axis=0)  # (M, N, T)
+
+    # -------- regression API (unchanged behavior) --------
+    def predict(self, dataset):
+        return self.predict_raw(dataset)
+
+    def predict_interval(self, dataset, alpha=0.05):
+        Y = self.predict_raw(dataset)           # (M, N, T)
+        mean = Y.mean(axis=0)                   # (N, T)
+        std  = Y.std(axis=0) + 1e-8             # (N, T)
+
+        z = norm.ppf(1 - alpha/2)
+        lower = mean - z * std
+        upper = mean + z * std
+        return mean, lower, upper
+
+    # -------- classification API --------
+    def predict_proba(self, dataset):
+        """
+        Returns:
+          p_mean: (N, T) mean probability over ensemble
+          p_members: (M, N, T) member probabilities
+        """
+        logits = self.predict_raw(dataset)            # (M, N, T)
+        logits = np.clip(logits, -50, 50)
+        p_members = 1.0 / (1.0 + np.exp(-logits))
+
+        # p_members = 1.0 / (1.0 + np.exp(-logits))     # sigmoid
+        # p_members = F.sigmoid(logits)
+        p_mean = p_members.mean(axis=0)               # (N, T)
+        return p_mean, p_members
+
+    def predict_uncertainty(self, dataset, eps=1e-10, return_mi=True):
+        """
+        Uncertainty for binary probs (per task):
+          total entropy: H[p_mean]
+          expected entropy: mean_m H[p_m]
+          MI: H[p_mean] - mean_m H[p_m]   (epistemic-ish)
+        Returns arrays with shape (N, T).
+        """
+        p_mean, p_members = self.predict_proba(dataset)   # (N,T), (M,N,T)
+
+        # entropy for Bernoulli
+        H_mean = -(p_mean * np.log(p_mean + eps) + (1 - p_mean) * np.log(1 - p_mean + eps))  # (N,T)
+        H_each = -(p_members * np.log(p_members + eps) + (1 - p_members) * np.log(1 - p_members + eps))  # (M,N,T)
+        H_exp = H_each.mean(axis=0)  # (N,T)
+
+        if not return_mi:
+            return p_mean, H_mean
+
+        MI = H_mean - H_exp
+        return p_mean, H_mean, H_exp, MI
+
 # ------------------------------
 # Deep Ensemble
 # ------------------------------
-def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0):
+def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0, use_weights=False, mode="regression"):
     n_tasks = train_dc.y.shape[1]
     n_features = train_dc.X.shape[1]
 
@@ -488,40 +662,95 @@ def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0):
 
     for i in range(M):
         model = MyTorchRegressor(n_features, n_tasks)
-        loss = dc.models.losses.L2Loss()
+        
+        if mode == "regression":
+            loss = dc.models.losses.L2Loss()
 
-        dc_model = dc.models.TorchModel(
-            model=model,
-            loss=loss,
-            output_types=['prediction'],
-            batch_size=64,
-            learning_rate=1e-3,
-            mode='regression',
-        )
+            dc_model = dc.models.TorchModel(
+                model=model,
+                loss=loss,
+                output_types=['prediction'],
+                batch_size=64,
+                learning_rate=1e-3,
+                mode=mode,
+            )
+        
+        else:
+            loss = dc.models.losses.SigmoidCrossEntropy()
+            dc_model = dc.models.TorchModel(
+                model=model,
+                loss=loss,
+                output_types=['prediction'],
+                batch_size=64,
+                learning_rate=1e-3,
+                mode=mode,
+            )
+
         dc_model.fit(train_dc, nb_epoch=50)
         models.append(dc_model)
 
-    ensemble = DeepEnsembleRegressor(models)
+    if mode == "regression":
+        ensemble = DeepEnsembleRegressor(models)
 
-    # Evaluate using ensemble mean
-    mean_valid, _, _ = ensemble.predict_interval(valid_dc)
-    mean_test,  lower_test, upper_test = ensemble.predict_interval(test_dc)
-    cutoff_error_df = calculate_cutoff_error_data(mean_test, upper_test-lower_test, test_dc.y)
-    test_error = mse_from_mean_prediction(mean_test,  test_dc)
+        # Evaluate using ensemble mean
+        mean_valid, _, _ = ensemble.predict_interval(valid_dc)
+        mean_test,  lower_test, upper_test = ensemble.predict_interval(test_dc)
+        cutoff_error_df = calculate_cutoff_error_data(mean_test, upper_test-lower_test, test_dc.y, test_dc.w, use_weights=use_weights)
+        test_error = mse_from_mean_prediction(mean_test, test_dc, use_weights=use_weights)
 
-    print("[Deep Ensemble] Validation MSE:", mse_from_mean_prediction(mean_valid, valid_dc))
-    print("[Deep Ensemble] Test MSE:",        mse_from_mean_prediction(mean_test,  test_dc))
+        print("[Deep Ensemble] Validation MSE:", mse_from_mean_prediction(mean_valid, valid_dc, use_weights=use_weights))
+        print("[Deep Ensemble] Test MSE:",        mse_from_mean_prediction(mean_test,  test_dc, use_weights=use_weights))
 
-    uq_metrics = evaluate_uq_metrics_from_interval(
-        y_true=test_dc.y,
-        mean=mean_test,
-        lower=lower_test,
-        upper=upper_test,
-        alpha=0.05,
-        test_error=test_error,
-    )
+        uq_metrics = evaluate_uq_metrics_from_interval(
+            y_true=test_dc.y,
+            mean=mean_test,
+            lower=lower_test,
+            upper=upper_test,
+            weights=test_dc.w,
+            use_weights=use_weights,
+            alpha=0.05,
+            test_error=test_error,
+        )
 
-    print("UQ (Deep Ensemble):", uq_metrics)
+        print("UQ (Deep Ensemble):", uq_metrics)
+    else:
+        ensemble = DeepEnsembleClassifier(models)
+        p_mean, H_total, H_exp, MI = ensemble.predict_uncertainty(test_dc, return_mi=True)
+
+        # If you only have ONE task, keep your existing downstream functions unchanged.
+        assert n_tasks == 1
+        probs_positive = p_mean[:, 0]  # (N,)
+        y_true = np.asarray(test_dc.y).reshape(-1)
+
+        if use_weights and test_dc.w is not None:
+            weights = np.asarray(test_dc.w).reshape(-1)
+        else:
+            weights = None
+
+        test_auc = roc_auc_score(y_true, probs_positive, sample_weight=weights)
+
+        # choose uncertainty score: total entropy (or MI)
+        uncertainty = H_total[:, 0]  # or MI[:, 0]
+
+        uq_metrics = evaluate_uq_metrics_classification(
+            y_true=test_dc.y,
+            probs=probs_positive,
+            auc=test_auc,
+            uncertainty=uncertainty,
+            weights=test_dc.w,
+            use_weights=use_weights,
+            n_bins=20
+        )
+
+        cutoff_error_df = calculate_cutoff_classification_data(
+            probs_positive,
+            test_dc.y,
+            weights=test_dc.w,
+            use_weights=use_weights
+        )
+
+        print(f"[Deep Ensemble Class] Test AUC: {test_auc:.6f}")
+        print(f"[Deep Ensemble Class] UQ Metrics: {uq_metrics}")
 
     return uq_metrics, cutoff_error_df
 
@@ -637,7 +866,84 @@ class MCDropoutRegressorRefined:
         return mean_pred, total_std
 
 
-def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, run_id=0):
+class MyTorchClassifierHeteroscedastic(nn.Module):
+    def __init__(self, in_dim: int, n_classes: int, dropout_rate: float = 0.2):
+        super(MyTorchClassifierHeteroscedastic, self).__init__()
+        self.n_classes = int(n_classes)
+
+        self.dense = nn.Sequential(
+            nn.Linear(in_dim, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate),
+
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate),
+
+            # Must be 2 * n_classes:
+            # first n_classes: mean logits (mu)
+            # second n_classes: log variance (log_var)
+            nn.Linear(64, self.n_classes * 2)
+        )
+
+    def forward(self, x):
+        return self.dense(x)
+
+
+def _enable_dropout_only(model: nn.Module):
+    model.eval()
+    for m in model.modules():
+        if m.__class__.__name__.startswith("Dropout"):
+            m.train()
+
+
+class MCDropoutClassifierWrapper:
+    def __init__(self, dc_model, n_samples=50, clamp_log_var=(-10.0, 10.0)):
+        self.dc_model = dc_model
+        self.n_samples = int(n_samples)
+        self.clamp_log_var = clamp_log_var
+
+    @torch.no_grad()
+    def predict_uncertainty(self, dataset):
+        X = dataset.X
+        if not isinstance(X, np.ndarray):
+            X = np.asarray(X)
+
+        model = self.dc_model.model
+        device = next(model.parameters()).device
+        X_tensor = torch.from_numpy(X).float().to(device)
+
+        _enable_dropout_only(model)
+
+        probs_list = []
+        for _ in range(self.n_samples):
+            out = model(X_tensor)  # (N, 2C)
+            C = out.shape[-1] // 2
+            mu = out[..., :C]
+            log_var = out[..., C:]
+
+            if self.clamp_log_var is not None:
+                lo, hi = self.clamp_log_var
+                log_var = log_var.clamp(lo, hi)
+
+            std = torch.exp(0.5 * log_var)
+            eps = torch.randn_like(std)
+            logits = mu + std * eps
+            probs = F.softmax(logits, dim=-1)  # (N, C)
+            probs_list.append(probs.cpu().numpy())
+
+        mc_probs = np.stack(probs_list, axis=0)   # (S, N, C)
+        mean_prob = mc_probs.mean(axis=0)         # (N, C)
+
+        e = 1e-10
+        entropy = -np.sum(mean_prob * np.log(mean_prob + e), axis=1)  # (N,)
+
+        return mean_prob, entropy
+
+
+def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, run_id=0, use_weights=False, mode="regression"):
     """
     Train heteroscedastic MC-dropout NN and:
       - compute MSE with deterministic predictions (eval mode, no dropout)
@@ -646,59 +952,118 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, 
     n_tasks    = train_dc.y.shape[1]
     n_features = train_dc.X.shape[1]
 
-    # ----- Build model & DeepChem wrapper -----
-    model = MyTorchRegressorMC(n_features, n_tasks)    # your MC + log-var net
-    loss  = HeteroscedasticL2Loss()                   # Kendall & Gal-style loss
+    if mode == "regression":
+        # ----- Build model & DeepChem wrapper -----
+        model = MyTorchRegressorMC(n_features, n_tasks)    # your MC + log-var net
+        loss  = HeteroscedasticL2Loss()                   # Kendall & Gal-style loss
 
-    dc_model = dc.models.TorchModel(
+        dc_model = dc.models.TorchModel(
+            model=model,
+            loss=loss,
+            output_types=['prediction', 'variance', 'loss'],
+            batch_size=64,
+            learning_rate=1e-3,
+            mode='regression'
+        )
+    else:
+        y = np.asarray(train_dc.y)
+
+        if y.ndim == 2 and y.shape[1] > 1 and set(np.unique(y)).issubset({0, 1}):
+            n_classes = y.shape[1]
+        else:
+            n_classes = 2
+
+        # Model outputs: (B, 2*K) = [mu_logits | log_var]
+        model = MyTorchClassifierHeteroscedastic(n_features, n_classes, dropout_rate=0.2)
+        loss = HeteroscedasticClassificationLoss(n_samples=20)  # MC samples for training integration
+        
+        dc_model = dc.models.TorchModel(
         model=model,
         loss=loss,
-        output_types=['prediction', 'variance', 'loss'],
+        output_types=['prediction'],
         batch_size=64,
         learning_rate=1e-3,
-        mode='regression'
-    )
+        mode='classification')
 
     # ----- Train -----
     dc_model.fit(train_dc, nb_epoch=100)
 
-    # Instantiate the FIXED wrapper
-    mc_model = MCDropoutRegressorRefined(dc_model, n_samples=100)
+    if mode == "regression":
+        # Instantiate the FIXED wrapper
+        mc_model = MCDropoutRegressorRefined(dc_model, n_samples=100)
+        # Run Prediction
+        mean_test, std_test = mc_model.predict_uncertainty(test_dc)
 
-    # Run Prediction
-    mean_test, std_test = mc_model.predict_uncertainty(test_dc)
+        # --- CRITICAL FIX: Ensure shapes match for MSE ---
+        # Reshape mean_test to (N, 1) if necessary to match test_dc.y
+        if mean_test.ndim == 1:
+            mean_test = mean_test.reshape(-1, 1)
 
-    # --- CRITICAL FIX: Ensure shapes match for MSE ---
-    # Reshape mean_test to (N, 1) if necessary to match test_dc.y
-    if mean_test.ndim == 1:
-        mean_test = mean_test.reshape(-1, 1)
+        cutoff_error_df = calculate_cutoff_error_data(mean_test, std_test, test_dc.y, test_dc.w, use_weights=use_weights)
+        # Calculate MSE (Should now be ~0.67)
+        test_mse = mse_from_mean_prediction(mean_test, test_dc, use_weights=use_weights)
 
-    cutoff_error_df = calculate_cutoff_error_data(mean_test, std_test, test_dc.y)
-    # Calculate MSE (Should now be ~0.67)
-    test_mse = mse_from_mean_prediction(mean_test, test_dc)
+        alpha = 0.05
+        z = norm.ppf(1 - alpha / 2.0)
 
-    alpha = 0.05
-    z = norm.ppf(1 - alpha / 2.0)
+        # Calculate UQ Metrics (Should now have Valid Coverage and Non-Zero Std)
+        lower = mean_test - z * std_test
+        upper = mean_test + z * std_test
 
-    # Calculate UQ Metrics (Should now have Valid Coverage and Non-Zero Std)
-    lower = mean_test - z * std_test
-    upper = mean_test + z * std_test
+        # Note: Ensure std_test is broadcastable. If shape mismatch, reshape it.
+        if std_test.ndim == 1:
+            std_test = std_test.reshape(-1, 1)
 
-    # Note: Ensure std_test is broadcastable. If shape mismatch, reshape it.
-    if std_test.ndim == 1:
-        std_test = std_test.reshape(-1, 1)
+        uq_metrics = evaluate_uq_metrics_from_interval(
+            y_true=test_dc.y,
+            mean=mean_test,
+            lower=lower,
+            upper=upper,
+            alpha=alpha,
+            test_error=test_mse,
+            weights=test_dc.w,
+            use_weights=use_weights
+        )
 
-    uq_metrics = evaluate_uq_metrics_from_interval(
-        y_true=test_dc.y,
-        mean=mean_test,
-        lower=lower,
-        upper=upper,
-        alpha=alpha,
-        test_error=test_mse
-    )
+        print(f"[NN MC-DROPOUT] Test MSE: {test_mse:.6f}")
+        print(f"[NN MC-DROPOUT] UQ Metrics: {uq_metrics}")
 
-    print(f"[NN MC-DROPOUT] Test MSE: {test_mse:.6f}")
-    print(f"[NN MC-DROPOUT] UQ Metrics: {uq_metrics}")
+    else:
+        mc_wrapper = MCDropoutClassifierWrapper(dc_model, n_samples=n_samples)
+        mean_probs, entropy = mc_wrapper.predict_uncertainty(test_dc)
+
+        # Binary AUC path (keeps your previous behavior)
+        assert mean_probs.shape[1] == 2
+        probs_positive = mean_probs[:, 1]
+        y_true = np.asarray(test_dc.y).reshape(-1)
+
+        if use_weights and test_dc.w is not None:
+            weights = np.asarray(test_dc.w).reshape(-1)
+        else:
+            weights = None
+
+        test_auc = roc_auc_score(y_true, probs_positive, sample_weight=weights)
+
+        uq_metrics = evaluate_uq_metrics_classification(
+            y_true=test_dc.y,
+            probs=probs_positive,
+            auc=test_auc,
+            uncertainty=entropy,
+            weights=test_dc.w,
+            use_weights=use_weights,
+            n_bins=20
+        )
+
+        cutoff_error_df = calculate_cutoff_classification_data(
+            probs_positive,
+            test_dc.y,
+            weights=test_dc.w,
+            use_weights=use_weights
+        )
+
+        print(f"[MC-Dropout Class] Test AUC: {test_auc:.6f}")
+        print(f"[MC-Dropout Class] UQ Metrics: {uq_metrics}")
+            
 
     return uq_metrics, cutoff_error_df
 
@@ -812,9 +1177,9 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
         if mu_test.ndim == 1:
             mu_test = mu_test.reshape(-1, 1)
 
-        cutoff_error_df = calculate_cutoff_error_data(mu_test, total_var_test, test_dc.y)
+        cutoff_error_df = calculate_cutoff_error_data(mu_test, total_var_test, test_dc.y, test_dc.w, use_weights=use_weights)
 
-        test_mse = mse_from_mean_prediction(mu_test, test_dc)
+        test_mse = mse_from_mean_prediction(mu_test, test_dc, use_weights=use_weights)
 
         # --- 5. Calculate UQ Metrics ---
         z = norm.ppf(1 - alpha / 2.0)
@@ -833,7 +1198,9 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
             lower=lower,
             upper=upper,
             alpha=alpha,
-            test_error=test_mse
+            test_error=test_mse,
+            weights=test_dc.w,
+            use_weights=use_weights
         )
 
         print(f"\n[EVIDENTIAL REGRESSION] Test MSE: {test_mse:.6f}")
@@ -851,11 +1218,11 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
             # wandb=True,  # Set to True
             # model_dir='deep-evidential-regression-run-{}'.format(run_id),
             log_frequency=40,
-            mode='regression'
+            mode='classification'
         )
 
         # --- 2. Train ---
-        print(f"Training Deep Evidential Regression with lambda (reg_coeff) = {reg_coeff}")
+        print(f"Training Deep Evidential Classification")
         dc_model.fit(train_dc, nb_epoch=300, callbacks=[gradientClip])
         device = next(dc_model.model.parameters()).device
 
@@ -879,36 +1246,28 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
 
         # --- 4. Calculate MSE (using the deterministic mean prediction, gamma) ---
         # Ensure prediction shape matches for MSE calculation
-        mu_test = mu_test.cpu().numpy()
+        mu_test = mu_test[:,1].cpu().numpy()
         if mu_test.ndim == 1:
             mu_test = mu_test.reshape(-1, 1)
 
-        cutoff_error_df = calculate_cutoff_error_data(mu_test, total_var_test, test_dc.y)
+        cutoff_error_df = calculate_cutoff_classification_data(mu_test, test_dc.y, test_dc.w, use_weights=use_weights)
 
-        test_mse = mse_from_mean_prediction(mu_test, test_dc)
+        test_auc = roc_auc_score(test_dc.y, mu_test, sample_weight=test_dc.w)
 
-        # --- 5. Calculate UQ Metrics ---
-        z = norm.ppf(1 - alpha / 2.0)
+        # test_mse = mse_from_mean_prediction(mu_test, test_dc)
 
-        # Confidence interval: mean ± z * standard_deviation
-        lower = mu_test - z * std_test
-        upper = mu_test + z * std_test
-
-        # Ensure std_test is broadcastable.
-        if std_test.ndim == 1:
-            std_test = std_test.reshape(-1, 1)
-
-        uq_metrics = evaluate_uq_metrics_from_interval(
+        uq_metrics = evaluate_uq_metrics_classification(
             y_true=test_dc.y,
-            mean=mu_test,
-            lower=lower,
-            upper=upper,
-            alpha=alpha,
-            test_error=test_mse
+            probs=mu_test,
+            auc=test_auc,
+            uncertainty=total_var_test,
+            weights=test_dc.w,
+            use_weights=use_weights,
+            n_bins=20
         )
 
-        print(f"\n[EVIDENTIAL REGRESSION] Test MSE: {test_mse:.6f}")
-        print(f"[EVIDENTIAL REGRESSION] UQ Metrics: {uq_metrics}")
+        print(f"\n[EVIDENTIAL CLASSIFIACTION] Test MSE: {test_auc:.6f}")
+        print(f"[EVIDENTIAL CLASSIFIACTION] UQ Metrics: {uq_metrics}")
 
         return uq_metrics, cutoff_error_df
     
@@ -932,7 +1291,7 @@ def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, 
             mode='regression',
         )
     else:
-        loss = dc.models.losses.BinaryCrossEntropy()
+        loss = dc.models.losses.SigmoidCrossEntropy()
 
         dc_model = dc.models.TorchModel(
             model=model,
@@ -940,7 +1299,7 @@ def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, 
             output_types=['prediction'],
             batch_size=64,
             learning_rate=1e-3,
-            mode='regression',
+            mode='classification',
         )
 
     if mode == "regression":

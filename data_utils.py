@@ -439,7 +439,11 @@ def evaluate_uq_metrics_classification(
     # These rely on the expected class probabilities E[p], not the uncertainty mass u.
     
     # NLL (Log Loss)
-    epsilon = 1e-15
+    epsilon = 1e-8
+    assert np.isfinite(probs).all(), (
+    f"probs has NaN/inf: nan={np.isnan(probs).sum()}, inf={np.isinf(probs).sum()}"
+)
+    probs = np.asarray(probs, dtype=np.float64)
     p_safe = np.clip(probs, epsilon, 1 - epsilon)
     nll_per_point = -(y_true * np.log(p_safe) + (1 - y_true) * np.log(1 - p_safe))
     nll = np.average(nll_per_point, weights=w)
