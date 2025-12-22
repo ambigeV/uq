@@ -5,8 +5,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import deepchem as dc
 from scipy.stats import norm
+import math
 from data_utils import evaluate_uq_metrics_from_interval, evaluate_uq_metrics_classification, \
-    calculate_cutoff_error_data, calculate_cutoff_classification_data, roc_auc_score
+    calculate_cutoff_error_data, calculate_cutoff_classification_data, roc_auc_score, auc_from_probs
 from deepchem.models.losses import Loss, _make_pytorch_shapes_consistent
 
 
@@ -50,10 +51,13 @@ class MyTorchClassifier(nn.Module):
 
 class HeteroscedasticClassificationLoss(Loss):
     """
-    Implements Eq. 12:
-      L = - log( (1/T) * sum_t exp( log p_t(y|x) ) )
-    where logits_t = mu + std * eps, eps ~ N(0, I),
-    and p_t computed via softmax(logits_t).
+    Heteroscedastic Loss for Multi-Task Binary Classification.
+    
+    L = Sum_over_tasks [ - log( (1/T) * sum_samples ( p_sample ) ) ]
+    
+    where:
+      - p_sample = Sigmoid(logit_sample)      if y=1
+      - p_sample = 1 - Sigmoid(logit_sample)  if y=0
     """
 
     def __init__(
@@ -70,90 +74,87 @@ class HeteroscedasticClassificationLoss(Loss):
         self.eps = float(eps)
 
     def _create_pytorch_loss(self):
+        import torch.nn.functional as F
+
         def loss(output, labels):
-            output, labels = _make_pytorch_shapes_consistent(output, labels)
+            # output: (B, 2*T) -> [means | log_vars]
+            # labels: (B, T)
+            output, labels = dc.models.losses._make_pytorch_shapes_consistent(output, labels)
 
-            if output.shape[-1] % 2 != 0:
-                raise ValueError(f"Expected output last dim = 2*n_classes, got {output.shape[-1]}.")
-
-            n_classes = output.shape[-1] // 2
-            if n_classes < 2:
-                raise ValueError("HeteroscedasticClassificationLoss expects n_classes >= 2.")
-
-            mu = output[..., :n_classes]      # (B, C)
-            log_var = output[..., n_classes:] # (B, C)
+            n_tasks = output.shape[-1] // 2
+            
+            # Split Mean and Variance
+            mu = output[..., :n_tasks]       # (B, n_tasks)
+            log_var = output[..., n_tasks:]  # (B, n_tasks)
 
             if self.clamp_log_var is not None:
                 lo, hi = self.clamp_log_var
                 log_var = log_var.clamp(min=lo, max=hi)
 
-            std = torch.exp(0.5 * log_var)    # (B, C)
+            std = torch.exp(0.5 * log_var)   # (B, n_tasks)
 
-            # labels -> indices
-            if labels.ndim > 1 and labels.shape[-1] == n_classes:
-                y = labels.argmax(dim=-1)
-            else:
-                y = labels.long()
-            if y.ndim > 1:
-                y = y.squeeze(-1)  # (B,)
-
-            # Vectorized MC: (T, B, C)
+            # --- Vectorized MC Sampling ---
+            # Sample T times for every task in the batch
+            # Shape: (N_samples, B, n_tasks)
             T = self.n_samples
             eps = torch.randn((T,) + mu.shape, device=mu.device, dtype=mu.dtype)
-            logits_s = mu.unsqueeze(0) + std.unsqueeze(0) * eps  # (T,B,C)
+            
+            # Sampled Logits
+            logits_s = mu.unsqueeze(0) + std.unsqueeze(0) * eps  # (T, B, n_tasks)
 
-            # log softmax
-            log_probs_s = logits_s - torch.logsumexp(logits_s, dim=-1, keepdim=True)  # (T,B,C)
+            # --- Calculate Log-Likelihood (Binary) ---
+            # We want log( 1/T * sum( Prob(y|x) ) )
+            
+            # Expand labels to match samples: (T, B, n_tasks)
+            target_expanded = labels.unsqueeze(0).expand(T, -1, -1)
 
-            # gather true class log-prob
-            y_idx = y.unsqueeze(0).unsqueeze(-1).expand(T, -1, 1)                      # (T,B,1)
-            log_p_true = log_probs_s.gather(dim=-1, index=y_idx).squeeze(-1)           # (T,B)
+            # Numerical Stability Trick:
+            # We use BCEWithLogitsLoss to get log_prob per sample, 
+            # then logsumexp to average them.
+            # BCE gives -log(p), so we take negative BCE.
+            
+            # This computes log(sigmoid(x)) if y=1, and log(1-sigmoid(x)) if y=0
+            # reduction='none' returns (T, B, n_tasks)
+            log_prob_per_sample = -F.binary_cross_entropy_with_logits(
+                logits_s, target_expanded, reduction='none'
+            )
 
-            import math
-            log_mean_p = torch.logsumexp(log_p_true, dim=0) - math.log(T)              # (B,)
-            per_example = -log_mean_p                                                  # (B,)
+            # Log-Sum-Exp trick to average probabilities in log-space:
+            # log(1/T * sum(exp(log_p))) = logsumexp(log_p) - log(T)
+            log_expected_prob = torch.logsumexp(log_prob_per_sample, dim=0) - math.log(T) # (B, n_tasks)
 
-            if self.reduction == "none":
-                return per_example
-            if self.reduction == "sum":
-                return per_example.sum()
-            return per_example.mean()
+            # Loss is negative log likelihood
+            loss_per_task = -log_expected_prob # (B, n_tasks)
+
+            # --- Final Reduction ---
+            # We return (B, n_tasks) so DeepChem can apply weights (B, n_tasks) element-wise.
+            return loss_per_task
 
         return loss
 
 
 class HeteroscedasticL2Loss(Loss):
-    """
-    Kendall & Gal heteroscedastic regression loss:
-
-      L = 1/N * sum_i [ 0.5 * exp(-s_i) * (y_i - y_hat_i)^2 + 0.5 * s_i ]
-
-    where s_i = log sigma_i^2.
-    """
-
     def _create_pytorch_loss(self):
         import torch
 
         def loss(output, labels):
-            # DeepChem helper: handles (N,), (N,1), multi-task shapes, etc.
-            output, labels = _make_pytorch_shapes_consistent(output, labels)
-            # output: (B, 2*T)  where T = n_tasks
+            # output: (B, 2*T) -> [means | log_vars]
             # labels: (B, T)
-
+            output, labels = _make_pytorch_shapes_consistent(output, labels)
+            
             D = labels.shape[-1]
             y_hat   = output[..., :D]   # (B, T)
             log_var = output[..., D:]   # (B, T)
 
-            precision = torch.exp(-log_var)     # 1 / sigma^2
-            diff2     = (labels - y_hat) ** 2   # (B, T)
+            precision = torch.exp(-log_var)
+            diff2     = (labels - y_hat) ** 2
 
-            # elementwise Kendall & Gal loss
-            loss_elem = 0.5 * precision * diff2 + 0.5 * log_var  # (B, T)
+            # (B, T)
+            loss_elem = 0.5 * precision * diff2 + 0.5 * log_var 
 
-            # mean over tasks → shape (B,) (per-sample)
-            loss_per_sample = torch.mean(loss_elem, dim=-1)
-            return loss_per_sample
-
+            # CRITICAL FIX: Do NOT average here. 
+            # Return (B, T) so it matches the shape of the weights (B, T).
+            return loss_elem
         return loss
 
 
@@ -161,31 +162,29 @@ class EvidentialClassificationLoss(Loss):
     """
     Deep Evidential Classification Loss wrapper for DeepChem.
     
-    Implements the loss function L = L_risk + lambda * L_reg (KL Divergence).
-    Designed to work with a model that outputs Dirichlet parameters (alpha).
+    Supports two operational modes based on input shapes:
+    1. Single-Task Multi-Class: Uses Dirichlet distribution (competing classes).
+    2. Multi-Task Binary: Uses Beta distribution (independent tasks).
     """
     def __init__(self, mode='mse', num_classes=2, annealing_step=10, epoch_tracker=None):
-        """
-        Args:
-            mode (str): The loss variant - 'mse', 'log', or 'digamma'.
-                        'mse' is generally the most stable for EDL.
-            num_classes (int): Number of classes. For Binary, this MUST be 2.
-            annealing_step (int): The number of epochs over which to ramp up the KL penalty.
-            epoch_tracker (list): A mutable list containing the current epoch number (e.g., [0]).
-                                  This allows the loss to access the training progress since 
-                                  DeepChem's loss signature is stateless.
-        """
         self.mode = mode
         self.num_classes = num_classes
         self.annealing_step = annealing_step
-        # Default to full penalty (epoch=100) if no tracker is provided
-        self.epoch_tracker = epoch_tracker if epoch_tracker is not None else [100]
+        # Use mutable list to track epoch across calls if not provided
+        self.epoch_tracker = epoch_tracker if epoch_tracker is not None else [0]
         super(EvidentialClassificationLoss, self).__init__()
 
     def _create_pytorch_loss(self):
         
-        # --- 1. Internal Helper: KL Divergence for Dirichlet ---
-        def kl_divergence(alpha, num_classes):
+        # --- Helpers ---
+        def get_annealing_coef(epoch, annealing_step):
+            return torch.min(
+                torch.tensor(1.0, dtype=torch.float32),
+                torch.tensor(epoch / annealing_step, dtype=torch.float32),
+            )
+
+        # [Logic A] Dirichlet KL (Single-Task, Competing Classes)
+        def kl_divergence_dirichlet(alpha, num_classes):
             ones = torch.ones([1, num_classes], dtype=torch.float32, device=alpha.device)
             sum_alpha = torch.sum(alpha, dim=1, keepdim=True)
             first_term = (
@@ -201,76 +200,95 @@ class EvidentialClassificationLoss(Loss):
             )
             return first_term + second_term
 
-        def get_annealing_coef(epoch, annealing_step):
-            # Linearly increase from 0 to 1 over 'annealing_step' epochs
-            return torch.min(
-                torch.tensor(1.0, dtype=torch.float32),
-                torch.tensor(epoch / annealing_step, dtype=torch.float32),
-            )
+        # [Logic B] Beta KL (Multi-Task, Independent Tasks)
+        def kl_divergence_beta(alpha, beta):
+            sum_params = alpha + beta
+            term1 = torch.lgamma(sum_params) - torch.lgamma(alpha) - torch.lgamma(beta)
+            term2 = (alpha - 1) * (torch.digamma(alpha) - torch.digamma(sum_params))
+            term3 = (beta - 1) * (torch.digamma(beta) - torch.digamma(sum_params))
+            return term1 + term2 + term3
 
-        # --- 3. The Main Loss Function ---
         def loss(output, labels):
-            # A. Tuple Handling
-            # If the model returns (prob, alpha, ale, epi), DeepChem routes 'alpha' here.
-            # However, if configurations change, we safeguard against receiving the tuple.
-            # if isinstance(output, (tuple, list)):
-            #     # "prediction" is index 0, "loss" (alpha) is index 1
-            #     output = output[1] 
-
-            # B. Shape Consistency
             output, labels = _make_pytorch_shapes_consistent(output, labels)
             
-            # C. Define Alpha (Evidence + 1)
-            # We assume the model layer 'DenseDirichlet' has already returned alpha.
-            alpha = output 
+            # --- Auto-Detection of Mode ---
+            n_label_cols = labels.shape[-1]
+            
+            # === MODE 1: MULTI-TASK (Beta Distribution) ===
+            if n_label_cols > 1:
+                n_tasks = n_label_cols
+                # Reshape: (Batch, Tasks, 2) -> alpha (Fail), beta (Success)
+                params = output.view(-1, n_tasks, 2)
+                
+                alpha_param = params[..., 0] 
+                beta_param  = params[..., 1]
+                
+                S = alpha_param + beta_param
+                p = beta_param / S 
+                
+                # --- Base Loss ---
+                if self.mode == 'mse':
+                    sq_err = (labels - p) ** 2
+                    var_term = (p * (1 - p)) / (S + 1)
+                    base_loss = sq_err + var_term
+                elif self.mode == 'log':
+                    base_loss = -(labels * (torch.log(beta_param) - torch.log(S)) + 
+                                  (1 - labels) * (torch.log(alpha_param) - torch.log(S)))
+                else:
+                    # Digamma for Binary
+                    base_loss = -(labels * (torch.digamma(beta_param) - torch.digamma(S)) + 
+                                  (1 - labels) * (torch.digamma(alpha_param) - torch.digamma(S)))
+            
+                
+                # Formula: labels * (Target if y=1) + (1-labels) * (Target if y=0)
+                alpha_reg = labels * alpha_param + (1 - labels) * 1
+                beta_reg  = labels * 1 + (1 - labels) * beta_param
+                
+                kl = kl_divergence_beta(alpha_reg, beta_reg)
+                
+                current_epoch = self.epoch_tracker[0]
+                annealing = get_annealing_coef(current_epoch, self.annealing_step)
+                
+                total_loss = base_loss + annealing * kl
 
-            # D. Label Handling (One-Hot Encoding)
-            # DeepChem binary labels are often shape (Batch, 1) or (Batch, Tasks) with values 0/1.
-            # EDL requires One-Hot: (Batch, 2) i.e., [Evidence_Class0, Evidence_Class1]
-            if labels.shape[-1] == 1: 
-                # Squeeze the last dim to get indices, then one_hot encode
-                # Ensure labels are LongTensor for one_hot
-                y_onehot = F.one_hot(labels.long().squeeze(-1), num_classes=self.num_classes).float()
+                return total_loss
+
+            # === MODE 2: SINGLE-TASK (Dirichlet Distribution) ===
             else:
-                # Assume already one-hot or proper shape
-                y_onehot = labels.float()
+                alpha = output 
+                
+                # One-Hot Encode
+                if labels.shape[-1] == 1: 
+                    y_onehot = F.one_hot(labels.long().squeeze(-1), num_classes=self.num_classes).float()
+                else:
+                    y_onehot = labels.float()
 
-            # E. Calculate Risk Loss (MSE / Log / Digamma)
-            S = torch.sum(alpha, dim=1, keepdim=True)
-            
-            if self.mode == 'mse':
-                # Expected Mean Squared Error + Variance term
-                pred_prob = alpha / S
-                loss_err = torch.sum((y_onehot - pred_prob) ** 2, dim=1, keepdim=True)
-                loss_var = torch.sum(
-                    alpha * (S - alpha) / (S * S * (S + 1)), dim=1, keepdim=True
-                )
-                base_loss = loss_err + loss_var
+                S = torch.sum(alpha, dim=1, keepdim=True)
+                
+                if self.mode == 'mse':
+                    pred_prob = alpha / S
+                    loss_err = torch.sum((y_onehot - pred_prob) ** 2, dim=1, keepdim=True)
+                    loss_var = torch.sum(
+                        alpha * (S - alpha) / (S * S * (S + 1)), dim=1, keepdim=True
+                    )
+                    base_loss = loss_err + loss_var
 
-            elif self.mode == 'log':
-                # Negative Log of the Expected Likelihood
-                base_loss = torch.sum(y_onehot * (torch.log(S) - torch.log(alpha)), dim=1, keepdim=True)
+                elif self.mode == 'log':
+                    base_loss = torch.sum(y_onehot * (torch.log(S) - torch.log(alpha)), dim=1, keepdim=True)
 
-            elif self.mode == 'digamma':
-                # Expected Cross Entropy (using Digamma)
-                base_loss = torch.sum(y_onehot * (torch.digamma(S) - torch.digamma(alpha)), dim=1, keepdim=True)
+                elif self.mode == 'digamma':
+                    base_loss = torch.sum(y_onehot * (torch.digamma(S) - torch.digamma(alpha)), dim=1, keepdim=True)
+                
+                else:
+                    raise ValueError(f"Unknown mode: {self.mode}")
 
-            else:
-                raise ValueError(f"Unknown mode: {self.mode}")
-
-            # F. Calculate Regularization (KL Divergence)
-            # Penalize divergence from uniform Dirichlet (alpha=1) for non-target classes
-            kl_alpha = (alpha - 1) * (1 - y_onehot) + 1
-            
-            current_epoch_val = self.epoch_tracker[0] 
-            annealing_coef = get_annealing_coef(current_epoch_val, self.annealing_step)
-            
-            kl = annealing_coef * kl_divergence(kl_alpha, self.num_classes)
-            
-            # G. Combine and Return Mean
-            total_loss_per_sample = base_loss + kl
-            
-            return torch.mean(total_loss_per_sample)
+                kl_alpha = (alpha - 1) * (1 - y_onehot) + 1
+                current_epoch = self.epoch_tracker[0]
+                annealing = get_annealing_coef(current_epoch, self.annealing_step)
+                
+                kl = annealing * kl_divergence_dirichlet(kl_alpha, self.num_classes)
+                
+                return torch.mean(base_loss + kl)
 
         return loss
 
@@ -325,36 +343,56 @@ class EvidentialRegressionLoss(Loss):
         evi = 2 * v + alpha  # Total Evidence (Phi)
         reg = error * evi
         return reg  # (B, T) tensor
-
+    
     def _create_pytorch_loss(self):
-
         def loss(output, labels):
-            # DeepChem helper: handles shapes
-            # NOTE: We assume the model outputs 4 parameters per task (T)
-            # output: (B, 4*T)
-            # labels: (B, T)
             output, labels = _make_pytorch_shapes_consistent(output, labels)
-            D = labels.shape[-1]
-
-            # 1. Chunk output into the four evidential parameters (B, T)
+            
+            # 1. Chunk output (B, 4*T) -> Four (B, T) tensors
             gamma, v, alpha, beta = output.chunk(4, dim=-1)
 
-            # 2. Compute Loss NLL: Negative Log-Likelihood
-            loss_nll_elem = self.nig_nll_tensor(labels, gamma, v, alpha, beta)
+            # 2. Compute Element-wise Losses (B, T)
+            loss_nll = self.nig_nll_tensor(labels, gamma, v, alpha, beta)
+            loss_reg = self.nig_reg_tensor(labels, gamma, v, alpha)
+            loss_u   = self.nig_reg_U_tensor(labels, gamma, v, alpha, beta)
 
-            # 3. Compute Loss R: Evidential Regularizer
-            loss_reg_elem = self.nig_reg_tensor(labels, gamma, v, alpha)
+            # 3. Combine
+            loss_elem = loss_nll + self.reg_coeff_r * loss_reg + self.reg_coeff_u * loss_u
 
-            loss_u = self.nig_reg_U_tensor(labels, gamma, v, alpha, beta)
-
-            # 4. Total Loss L = L_NLL + lambda * L_R
-            loss_elem = loss_nll_elem + self.reg_coeff_r * loss_reg_elem + self.reg_coeff_u * loss_u  # (B, T)
-
-            # mean over tasks → shape (B,) (per-sample)
-            loss_per_sample = torch.mean(loss_elem, dim=-1)
-            return loss_per_sample
+            # CRITICAL FIX: Return (B, T), do not mean() here.
+            return loss_elem
 
         return loss
+
+    # def _create_pytorch_loss(self):
+
+    #     def loss(output, labels):
+    #         # DeepChem helper: handles shapes
+    #         # NOTE: We assume the model outputs 4 parameters per task (T)
+    #         # output: (B, 4*T)
+    #         # labels: (B, T)
+    #         output, labels = _make_pytorch_shapes_consistent(output, labels)
+    #         D = labels.shape[-1]
+
+    #         # 1. Chunk output into the four evidential parameters (B, T)
+    #         gamma, v, alpha, beta = output.chunk(4, dim=-1)
+
+    #         # 2. Compute Loss NLL: Negative Log-Likelihood
+    #         loss_nll_elem = self.nig_nll_tensor(labels, gamma, v, alpha, beta)
+
+    #         # 3. Compute Loss R: Evidential Regularizer
+    #         loss_reg_elem = self.nig_reg_tensor(labels, gamma, v, alpha)
+
+    #         loss_u = self.nig_reg_U_tensor(labels, gamma, v, alpha, beta)
+
+    #         # 4. Total Loss L = L_NLL + lambda * L_R
+    #         loss_elem = loss_nll_elem + self.reg_coeff_r * loss_reg_elem + self.reg_coeff_u * loss_u  # (B, T)
+
+    #         # mean over tasks → shape (B,) (per-sample)
+    #         loss_per_sample = torch.mean(loss_elem, dim=-1)
+    #         return loss_per_sample
+
+    #     return loss
 
 
 class DenseDirichlet(nn.Module):
@@ -392,25 +430,51 @@ class DenseDirichlet(nn.Module):
         logits = self.dense(x)
         
         # Evidence is typically exp(logits) or softplus(logits)
-        # Using exp ensures evidence > 0. Adding 1 ensures alpha >= 1.
         evidence = torch.exp(logits) 
         alpha = evidence + 1
 
-        # Calculate S (sum of alphas) - Strength of the Dirichlet distribution
-        S = torch.sum(alpha, dim=1, keepdim=True)
-        K = self.out_dim
+        # --- CRITICAL FIX START ---
+        
+        # 1. Reshape to separate tasks from classes
+        # Current shape: (Batch, 2 * n_tasks)
+        # New shape:     (Batch, n_tasks, 2)
+        # where dim 2 is [alpha_class0, alpha_class1]
+        n_tasks = self.out_dim // 2  # Assuming out_dim is total outputs (2*T)
+        alpha_reshaped = alpha.view(-1, n_tasks, 2)
+        
+        # 2. Calculate S per task (Sum over the LAST dimension only)
+        # S shape: (Batch, n_tasks, 1)
+        S = torch.sum(alpha_reshaped, dim=2, keepdim=True)
+        
+        # 3. Calculate K (Number of classes per task)
+        # For binary tasks, K = 2
+        K = 2 
 
-        # 1. Prediction (Expected Probability): alpha_k / S
-        prob = alpha / S
+        # 4. Prediction (Expected Probability): alpha_k / S_k
+        # We calculate this for the "positive class" (index 1) usually, 
+        # or return both. Let's return full shape (Batch, n_tasks, 2) to be safe.
+        prob = alpha_reshaped / S
 
-        # 2. Epistemic Uncertainty: K / S (inversely related to total evidence)
+        # 5. Epistemic Uncertainty (Vacuity): K / S
+        # Shape: (Batch, n_tasks, 1)
         epistemic = K / S
 
-        # 3. Aleatoric Uncertainty: Entropy of the expected probability
-        # calculate entropy H(p) = - sum(p * log(p))
-        aleatoric = -torch.sum(prob * torch.log(prob + 1e-8), dim=1, keepdim=True)
+        # 6. Aleatoric Uncertainty: Entropy of the expected probability
+        # Sum over the 2 classes (last dim)
+        prob_safe = prob + 1e-8
+        aleatoric = -torch.sum(prob * torch.log(prob_safe), dim=2, keepdim=True)
 
-        # RETURN ORDER MATTERS FOR DEEPCHEM:
+        # --- CRITICAL FIX END ---
+
+        # Reshape back to flat vectors if your training loop expects flat tensors
+        # or keep them structured. DeepChem usually expects (Batch, N) outputs.
+        # Let's flatten everything back to (Batch, N) to match typical API expectations.
+        
+        prob = prob.view(x.shape[0], -1)       # (Batch, 2*T)
+        alpha = alpha                          # (Batch, 2*T) - Already flat
+        aleatoric = aleatoric.view(x.shape[0], -1) # (Batch, T)
+        epistemic = epistemic.view(x.shape[0], -1) # (Batch, T)
+
         return prob, alpha, aleatoric, epistemic
 
 
@@ -515,42 +579,61 @@ class MyTorchRegressorMC(nn.Module):
 # 2. Helper Evaluation
 # ============================================================
 
+import numpy as np
+
 def mse_from_mean_prediction(mean, dataset, use_weights=False):
-    # 1. Always flatten the True Labels to (N,)
-    y_true = dataset.y.reshape(-1)
+    """
+    Calculates MSE.
+    - If Single-Task: Returns a scalar (float).
+    - If Multi-Task: Returns a list of scalars (one per task).
+    """
+    # 1. Standardize Shapes to (N, n_tasks)
+    # This prevents the "hidden 1D array" issues
+    y_true = dataset.y
+    if y_true.ndim == 1: 
+        y_true = y_true.reshape(-1, 1)
+    
+    if mean.ndim == 1: 
+        mean = mean.reshape(-1, 1)
 
-    # 2. Handle the Prediction 'mean'
-    # Check if 'mean' is 2D and has more than 1 column (e.g., [Pred, Var])
-    if mean.ndim > 1 and mean.shape[1] > 1:
-        # Take only the first column (The Prediction)
-        mean = mean[:, 0]
+    n_tasks = y_true.shape[1]
 
-    # 3. Flatten prediction to (N,) to guarantee 1-to-1 subtraction
-    mean = mean.reshape(-1)
+    # 2. Prepare Weights (N, n_tasks)
+    if use_weights and hasattr(dataset, 'w') and dataset.w is not None:
+        w = dataset.w
+        if w.ndim == 1: 
+            w = w.reshape(-1, 1)
+        
+        # Safety: Check shape match
+        if w.shape != y_true.shape:
+            print(f"Warning: Weights shape {w.shape} != Y shape {y_true.shape}. Using unweighted.")
+            w = np.ones_like(y_true)
+    else:
+        w = np.ones_like(y_true)
 
-    # 4. Calculate Squared Errors
-    sq_error = (mean - y_true) ** 2
+    # 3. Calculate MSE Per Task
+    mse_list = []
+    for t in range(n_tasks):
+        y_t = y_true[:, t]
+        pred_t = mean[:, t]
+        w_t = w[:, t]
 
-    # 5. Handle Weighting
-    if use_weights:
-        # Attempt to grab weights from the dataset (standard in DeepChem/many loaders)
-        if hasattr(dataset, 'w') and dataset.w is not None:
-            w = dataset.w.reshape(-1)
-            
-            # Safety check: ensure weights match data length
-            if len(w) != len(y_true):
-                # Fallback or strict error depending on preference. 
-                # Here we warn and fallback to unweighted to avoid crashing.
-                print(f"Warning: Weight shape {w.shape} mismatch with labels {y_true.shape}. Using unweighted MSE.")
-                return sq_error.mean()
-                
-            return np.average(sq_error, weights=w)
+        sq_err = (y_t - pred_t) ** 2
+        
+        # Weighted Mean for this specific task
+        w_sum = np.sum(w_t)
+        if w_sum > 0:
+            task_mse = np.average(sq_err, weights=w_t)
         else:
-            # If use_weights is True but no weights found, usually default to unweighted
-            pass
+            task_mse = np.mean(sq_err) # Fallback if weights are all zero
+            
+        mse_list.append(float(task_mse))
 
-    # Standard unweighted MSE
-    return sq_error.mean()
+    # 4. Return Logic
+    if n_tasks == 1:
+        return mse_list[0] # Return Scalar
+    else:
+        return mse_list    # Return List [MSE_task1, MSE_task2, ...]
 
 
 # ============================================================
@@ -807,9 +890,9 @@ class MCDropoutRegressorRefined:
         # This returns shape (N, 2) -> [Prediction, Variance]
         raw_preds = self.dc_model.predict(dataset)
 
-        # 2. SLICE IT! (Crucial fix for the 1.80 -> 0.67 drop)
+        # 2. 
         # We discard the variance column for the MSE calculation.
-        mean_pred = raw_preds[:, 0]
+        mean_pred = raw_preds
 
         # Ensure shape is (N, 1) for consistent metric calculation
         # if mean_pred.ndim == 1:
@@ -917,10 +1000,30 @@ class MCDropoutClassifierWrapper:
 
         _enable_dropout_only(model)
 
+        # --- 1. DETECT MODE (Single vs Multi-Task) ---
+        # We peek at the output shape to decide between Softmax and Sigmoid
+        with torch.no_grad():
+            dummy_out = model(X_tensor[:2])
+            raw_dim = dummy_out.shape[-1]
+            # Assuming model outputs [means, log_vars], so we divide by 2
+            C = raw_dim // 2 
+            
+        n_dataset_tasks = dataset.y.shape[1]
+        
+        # LOGIC:
+        # If we have 1 task in dataset, but model outputs 2 dims (Class 0, Class 1),
+        # use SOFTMAX (standard binary classification).
+        # If we have N tasks in dataset, and model outputs N dims, 
+        # use SIGMOID (independent binary tasks).
+        if n_dataset_tasks == 1 and C == 2:
+            activation_fn = "softmax"
+        else:
+            activation_fn = "sigmoid"
+
+        # --- 2. MC DROPOUT LOOP ---
         probs_list = []
         for _ in range(self.n_samples):
             out = model(X_tensor)  # (N, 2C)
-            C = out.shape[-1] // 2
             mu = out[..., :C]
             log_var = out[..., C:]
 
@@ -931,14 +1034,32 @@ class MCDropoutClassifierWrapper:
             std = torch.exp(0.5 * log_var)
             eps = torch.randn_like(std)
             logits = mu + std * eps
-            probs = F.softmax(logits, dim=-1)  # (N, C)
+            
+            # [FIX 1] Apply correct activation
+            if activation_fn == "softmax":
+                probs = F.softmax(logits, dim=-1)  # (N, 2) -> Sums to 1
+            else:
+                probs = torch.sigmoid(logits)      # (N, T) -> Independent
+            
             probs_list.append(probs.cpu().numpy())
 
         mc_probs = np.stack(probs_list, axis=0)   # (S, N, C)
         mean_prob = mc_probs.mean(axis=0)         # (N, C)
-
+        
         e = 1e-10
-        entropy = -np.sum(mean_prob * np.log(mean_prob + e), axis=1)  # (N,)
+
+        # --- 3. ENTROPY CALCULATION ---
+        # [FIX 2] Calculate entropy based on the mode
+        if activation_fn == "softmax":
+            # Categorical Entropy: -sum(p log p)
+            # Returns (N,) -> reshaped to (N, 1)
+            entropy = -np.sum(mean_prob * np.log(mean_prob + e), axis=1)
+            entropy = entropy.reshape(-1, 1)
+        else:
+            # Binary Entropy Per Task: -[p log p + (1-p) log (1-p)]
+            # Returns (N, T) -> One uncertainty value per task
+            entropy = -(mean_prob * np.log(mean_prob + e) + 
+                       (1 - mean_prob) * np.log(1 - mean_prob + e))
 
         return mean_prob, entropy
 
@@ -974,7 +1095,7 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, 
             n_classes = 2
 
         # Model outputs: (B, 2*K) = [mu_logits | log_var]
-        model = MyTorchClassifierHeteroscedastic(n_features, n_classes, dropout_rate=0.2)
+        model = MyTorchClassifierHeteroscedastic(n_features, n_classes=n_tasks, dropout_rate=0.2)
         loss = HeteroscedasticClassificationLoss(n_samples=20)  # MC samples for training integration
         
         dc_model = dc.models.TorchModel(
@@ -1025,7 +1146,7 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, 
             use_weights=use_weights
         )
 
-        print(f"[NN MC-DROPOUT] Test MSE: {test_mse:.6f}")
+        print(f"[NN MC-DROPOUT] Test MSE: {test_mse}")
         print(f"[NN MC-DROPOUT] UQ Metrics: {uq_metrics}")
 
     else:
@@ -1033,27 +1154,28 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, 
         mean_probs, entropy = mc_wrapper.predict_uncertainty(test_dc)
 
         # Binary AUC path (keeps your previous behavior)
-        assert mean_probs.shape[1] == 2
-        probs_positive = mean_probs[:, 1]
-        y_true = np.asarray(test_dc.y).reshape(-1)
-
-        if use_weights and test_dc.w is not None:
-            weights = np.asarray(test_dc.w).reshape(-1)
+        n_tasks = test_dc.y.shape[1]
+        if n_tasks == 1 and mean_probs.shape[1] == 2:
+            probs_positive = mean_probs[:, 1].reshape(-1, 1) # Force (N, 1)
+            entropy = entropy.reshape(-1, 1)
         else:
-            weights = None
+            probs_positive = mean_probs # Already (N, T)
 
-        test_auc = roc_auc_score(y_true, probs_positive, sample_weight=weights)
+        # 4. Calculate AUC (Scalar or List) using helper
+        test_auc = auc_from_probs(test_dc.y, probs_positive, test_dc.w, use_weights=use_weights)
 
+        # 5. Calculate UQ Metrics (Internal loop handles lists)
         uq_metrics = evaluate_uq_metrics_classification(
             y_true=test_dc.y,
             probs=probs_positive,
-            auc=test_auc,
-            uncertainty=entropy,
+            auc=test_auc,        # Pass the pre-calculated AUC
+            uncertainty=entropy, # Pass the entropy (N, T)
             weights=test_dc.w,
             use_weights=use_weights,
             n_bins=20
         )
 
+        # 6. Calculate Cutoff Data (Internal loop handles DataFrame concatenation)
         cutoff_error_df = calculate_cutoff_classification_data(
             probs_positive,
             test_dc.y,
@@ -1061,9 +1183,9 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, 
             use_weights=use_weights
         )
 
-        print(f"[MC-Dropout Class] Test AUC: {test_auc:.6f}")
-        print(f"[MC-Dropout Class] UQ Metrics: {uq_metrics}")
-            
+        # 7. Print consistent output
+        print(f"[NN MC-DROPOUT] Test AUC: {test_auc}") 
+        print(f"[NN MC-DROPOUT] UQ Metrics: {uq_metrics}")
 
     return uq_metrics, cutoff_error_df
 
@@ -1244,15 +1366,22 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
         total_var_test = aleatoric_test.cpu().numpy() + epistemic_test.cpu().numpy()
         std_test = np.sqrt(total_var_test)
 
-        # --- 4. Calculate MSE (using the deterministic mean prediction, gamma) ---
-        # Ensure prediction shape matches for MSE calculation
-        mu_test = mu_test[:,1].cpu().numpy()
+        if isinstance(mu_test, torch.Tensor):
+            mu_test = mu_test.cpu().numpy()
+            
+        # Check if we have multiple columns (binary classification usually has >= 2)
+        if mu_test.ndim > 1 and mu_test.shape[1] > 1:
+            # Slice: Start at index 1 (Class 1), take every 2nd column
+            mu_test = mu_test[:, 1::2]
+        
+        # Ensure it is at least 2D for consistency: (N_Samples, N_Tasks)
+        # Even if it's single task, we want (N, 1), not (N,)
         if mu_test.ndim == 1:
             mu_test = mu_test.reshape(-1, 1)
 
         cutoff_error_df = calculate_cutoff_classification_data(mu_test, test_dc.y, test_dc.w, use_weights=use_weights)
 
-        test_auc = roc_auc_score(test_dc.y, mu_test, sample_weight=test_dc.w)
+        test_auc = auc_from_probs(test_dc.y, mu_test, test_dc.w, use_weights=use_weights)
 
         # test_mse = mse_from_mean_prediction(mu_test, test_dc)
 
@@ -1306,12 +1435,35 @@ def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, 
         dc_model.fit(train_dc, nb_epoch=80)
 
         metric = dc.metrics.Metric(dc.metrics.mean_squared_error)
-        valid_scores = dc_model.evaluate(valid_dc, [metric], use_sample_weights=use_weights)
-        test_scores = dc_model.evaluate(test_dc, [metric], use_sample_weights=use_weights)
+        metric_name = metric.name
 
-        print("[NN Baseline] Validation MSE:", valid_scores[metric.name])
-        print("[NN Baseline] Test MSE:",      test_scores[metric.name])
-        mse_test = test_scores[metric.name]
+        valid_scores = dc_model.evaluate(valid_dc, [metric], use_sample_weights=use_weights, per_task_metrics=True)
+        test_scores = dc_model.evaluate(test_dc, [metric], use_sample_weights=use_weights, per_task_metrics=True)
+
+        # 4. Unpack the tuples safely
+        # *_agg:      Dict with scalar weighted average (mean across tasks)
+        # *_detailed: Dict with detailed scores (List if multitask, float if singletask)
+        valid_agg, valid_detailed = valid_scores
+        test_agg,  test_detailed  = test_scores
+
+        # 5. Extract the Main Aggregate Score (Safe for logging)
+        val_score_avg = valid_agg[metric_name]
+        test_score_avg = test_agg[metric_name]
+
+        # 6. Console Logging
+        print(f"[NN Baseline] Validation {metric_name} (Avg): {val_score_avg:.4f}")
+        print(f"[NN Baseline] Test {metric_name} (Avg):       {test_score_avg:.4f}")
+
+        # 7. Per-Task Logging (Handle List vs Scalar types automatically)
+        task_scores_test = test_detailed[metric_name]
+
+        if isinstance(task_scores_test, list):
+            # Multi-task: Print list rounded for readability
+            formatted_scores = [round(x, 4) for x in task_scores_test]
+            print(f"[NN Baseline] Test {metric_name} (Per Task): {formatted_scores}")
+        else:
+            # Single-task: It is just a float
+            print(f"[NN Baseline] Test {metric_name} (Task 0):   {task_scores_test:.4f}")
 
         return {
             "alpha": None,
@@ -1320,24 +1472,56 @@ def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, 
             "nll": None,
             "ce": None,
             "spearman_err_unc": None,
-            "MSE": float(mse_test),
+            "MSE": task_scores_test,
         }
     else:
+        # 1. Train the model
         dc_model.fit(train_dc, nb_epoch=80)
 
+        # 2. Define the metric (Using ROC-AUC as in your snippet)
         metric = dc.metrics.Metric(dc.metrics.roc_auc_score)
-        valid_scores = dc_model.evaluate(valid_dc, [metric], use_sample_weights=use_weights)
-        test_scores = dc_model.evaluate(test_dc, [metric], use_sample_weights=use_weights)
+        metric_name = metric.name
 
-        print("[NN Baseline] Validation AUC:", valid_scores[metric.name])
-        print("[NN Baseline] Test AUC:", test_scores[metric.name])
-        mse_test = test_scores[metric.name]
+        # 3. Evaluate with per_task_metrics=True
+        # This returns a tuple: (aggregate_score_dict, per_task_score_dict)
+        valid_results = dc_model.evaluate(valid_dc, [metric], use_sample_weights=use_weights, per_task_metrics=True)
+        test_results = dc_model.evaluate(test_dc, [metric], use_sample_weights=use_weights, per_task_metrics=True)
 
+        # 4. Unpack the tuples safely
+        # *_agg:      Dict with scalar weighted average (mean across tasks)
+        # *_detailed: Dict with detailed scores (List if multitask, float if singletask)
+        valid_agg, valid_detailed = valid_results
+        test_agg,  test_detailed  = test_results
+
+        # 5. Extract the Main Aggregate Score (Safe for logging)
+        val_score_avg = valid_agg[metric_name]
+        test_score_avg = test_agg[metric_name]
+
+        # 6. Console Logging
+        print(f"[NN Baseline] Validation {metric_name} (Avg): {val_score_avg:.4f}")
+        print(f"[NN Baseline] Test {metric_name} (Avg):       {test_score_avg:.4f}")
+
+        # 7. Per-Task Logging (Handle List vs Scalar types automatically)
+        task_scores_test = test_detailed[metric_name]
+
+        if isinstance(task_scores_test, list):
+            # Multi-task: Print list rounded for readability
+            formatted_scores = [round(x, 4) for x in task_scores_test]
+            print(f"[NN Baseline] Test {metric_name} (Per Task): {formatted_scores}")
+        else:
+            # Single-task: It is just a float
+            print(f"[NN Baseline] Test {metric_name} (Task 0):   {task_scores_test:.4f}")
+
+        # 8. Return Dictionary
         return {
-            "AUC": float(mse_test),
+            # INVARIANT: Always returns a single float (mean over tasks).
+            # This keeps your main results table clean and crash-free.
+            # NEW: Stores the detailed scores (list or float) for deeper analysis.
+            "AUC": task_scores_test,
+            # Placeholders for other metrics
             "NLL": None,
             "Brier": None,
             "ECE": None,
             "Avg_Entropy": None,
-            "spearman_err_unc": None,
+            "Spearman_Err_Unc": None,
         }

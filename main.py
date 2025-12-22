@@ -1,3 +1,4 @@
+from typing import List, Optional, Tuple
 import gc
 import deepchem as dc
 from data_utils import prepare_datasets, evaluate_uq_metrics_from_interval, \
@@ -47,59 +48,83 @@ def save_summary_to_csv(all_results, n_runs, out_path: str):
         writer.writeheader()
         writer.writerows(rows)
 
-
-def load_dataset(dataset_name: str = "delaney", split: str = "random"):
+def load_dataset(
+    dataset_name: str = "delaney", 
+    split: str = "random", 
+    task_indices: Optional[List[int]] = None
+):
     """
-    dataset_name: one of {"qm7", "qm8", "delaney", "lipo"}
-    featurizer_name: "ecfp" or "coulomb" (depending on dataset)
+    dataset_name: {"qm7", "qm8", "delaney", "lipo", "tox21"}
+    task_indices: List of indices to keep. e.g., [0] for first task, 
+                  [0, 2] for 1st and 3rd. If None, keeps ALL tasks.
     """
+    # 1. Load Raw Data
     if dataset_name == "qm7":
         FEATURIZER = "coulomb"
-        tasks, datasets, transformers = load_qm7(splitter=split)
+        tasks, datasets, transformers = dc.molnet.load_qm7(splitter=split)
     elif dataset_name == "qm8":
         FEATURIZER = "coulomb"
-        tasks, datasets, transformers = load_qm8(splitter=split)
+        tasks, datasets, transformers = dc.molnet.load_qm8(splitter=split)
     elif dataset_name == "delaney":
         FEATURIZER = "ecfp"
-        tasks, datasets, transformers = load_delaney(splitter=split)
+        tasks, datasets, transformers = dc.molnet.load_delaney(splitter=split)
     elif dataset_name == "lipo":
         FEATURIZER = "ecfp"
-        tasks, datasets, transformers = load_lipo(splitter=split)
+        tasks, datasets, transformers = dc.molnet.load_lipo(splitter=split)
     elif dataset_name == "tox21":
         FEATURIZER = "ecfp"
-        tasks, datasets, transformers = load_tox21(splitter=split)
+        tasks, datasets, transformers = dc.molnet.load_tox21(splitter=split)
     else:
         raise ValueError(f"Unknown dataset_name: {dataset_name}")
 
+    # 2. Flatten/Preprocess
     train_dc, valid_dc, test_dc = prepare_datasets(
         datasets,
         featurizer_name=FEATURIZER
     )
 
-    print("train_dc.w is", train_dc.w.shape)
-    print("train_dc.w is", train_dc.w.shape)
-    print("train_dc.w is", train_dc.w.shape)
+    # 3. Apply Task Mask (Slicing)
+    if task_indices is not None:
+        # Validate indices
+        n_available = len(tasks)
+        if any(i >= n_available for i in task_indices):
+            raise ValueError(f"task_indices {task_indices} out of range for {n_available} tasks.")
+        
+        # Slice task names
+        print(f"Original tasks: {len(tasks)}. Selecting indices: {task_indices}")
+        tasks = [tasks[i] for i in task_indices]
 
-    # Keep only first task if multi-task
-    if train_dc.y.ndim == 2 and train_dc.y.shape[1] > 1:
-        first_task_name = tasks[0]
-        tasks = [first_task_name]
+        # Helper to slice DeepChem datasets
+        def _slice_tasks(ds: dc.data.NumpyDataset) -> dc.data.NumpyDataset:
+            # Handle Y
+            if ds.y.ndim == 2:
+                new_y = ds.y[:, task_indices]
+            else:
+                # If y is 1D (N,), promote to (N,1) then slice, or error
+                new_y = ds.y.reshape(-1, 1)[:, task_indices]
 
-        def _keep_first_task(ds) -> dc.data.NumpyDataset:
+            # Handle W (weights)
+            if ds.w.ndim == 2:
+                new_w = ds.w[:, task_indices]
+            else:
+                new_w = ds.w.reshape(-1, 1)[:, task_indices]
+
             return dc.data.NumpyDataset(
                 X=ds.X,
-                y=ds.y[:, 0:1],
-                w=ds.w[:, 0:1],
+                y=new_y,
+                w=new_w,
                 ids=ds.ids,
-                n_tasks=1,
+                n_tasks=len(task_indices) # Update metadata
             )
 
-        train_dc = _keep_first_task(train_dc)
-        valid_dc = _keep_first_task(valid_dc)
-        test_dc = _keep_first_task(test_dc)
+        train_dc = _slice_tasks(train_dc)
+        valid_dc = _slice_tasks(valid_dc)
+        test_dc = _slice_tasks(test_dc)
+
+    print(f"Final Active Tasks: {len(tasks)}")
+    print(f"Train Y Shape: {train_dc.y.shape}")
 
     return tasks, train_dc, valid_dc, test_dc, transformers
-
 
 def _to_torch_xy(dc_dataset):
     X_t = torch.from_numpy(dc_dataset.X).float()
@@ -1350,23 +1375,25 @@ def main_gp_all(dataset_name: str = "delaney",
     )
 
 
-# if __name__ == "__main__":
-#     # main_svgp_ensemble_all()
-#     # main_nngp_exact()
-#     # main_nngp_exact_ensemble_all()
-#     # main_nngp_svgp_exact_ensemble_all()
-#     # main_nn()
-#     tasks, train_dc, valid_dc, test_dc, transformers = load_dataset(
-#         dataset_name="tox21",
-#         split="random"
-#     )
+if __name__ == "__main__":
+    # main_svgp_ensemble_all()
+    # main_nngp_exact()
+    # main_nngp_exact_ensemble_all()
+    # main_nngp_svgp_exact_ensemble_all()
+    # main_nn()
+    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset(
+        # dataset_name="tox21",
+        dataset_name="qm8",
+        split="random",
+        task_indices=[0,1,2]
+    )
 
     # train_nn_baseline(train_dc, valid_dc, test_dc,
-    #                   run_id=0, use_weights=False, mode="classification")
+    #                   run_id=0, use_weights=False)
     # train_nn_baseline(train_dc, valid_dc, test_dc,
     #                   run_id=0, use_weights=True, mode="classification")
-    # train_nn_mc_dropout(train_dc, valid_dc, test_dc,
-    #                   run_id=0, use_weights=False, mode="classification")
+    train_nn_mc_dropout(train_dc, valid_dc, test_dc,
+                      run_id=0, use_weights=False)
     # train_nn_mc_dropout(train_dc, valid_dc, test_dc,
     #                   run_id=0, use_weights=True, mode="classification")
     # train_evd_baseline(train_dc, valid_dc, test_dc,
@@ -1383,31 +1410,31 @@ def main_gp_all(dataset_name: str = "delaney",
     # main_svgp_ensemble_all(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc,
     #                 run_id=0, use_weights=True, mode="classification")
 
-#
-if __name__ == "__main__":
-    import argparse
+# #
+# if __name__ == "__main__":
+#     import argparse
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="delaney",
-                        choices=["qm7", "qm8", "delaney", "lipo", "tox21"])
-    parser.add_argument("--n_runs", type=int, default=5)
-    parser.add_argument("--base_seed", type=int, default=0)
-    parser.add_argument("--split", type=str, default="random",
-                        choices=["random", "scaffold"])
-    parser.add_argument("--mode", type=str, default="regression",
-                        choices=["regression", "classification"])
-    args = parser.parse_args()
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument("--dataset", type=str, default="delaney",
+#                         choices=["qm7", "qm8", "delaney", "lipo", "tox21"])
+#     parser.add_argument("--n_runs", type=int, default=5)
+#     parser.add_argument("--base_seed", type=int, default=0)
+#     parser.add_argument("--split", type=str, default="random",
+#                         choices=["random", "scaffold"])
+#     parser.add_argument("--mode", type=str, default="regression",
+#                         choices=["regression", "classification"])
+#     args = parser.parse_args()
 
-    main_gp_all(dataset_name=args.dataset,
-                n_runs=args.n_runs,
-                split=args.split,
-                base_seed=args.base_seed,
-                mode = args.mode,
-                use_weights = (args.mode == "classification"))
+#     main_gp_all(dataset_name=args.dataset,
+#                 n_runs=args.n_runs,
+#                 split=args.split,
+#                 base_seed=args.base_seed,
+#                 mode = args.mode,
+#                 use_weights = (args.mode == "classification"))
 
-    main_nn(dataset_name=args.dataset,
-            n_runs=args.n_runs,
-            split=args.split,
-            base_seed=args.base_seed,
-            mode = args.mode,
-            use_weights = (args.mode == "classification"))
+#     main_nn(dataset_name=args.dataset,
+#             n_runs=args.n_runs,
+#             split=args.split,
+#             base_seed=args.base_seed,
+#             mode = args.mode,
+#             use_weights = (args.mode == "classification"))
