@@ -14,8 +14,11 @@ from gp_single import GPyTorchRegressor, SVGPModel, FeatureNet, \
 from gp_trainer import GPTrainer, EnsembleGPTrainer, GPClassificationTrainer
 from data_utils import calculate_cutoff_error_data
 import numpy as np
+import pandas as pd
 import csv
 import random
+import os
+import collections
 
 
 def set_global_seed(seed: int):
@@ -47,6 +50,7 @@ def save_summary_to_csv(all_results, n_runs, out_path: str):
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
 
 def load_dataset(
     dataset_name: str = "delaney", 
@@ -125,6 +129,7 @@ def load_dataset(
     print(f"Train Y Shape: {train_dc.y.shape}")
 
     return tasks, train_dc, valid_dc, test_dc, transformers
+
 
 def _to_torch_xy(dc_dataset):
     X_t = torch.from_numpy(dc_dataset.X).float()
@@ -679,8 +684,8 @@ def main_gp(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regr
     if use_weights and train_dc.w is not None:
         print("--> Using per-point precision weights via FixedNoiseGaussianLikelihood")
         w_np = train_dc.w
-        if w_np.ndim == 2:
-            w_np = w_np[:, 0]
+        if w_np.ndim == 2 and w_np.shape[1] == 1 and y_np.ndim == 1:
+             w_np = w_np[:, 0]
         train_w_torch = torch.from_numpy(w_np).float()
 
     if mode == "regression":
@@ -698,7 +703,7 @@ def main_gp(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regr
             model=gp_model,
             train_dataset=train_dc,
             lr=0.05,
-            num_iters=200,
+            num_iters=20,
             device="cpu",
             log_interval=40,
         )
@@ -707,8 +712,9 @@ def main_gp(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regr
         # 4. Evaluate
         valid_mse = trainer.evaluate_mse(valid_dc, use_weights=use_weights)
         test_mse = trainer.evaluate_mse(test_dc, use_weights=use_weights)
-        print("[GP Single-task] Validation MSE:", valid_mse)
-        print("[GP Single-task] Test MSE:",      test_mse)
+        task_str = "Multitask" if (y_np.ndim > 1) else "Single-task"
+        print(f"[GP {task_str}] Validation MSE: {valid_mse}")
+        print(f"[GP {task_str}] Test MSE:       {test_mse}")
 
         # 5. Get uncertainty intervals on test set
         mean_test, lower_test, upper_test = trainer.predict_interval(test_dc, alpha=0.05, use_weights=use_weights)
@@ -731,8 +737,6 @@ def main_gp(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regr
         print("UQ:", uq_metrics)
     else:
         # 1. Instantiate Classifier
-        # Note: We do NOT pass train_w here. In classification, weights are used
-        # for evaluation metrics (AUC), not for fixing likelihood noise variance.
         gp_model = GPyTorchClassifier(
             train_x=X_train_torch,
             train_y=y_train_torch,
@@ -1136,7 +1140,8 @@ def run_once_nn(dataset_name: str,
                 run_id: int = 0,
                 split: str = "random",
                 mode: str = "regression",
-                use_weights: bool = False):
+                use_weights: bool = False,
+                task_indices: Optional[List[int]] = None): 
     """
     One full run on a given dataset & featurizer with a fixed seed.
     """
@@ -1144,7 +1149,8 @@ def run_once_nn(dataset_name: str,
 
     tasks, train_dc, valid_dc, test_dc, transformers = load_dataset(
         dataset_name=dataset_name,
-        split=split
+        split=split,
+        task_indices=task_indices
     )
 
     use_weights = False
@@ -1180,7 +1186,19 @@ def run_once_nn(dataset_name: str,
     combined_cutoff_df = pd.concat(all_cutoff_dfs, ignore_index=True)
 
     # Define a consistent filename
-    output_filename = f"./cdata_{mode}/figure/{split}_{dataset_name}_NN_cutoff_run_{run_id}.csv"
+    # 1. Generate a suffix for the filename based on task_indices
+    if task_indices is None:
+        task_suffix = ""
+    else:
+        # e.g., turns [0, 2] into "_tasks_0_2"
+        task_suffix = "_tasks_" + "_".join(map(str, task_indices))
+
+    # 2. Define the consistent filename with the suffix
+    output_filename = f"./cdata_{mode}/figure/{split}_{dataset_name}{task_suffix}_NN_cutoff_run_{run_id}.csv"
+
+    import os
+    # 3. Create the directory if it does not exist
+    os.makedirs(os.path.dirname(output_filename), exist_ok=True)
 
     # Store the final combined data
     combined_cutoff_df.to_csv(output_filename, index=False)
@@ -1200,42 +1218,98 @@ def main_nn(dataset_name: str = "delaney",
             split: str = "random",
             base_seed: int = 0,
             mode: str = "regression",
-            use_weights: bool = False):
+            use_weights: bool = False,
+            task_indices: Optional[List[int]] = None): 
 
-    all_results = {}
+    if task_indices is None:
+        global_task_suffix = ""
+    else:
+        global_task_suffix = "_tasks_" + "_".join(map(str, task_indices))
+
+    tasks_results_container = collections.defaultdict(dict)
 
     for run_idx in range(n_runs):
         seed = base_seed + run_idx
+        
+        # Run the model
         run_res = run_once_nn(dataset_name=dataset_name, seed=seed, run_id=run_idx,
-                              split=split, mode=mode, use_weights=use_weights)
+                            split=split, mode=mode, use_weights=use_weights, task_indices=task_indices)
+        
         for method, uq_dict in run_res.items():
-            all_results.setdefault(method, []).append(uq_dict)
+            # Check if output is multitask (array) or single task (scalar)
+            first_val = next(iter(uq_dict.values()))
+            is_multitask = isinstance(first_val, (list, np.ndarray)) and np.size(first_val) > 1
 
-    # Aggregate: per method, per metric → mean & std
-    print("\n===== Aggregated results over", n_runs, "runs =====")
-    for method, uq_list in all_results.items():
-        print(f"\n### Method: {method}")
-        if not uq_list:
-            print("  (no results)")
-            continue
+            if not is_multitask:
+                # Single Task logic (default to task_id 0)
+                tasks_results_container[0].setdefault(method, []).append(uq_dict)
+            else:
+                # Multi Task logic: Split into separate dicts per task
+                n_tasks_detected = len(first_val)
+                for t in range(n_tasks_detected):
+                    # Extract values for just this task
+                    task_dict = {k: v[t] for k, v in uq_dict.items() if v is not None}
+                    
+                    # Correctly map the index t to the real task ID
+                    # If indices=[0, 2]: t=0 -> ID=0, t=1 -> ID=2
+                    real_task_id = task_indices[t] if (task_indices is not None and len(task_indices) > t) else t
+                    
+                    tasks_results_container[real_task_id].setdefault(method, []).append(task_dict)
 
-        # assume all dicts have same keys
-        metric_names = uq_list[0].keys()
+    # 3. Save Results using the Combined Naming Convention
+    print(f"\n===== Aggregated results over {n_runs} runs =====")
 
-        for m in metric_names:
-            # collect values, ignoring None
-            vals = [d[m] for d in uq_list if d[m] is not None]
-            if not vals:
-                print(f"  {m}: no valid values")
-                continue
-            vals = np.asarray(vals, dtype=float)
-            mean = float(vals.mean())
-            std = float(vals.std(ddof=0))
-            print(f"  {m}: mean={mean:.5g}, std={std:.5g}")
+    output_dir = f"./cdata_{mode}"
+    os.makedirs(output_dir, exist_ok=True)
 
-    save_summary_to_csv(all_results, 
-                        n_runs, 
-                        "./cdata_{}/NN_{}_{}_c.csv".format(mode, split, dataset_name))
+    for task_id, method_results in sorted(tasks_results_container.items()):
+        
+        # --- COMBINED SUFFIX LOGIC ---
+        # Global context + Specific ID
+        # Example: "_tasks_0_2" + "_id_0"
+        final_suffix = f"{global_task_suffix}_id_{task_id}"
+        
+        # Construct filename
+        # Result: ./cdata_test/NN_random_chem_tasks_0_2_id_0_c.csv
+        csv_filename = f"{output_dir}/NN_{split}_{dataset_name}{final_suffix}_c.csv"
+
+        print(f"Saving Summary for TASK {task_id} to: {csv_filename}")
+        
+        # Call your ORIGINAL save function
+        save_summary_to_csv(method_results, n_runs, csv_filename)
+        
+    # for run_idx in range(n_runs):
+    #     seed = base_seed + run_idx
+    #     run_res = run_once_nn(dataset_name=dataset_name, seed=seed, run_id=run_idx,
+    #                           split=split, mode=mode, use_weights=use_weights, task_indices=task_indices)
+    #     for method, uq_dict in run_res.items():
+    #         all_results.setdefault(method, []).append(uq_dict)
+
+    # # Aggregate: per method, per metric → mean & std
+    # print("\n===== Aggregated results over", n_runs, "runs =====")
+    # for method, uq_list in all_results.items():
+    #     print(f"\n### Method: {method}")
+    #     if not uq_list:
+    #         print("  (no results)")
+    #         continue
+
+    #     # assume all dicts have same keys
+    #     metric_names = uq_list[0].keys()
+
+    #     for m in metric_names:
+    #         # collect values, ignoring None
+    #         vals = [d[m] for d in uq_list if d[m] is not None]
+    #         if not vals:
+    #             print(f"  {m}: no valid values")
+    #             continue
+    #         vals = np.asarray(vals, dtype=float)
+    #         mean = float(vals.mean())
+    #         std = float(vals.std(ddof=0))
+    #         print(f"  {m}: mean={mean:.5g}, std={std:.5g}")
+
+    # save_summary_to_csv(all_results, 
+    #                     n_runs, 
+    #                     "./cdata_{}/NN_{}_{}_c.csv".format(mode, split, dataset_name))
 
 
 def run_once_gp(dataset_name: str,
@@ -1243,18 +1317,19 @@ def run_once_gp(dataset_name: str,
                 run_id: int = 0,
                 split: str = "random",
                 mode: str = "regression",
-                use_weights: bool = False):
+                use_weights: bool = False,
+                task_indices: Optional[List[int]] = None):
     """
     One full run on a given dataset with a fixed seed,
     running both Exact GP and SVGP in a single shot.
-
-    Analogous to run_once_nn().
     """
     set_global_seed(seed)
 
+    # Updated to accept task_indices
     tasks, train_dc, valid_dc, test_dc, transformers = load_dataset(
         dataset_name=dataset_name,
-        split=split
+        split=split,
+        task_indices=task_indices
     )
 
     print(f"\n=== [GP] Run with seed={seed} on dataset={dataset_name}")
@@ -1270,6 +1345,7 @@ def run_once_gp(dataset_name: str,
                                                   use_weights=use_weights, mode=mode)
         gp_cut_off['Method'] = "gp_exact"
         all_cutoff_dfs.append(gp_cut_off)
+        
         results["gp_nngp"], nngp_cut_off = main_nngp_exact(train_dc, valid_dc, test_dc, run_id=run_id,
                                                            use_weights=use_weights, mode=mode)
         nngp_cut_off['Method'] = "gp_nngp"
@@ -1303,14 +1379,22 @@ def run_once_gp(dataset_name: str,
         results["nnsvgp_ensemble_{}".format(cur["name"])] = cur["uq_metrics"]
         cut_offs[idx]['Method'] = "nnsvgp_ensemble_{}".format(cur["name"])
         all_cutoff_dfs.append(cut_offs[idx])
-    
-    import pandas as pd
 
     # Concatenate all DataFrames into a single one
     combined_cutoff_df = pd.concat(all_cutoff_dfs, ignore_index=True)
 
-    # Define a consistent filename
-    output_filename = f"./cdata_{mode}/figure/{split}_{dataset_name}_GP_cutoff_run_{run_id}.csv"
+    # --- Refined Filename Logic ---
+    # 1. Generate a suffix for the filename based on task_indices
+    if task_indices is None:
+        task_suffix = ""
+    else:
+        task_suffix = "_tasks_" + "_".join(map(str, task_indices))
+
+    # 2. Define the consistent filename with the suffix
+    output_filename = f"./cdata_{mode}/figure/{split}_{dataset_name}{task_suffix}_GP_cutoff_run_{run_id}.csv"
+
+    import os
+    os.makedirs(os.path.dirname(output_filename), exist_ok=True)
 
     # Store the final combined data
     combined_cutoff_df.to_csv(output_filename, index=False)
@@ -1330,50 +1414,85 @@ def main_gp_all(dataset_name: str = "delaney",
                 split: str = "random",
                 base_seed: int = 0,
                 mode: str = "regression",
-                use_weights: bool = False):
+                use_weights: bool = False,
+                task_indices: Optional[List[int]] = None):
     """
-    Multi-run driver for GP + SVGP, analogous to main_nn().
-
+    Multi-run driver for GP + SVGP.
     - Calls run_once_gp(...) n_runs times with different seeds.
-    - Aggregates per-method, per-metric mean/std.
-    - Saves a CSV via save_summary_to_csv.
+    - Aggregates per-method, per-metric mean/std PER TASK.
+    - Saves a CSV via save_summary_to_csv for each task.
     """
-    all_results = {}  # method_name -> list[metrics_dict]
+    
+    # Define global suffix for file naming based on the requested tasks
+    if task_indices is None:
+        global_task_suffix = ""
+    else:
+        global_task_suffix = "_tasks_" + "_".join(map(str, task_indices))
+
+    tasks_results_container = collections.defaultdict(dict)
 
     for run_idx in range(n_runs):
         seed = base_seed + run_idx
-        run_res = run_once_gp(dataset_name=dataset_name, seed=seed, run_id=run_idx, split=split, mode=mode, use_weights=use_weights)
+        # Pass task_indices to the run_once function
+        run_res = run_once_gp(dataset_name=dataset_name, seed=seed, run_id=run_idx, 
+                              split=split, mode=mode, use_weights=use_weights, task_indices=task_indices)
 
         for method, uq_dict in run_res.items():
-            all_results.setdefault(method, []).append(uq_dict)
+            # Check if output is multitask (array) or single task (scalar)
+            # We assume the first metric in the dict represents the shape of all metrics
+            first_val = next(iter(uq_dict.values()))
+            is_multitask = isinstance(first_val, (list, np.ndarray)) and np.size(first_val) > 1
 
-    # Aggregate: per method, per metric → mean & std
-    print("\n===== [GP] Aggregated results over", n_runs, "runs =====")
-    for method, uq_list in all_results.items():
-        print(f"\n### Method: {method}")
-        if not uq_list:
-            print("  (no results)")
-            continue
+            if not is_multitask:
+                # Single Task logic (default to task_id 0)
+                tasks_results_container[0].setdefault(method, []).append(uq_dict)
+            else:
+                # Multi Task logic: Split into separate dicts per task
+                n_tasks_detected = len(first_val)
+                for t in range(n_tasks_detected):
+                    # Extract values for just this task
+                    task_dict = {k: v[t] for k, v in uq_dict.items() if v is not None}
+                    
+                    # Correctly map the index t to the real task ID
+                    # If indices=[0, 2]: t=0 -> ID=0, t=1 -> ID=2
+                    real_task_id = task_indices[t] if (task_indices is not None and len(task_indices) > t) else t
+                    
+                    tasks_results_container[real_task_id].setdefault(method, []).append(task_dict)
 
-        metric_names = uq_list[0].keys()
+    # 3. Save Results using the Combined Naming Convention
+    print(f"\n===== [GP] Aggregated results over {n_runs} runs =====")
 
-        for m in metric_names:
-            vals = [d[m] for d in uq_list if d[m] is not None]
-            if not vals:
-                print(f"  {m}: no valid values")
-                continue
-            vals = np.asarray(vals, dtype=float)
-            mean = float(vals.mean())
-            std = float(vals.std(ddof=0))
-            print(f"  {m}: mean={mean:.5g}, std={std:.5g}")
+    output_dir = f"./cdata_{mode}"
+    os.makedirs(output_dir, exist_ok=True)
 
-    # Reuse the same helper as NN, different filename prefix
-    save_summary_to_csv(
-        all_results,
-        n_runs,
-        "./cdata_{}/GP_{}_{}_c.csv".format(mode, split, dataset_name),
-    )
+    for task_id, method_results in sorted(tasks_results_container.items()):
+        
+        # --- COMBINED SUFFIX LOGIC ---
+        # Global context + Specific ID
+        # Example: "_tasks_0_2" + "_id_0"
+        final_suffix = f"{global_task_suffix}_id_{task_id}"
+        
+        # Construct filename
+        # Result: ./cdata_regression/GP_random_delaney_tasks_0_2_id_0_c.csv
+        csv_filename = f"{output_dir}/GP_{split}_{dataset_name}{final_suffix}_c.csv"
 
+        print(f"Saving Summary for TASK {task_id} to: {csv_filename}")
+        
+        # Print aggregation to console for verification (optional, mirroring original behavior)
+        print(f"\n--- Task {task_id} Summary ---")
+        for method, uq_list in method_results.items():
+            if not uq_list: continue
+            metric_names = uq_list[0].keys()
+            for m in metric_names:
+                vals = [d[m] for d in uq_list if d[m] is not None]
+                if not vals: continue
+                vals = np.asarray(vals, dtype=float)
+                mean = float(vals.mean())
+                std = float(vals.std(ddof=0))
+                # print(f"  {method} - {m}: mean={mean:.5g}, std={std:.5g}")
+
+        # Call save function
+        save_summary_to_csv(method_results, n_runs, csv_filename)
 
 if __name__ == "__main__":
     # main_svgp_ensemble_all()
@@ -1385,15 +1504,19 @@ if __name__ == "__main__":
         # dataset_name="tox21",
         dataset_name="qm8",
         split="random",
-        task_indices=[0,1,2]
+        task_indices=[0,1]
     )
+
+    res1, res2 = main_gp(valid_dc, valid_dc, test_dc, run_id=0, use_weights=True)
+    print(res1)
+    print(res2)
 
     # train_nn_baseline(train_dc, valid_dc, test_dc,
     #                   run_id=0, use_weights=False)
     # train_nn_baseline(train_dc, valid_dc, test_dc,
     #                   run_id=0, use_weights=True, mode="classification")
-    train_nn_mc_dropout(train_dc, valid_dc, test_dc,
-                      run_id=0, use_weights=False)
+    # train_nn_mc_dropout(train_dc, valid_dc, test_dc,
+    #                   run_id=0, use_weights=False)
     # train_nn_mc_dropout(train_dc, valid_dc, test_dc,
     #                   run_id=0, use_weights=True, mode="classification")
     # train_evd_baseline(train_dc, valid_dc, test_dc,
@@ -1410,7 +1533,7 @@ if __name__ == "__main__":
     # main_svgp_ensemble_all(train_dc=train_dc, valid_dc=valid_dc, test_dc=test_dc,
     #                 run_id=0, use_weights=True, mode="classification")
 
-# #
+
 # if __name__ == "__main__":
 #     import argparse
 
@@ -1423,18 +1546,21 @@ if __name__ == "__main__":
 #                         choices=["random", "scaffold"])
 #     parser.add_argument("--mode", type=str, default="regression",
 #                         choices=["regression", "classification"])
+#     parser.add_argument("--tasks", type=int, nargs='+', default=None,
+#                     help="List of task indices to use (e.g., --tasks 0 2)")
 #     args = parser.parse_args()
 
-#     main_gp_all(dataset_name=args.dataset,
-#                 n_runs=args.n_runs,
-#                 split=args.split,
-#                 base_seed=args.base_seed,
-#                 mode = args.mode,
-#                 use_weights = (args.mode == "classification"))
+#     # main_gp_all(dataset_name=args.dataset,
+#     #             n_runs=args.n_runs,
+#     #             split=args.split,
+#     #             base_seed=args.base_seed,
+#     #             mode = args.mode,
+#     #             use_weights = (args.mode == "classification"))
 
 #     main_nn(dataset_name=args.dataset,
 #             n_runs=args.n_runs,
 #             split=args.split,
 #             base_seed=args.base_seed,
 #             mode = args.mode,
-#             use_weights = (args.mode == "classification"))
+#             use_weights = (args.mode == "classification"),
+#             task_indices=args.tasks)

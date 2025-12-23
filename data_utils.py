@@ -575,7 +575,7 @@ def evaluate_uq_metrics_from_interval(
     # --- 4. Final Formatting (Scalar vs List) ---
     
     # Store test_error directly (it should already be correct format from previous function)
-    final_dict = {"alpha": alpha, "MSE": test_error}
+    final_dict = {"MSE": test_error}
 
     if n_tasks == 1:
         # SINGLE TASK: Extract the single value from the lists
@@ -633,9 +633,17 @@ def evaluate_uq_metrics_classification(
         u_t = uncertainty[:, t] if uncertainty is not None else None
 
         # --- Metric A: NLL ---
-        epsilon = 1e-8
+
+        # 2. Define Safe Epsilon
+        epsilon = 1e-7 
+
+        # [ASSERTION A] Check Machine Precision (Prevent Divide by Zero)
+        # Ensures 1.0 - epsilon is actually different from 1.0
+        assert np.float32(1.0) - np.float32(epsilon) < 1.0, f"CRASH: Epsilon {epsilon} is too small for float32 precision!"
         p_safe = np.clip(p_t, epsilon, 1 - epsilon)
         nll_per_point = -(y_t * np.log(p_safe) + (1 - y_t) * np.log(1 - p_safe))
+        # [ASSERTION B] Check for NaNs (Prevent Invalid Value propagation)
+        assert not np.isnan(nll_per_point).any(), f"CRASH: Found {np.sum(np.isnan(nll_per_point))} NaNs in NLL calculation!"
         nll = np.average(nll_per_point, weights=w_t)
         results["NLL"].append(nll)
 

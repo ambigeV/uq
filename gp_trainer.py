@@ -401,22 +401,33 @@ class GPTrainer:
                 # Clamp and convert to Noise Variance
                 w_torch = torch.clamp(w_torch, min=1e-5)
 
-                preds = self.model(X, w=w_torch).squeeze(-1)  # (N,)
+                preds = self.model(X, w=w_torch)
             else:
-                preds = self.model(X).squeeze(-1)
+                preds = self.model(X)
 
+            if self.model.num_tasks == 1:
+                preds = preds.squeeze(-1)
             mean_preds = preds.cpu().numpy()
 
         squared_errors = (y_true - mean_preds) ** 2
 
         if use_weights and dataset.w is not None:
-            # Weighted MSE
-            weights = dataset.w.flatten()
-            mse = np.average(squared_errors, weights=weights)
+            # dataset.w is (N, K) or (N, 1) or (N,)
+            # squared_errors is (N, K) or (N,)
+            
+            # We flatten both to (N*K,) to perform a global weighted average.
+            # This handles both Single Task and Multitask consistently.
+            w_flat = dataset.w.flatten()
+            se_flat = squared_errors.flatten()
+
+            # Safety check: ensure total elements match before averaging
+            if w_flat.shape == se_flat.shape:
+                 mse = np.average(se_flat, weights=w_flat)
+            else:
+                 print(f"Warning: Weight shape {dataset.w.shape} mismatch with error shape {squared_errors.shape}. using non-weighted MSE.")
+                 mse = np.mean(squared_errors)
         else:
-            # Standard MSE
-            # print(squared_errors.__class__)
-            mse = np.mean(squared_errors.cpu().numpy())
+            mse = np.mean(squared_errors)
 
         return mse
 

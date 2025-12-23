@@ -6,70 +6,48 @@ import gpytorch
 
 class MultitaskExactGPModel(gpytorch.models.ExactGP):
     """
-    You will need to define a multitask kernel here, e.g.,
-    using gpytorch.kernels.MultitaskKernel or LMC.
-    This is just a placeholder skeleton.
+    Multitask GP (LCM) that normalizes X internally, supporting K tasks.
+    Matches the API of your single-task ExactGPModel.
     """
-    def __init__(self, train_x, train_y, likelihood):
+    def __init__(self, train_x, train_y, likelihood, num_tasks,
+                 x_mean: torch.Tensor, x_std: torch.Tensor, normalize_x: bool):
         super().__init__(train_x, train_y, likelihood)
-        input_dim = train_x.shape[-1]
-        num_tasks = train_y.shape[-1]
 
-        base_kernel = gpytorch.kernels.RBFKernel(ard_num_dims=input_dim)
+        self.normalize_x = normalize_x
+        self.num_tasks = num_tasks
+        
+        # Register normalization buffers (same as single-task)
+        self.register_buffer("x_mean", x_mean)
+        self.register_buffer("x_std", x_std)
+
+        input_dim = train_x.shape[-1]
+        
+        # 1. Multitask Mean: Wraps a ConstantMean (or others)
         self.mean_module = gpytorch.means.MultitaskMean(
-            gpytorch.means.ConstantMean(), num_tasks=num_tasks
+            gpytorch.means.ConstantMean(), 
+            num_tasks=num_tasks
+        )
+        
+        # 2. Multitask Kernel (LCM): Wraps your base kernel
+        # rank=1 is standard for LCM (Linear Model of Coregionalization)
+        base_kernel = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.RBFKernel(ard_num_dims=input_dim)
         )
         self.covar_module = gpytorch.kernels.MultitaskKernel(
-            base_kernel,
-            num_tasks=num_tasks,
-            rank=1,
+            base_kernel, num_tasks=num_tasks, rank=1
         )
 
+    def _norm_x(self, x: torch.Tensor) -> torch.Tensor:
+        if self.normalize_x:
+            return (x - self.x_mean) / self.x_std
+        return x
+
     def forward(self, x):
-        mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
+        x_n = self._norm_x(x)
+        
+        mean_x = self.mean_module(x_n)
+        covar_x = self.covar_module(x_n)
+        
+        # Crucial: Must return MultitaskMultivariateNormal for MLL to work
         return gpytorch.distributions.MultitaskMultivariateNormal(mean_x, covar_x)
 
-
-class GPyTorchMultitaskRegressor(nn.Module):
-    """
-    - forward(x) -> (N, T)
-    - predict_interval(x, alpha) -> (mean, lower, upper), each (N, T)
-    """
-    def __init__(self, train_x, train_y):
-        super().__init__()
-        self.register_buffer("train_x", train_x)
-        self.register_buffer("train_y", train_y)
-
-        self.num_tasks = train_y.shape[-1]
-        self.likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(
-            num_tasks=self.num_tasks
-        )
-        self.gp_model = MultitaskExactGPModel(self.train_x, self.train_y, self.likelihood)
-
-    def forward(self, x):
-        self.gp_model.eval()
-        self.likelihood.eval()
-        with torch.no_grad():
-            dist = self.likelihood(self.gp_model(x))
-            mean = dist.mean  # (N, T)
-            return mean
-
-    def predict_interval(self, x, alpha: float = 0.05):
-        self.gp_model.eval()
-        self.likelihood.eval()
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            dist = self.likelihood(self.gp_model(x))
-            mean = dist.mean
-            std = dist.stddev
-
-            if alpha == 0.05:
-                z = 1.96
-            else:
-                z = torch.distributions.Normal(0, 1).icdf(
-                    torch.tensor(1 - alpha / 2, device=x.device)
-                )
-
-            lower = mean - z * std
-            upper = mean + z * std
-            return mean, lower, upper

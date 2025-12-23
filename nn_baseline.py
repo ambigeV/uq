@@ -643,7 +643,7 @@ def mse_from_mean_prediction(mean, dataset, use_weights=False):
 class DeepEnsembleRegressor:
     """
     Wrapper over M independently trained DeepChem TorchModels.
-    Provides: predict() and predict_interval().
+    Compatible with both Single-Task and Multi-Task Regression.
     """
     def __init__(self, models):
         self.models = models
@@ -651,16 +651,34 @@ class DeepEnsembleRegressor:
     def predict(self, dataset):
         preds = []
         for m in self.models:
-            out = m.predict(dataset)[:, 0]    
+            # [FIX] Do NOT slice [:, 0]. Keep all tasks.
+            # Shape per model: (N_Samples, N_Tasks)
+            out = m.predict(dataset)
+            
+            # DeepChem sometimes returns (N_Samples,) for single-task.
+            # We enforce 2D shape (N_Samples, N_Tasks) to be safe.
+            if out.ndim == 1:
+                out = out.reshape(-1, 1)
+                
             preds.append(out)
+            
+        # Stack along new axis 0 (Models)
+        # Final Shape: (N_Models, N_Samples, N_Tasks)
         return np.stack(preds, axis=0)        
 
     def predict_interval(self, dataset, alpha=0.05):
+        # Y Shape: (N_Models, N_Samples, N_Tasks)
         Y = self.predict(dataset)             
+        
+        # Mean/Std over the 'Models' dimension (axis 0)
+        # Result Shape: (N_Samples, N_Tasks)
         mean = Y.mean(axis=0)
         std  = Y.std(axis=0) + 1e-8
 
+        # Z-score for confidence interval
         z = norm.ppf(1 - alpha/2)
+        
+        # Broadcasting handles the shapes automatically
         lower = mean - z * std
         upper = mean + z * std
 
@@ -668,71 +686,71 @@ class DeepEnsembleRegressor:
 
 
 class DeepEnsembleClassifier:
+    """
+    Ensemble wrapper for Multitask Binary Classification.
+    Assumes base models output RAW LOGITS of shape (N_Samples, N_Tasks).
+    """
     def __init__(self, models):
         self.models = models
 
     def predict_raw(self, dataset):
         """
-        Returns stacked raw predictions:
-          regression: raw preds (M, N, T)
-          classification: raw logits (M, N, T)
+        Returns stacked raw LOGITS from base models.
+        Shape: (M_Models, N_Samples, N_Tasks)
         """
         preds = []
         for m in self.models:
-            out = m.predict(dataset)  # (N, T)
+            # Assumes m.predict returns (N, T) logits directly
+            out = m.predict(dataset)
             preds.append(out)
-        return np.stack(preds, axis=0)  # (M, N, T)
+        return np.stack(preds, axis=0)
 
-    # -------- regression API (unchanged behavior) --------
-    def predict(self, dataset):
-        return self.predict_raw(dataset)
-
-    def predict_interval(self, dataset, alpha=0.05):
-        Y = self.predict_raw(dataset)           # (M, N, T)
-        mean = Y.mean(axis=0)                   # (N, T)
-        std  = Y.std(axis=0) + 1e-8             # (N, T)
-
-        z = norm.ppf(1 - alpha/2)
-        lower = mean - z * std
-        upper = mean + z * std
-        return mean, lower, upper
-
-    # -------- classification API --------
     def predict_proba(self, dataset):
         """
+        Applies Sigmoid to logits to get Probabilities.
         Returns:
-          p_mean: (N, T) mean probability over ensemble
-          p_members: (M, N, T) member probabilities
+          p_mean:    (N, T) -> Mean probability (Ensemble Prediction)
+          p_members: (M, N, T) -> Probabilities per model
         """
-        logits = self.predict_raw(dataset)            # (M, N, T)
+        logits = self.predict_raw(dataset) # (M, N, T)
+        
+        # Stability clipping to prevent overflow in exp
         logits = np.clip(logits, -50, 50)
+        
+        # Apply Sigmoid (Logic is correct: Logits -> Probs)
         p_members = 1.0 / (1.0 + np.exp(-logits))
-
-        # p_members = 1.0 / (1.0 + np.exp(-logits))     # sigmoid
-        # p_members = F.sigmoid(logits)
-        p_mean = p_members.mean(axis=0)               # (N, T)
+        
+        # Average the PROBABILITIES, not the logits
+        p_mean = p_members.mean(axis=0) # (N, T)
         return p_mean, p_members
 
-    def predict_uncertainty(self, dataset, eps=1e-10, return_mi=True):
+    def predict_uncertainty(self, dataset, eps=1e-10):
         """
-        Uncertainty for binary probs (per task):
-          total entropy: H[p_mean]
-          expected entropy: mean_m H[p_m]
-          MI: H[p_mean] - mean_m H[p_m]   (epistemic-ish)
-        Returns arrays with shape (N, T).
+        Decomposes uncertainty for Multitask Binary Classification.
+        All outputs preserve shape (N_Samples, N_Tasks).
         """
-        p_mean, p_members = self.predict_proba(dataset)   # (N,T), (M,N,T)
+        p_mean, p_members = self.predict_proba(dataset) # (N, T), (M, N, T)
 
-        # entropy for Bernoulli
-        H_mean = -(p_mean * np.log(p_mean + eps) + (1 - p_mean) * np.log(1 - p_mean + eps))  # (N,T)
-        H_each = -(p_members * np.log(p_members + eps) + (1 - p_members) * np.log(1 - p_members + eps))  # (M,N,T)
-        H_exp = H_each.mean(axis=0)  # (N,T)
+        # 1. Total Uncertainty (Entropy of the Mean Probability)
+        # H[p_mean]
+        # Shape: (N, T)
+        H_total = -(p_mean * np.log(p_mean + eps) + (1 - p_mean) * np.log(1 - p_mean + eps))
 
-        if not return_mi:
-            return p_mean, H_mean
+        # 2. Aleatoric Uncertainty (Average Entropy of Members)
+        # E[H(p_member)]
+        # Shape: (M, N, T) -> mean -> (N, T)
+        H_member = -(p_members * np.log(p_members + eps) + (1 - p_members) * np.log(1 - p_members + eps))
+        H_aleatoric = H_member.mean(axis=0)
 
-        MI = H_mean - H_exp
-        return p_mean, H_mean, H_exp, MI
+        # 3. Epistemic Uncertainty (Mutual Information)
+        # MI = Total - Aleatoric
+        # Shape: (N, T)
+        MI = H_total - H_aleatoric
+        
+        # Clip small negative values due to float precision
+        MI = np.maximum(MI, 0.0)
+
+        return p_mean, H_total, H_aleatoric, MI
 
 # ------------------------------
 # Deep Ensemble
@@ -798,22 +816,25 @@ def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0, use_weigh
         print("UQ (Deep Ensemble):", uq_metrics)
     else:
         ensemble = DeepEnsembleClassifier(models)
-        p_mean, H_total, H_exp, MI = ensemble.predict_uncertainty(test_dc, return_mi=True)
+        mean_probs, H_total, H_exp, MI = ensemble.predict_uncertainty(test_dc)
 
-        # If you only have ONE task, keep your existing downstream functions unchanged.
-        assert n_tasks == 1
-        probs_positive = p_mean[:, 0]  # (N,)
-        y_true = np.asarray(test_dc.y).reshape(-1)
+        # Binary AUC path (keeps your previous behavior)
+        n_tasks = test_dc.y.shape[1]
+        if n_tasks == 1 and mean_probs.shape[1] == 2:
+            probs_positive = mean_probs[:, 1].reshape(-1, 1) # Force (N, 1)
+            entropy = entropy.reshape(-1, 1)
+        else:
+            probs_positive = mean_probs # Already (N, T)
 
         if use_weights and test_dc.w is not None:
             weights = np.asarray(test_dc.w).reshape(-1)
         else:
             weights = None
 
-        test_auc = roc_auc_score(y_true, probs_positive, sample_weight=weights)
+        test_auc = auc_from_probs(test_dc.y, probs_positive, test_dc.w, use_weights=use_weights)
 
         # choose uncertainty score: total entropy (or MI)
-        uncertainty = H_total[:, 0]  # or MI[:, 0]
+        uncertainty = H_total
 
         uq_metrics = evaluate_uq_metrics_classification(
             y_true=test_dc.y,
@@ -832,7 +853,7 @@ def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0, use_weigh
             use_weights=use_weights
         )
 
-        print(f"[Deep Ensemble Class] Test AUC: {test_auc:.6f}")
+        print(f"[Deep Ensemble Class] Test AUC: {test_auc}")
         print(f"[Deep Ensemble Class] UQ Metrics: {uq_metrics}")
 
     return uq_metrics, cutoff_error_df
@@ -1325,7 +1346,7 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
             use_weights=use_weights
         )
 
-        print(f"\n[EVIDENTIAL REGRESSION] Test MSE: {test_mse:.6f}")
+        print(f"\n[EVIDENTIAL REGRESSION] Test MSE: {test_mse}")
         print(f"[EVIDENTIAL REGRESSION] UQ Metrics: {uq_metrics}")
 
         return uq_metrics, cutoff_error_df
@@ -1395,7 +1416,7 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
             n_bins=20
         )
 
-        print(f"\n[EVIDENTIAL CLASSIFIACTION] Test MSE: {test_auc:.6f}")
+        print(f"\n[EVIDENTIAL CLASSIFIACTION] Test MSE: {test_auc}")
         print(f"[EVIDENTIAL CLASSIFIACTION] UQ Metrics: {uq_metrics}")
 
         return uq_metrics, cutoff_error_df

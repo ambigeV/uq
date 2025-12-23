@@ -1,4 +1,5 @@
 # gp_single.py
+from gp_multi import MultitaskExactGPModel
 import torch
 import torch.nn as nn
 import gpytorch
@@ -483,6 +484,11 @@ class GPyTorchRegressor(nn.Module):
         self.register_buffer("train_x_raw", train_x)
         self.register_buffer("train_y_raw", train_y)
 
+        # multi-task head
+        self.num_tasks = 1
+        if train_y.ndim == 2 and train_y.shape[1] > 1:
+            self.num_tasks = train_y.shape[1]
+
         # Decide X normalization
         if normalize_x == "auto":
             # If all features are in {0,1}, assume ECFP -> skip norm
@@ -505,18 +511,22 @@ class GPyTorchRegressor(nn.Module):
         self.register_buffer("x_mean", x_mean)
         self.register_buffer("x_std", x_std)
 
-        train_y_1d = train_y.squeeze(-1) if train_y.ndim == 2 else train_y
-        y_mean = train_y_1d.mean()
-        y_std = train_y_1d.std() + eps
+        # 2. Setup Y stats (Handles K tasks)
+        if self.num_tasks > 1:
+            # Multitask: Statistics are (1, K)
+            y_mean = train_y.mean(dim=0, keepdim=True)
+            y_std = train_y.std(dim=0, keepdim=True) + eps
+            train_y_norm = (train_y - y_mean) / y_std
+        else:
+            # Single-task: Flatten to (N,)
+            train_y_1d = train_y.squeeze(-1) if train_y.ndim == 2 else train_y
+            y_mean = train_y_1d.mean()
+            y_std = train_y_1d.std() + eps
+            train_y_norm = (train_y_1d - y_mean) / y_std
+
         self.register_buffer("y_mean", y_mean)
         self.register_buffer("y_std", y_std)
-
-        # Normalized targets for training / MLL
-        train_y_norm = (train_y_1d - self.y_mean) / self.y_std
         self.register_buffer("train_y_norm", train_y_norm)
-        train_x_norm = (train_x - self.x_mean) / self.x_std if self.normalize_x else train_x
-        self.register_buffer("train_x_norm", train_x_norm)
-
         self.register_buffer("train_w", train_w)
 
         # keep these hyperparams for weight->noise
@@ -528,21 +538,31 @@ class GPyTorchRegressor(nn.Module):
         self.ratio_clip = ratio_clip
 
         fixed_noise_norm = None
-        if self.use_weights and (train_w is not None):
-            fixed_noise_norm = self._w_to_noise_norm(train_w)
-
+        # 3. Instantiate Likelihood & Model
         if likelihood is None:
-            if fixed_noise_norm is not None:
-                likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(
-                    noise=fixed_noise_norm,
-                    learn_additional_noise=True,  # <-- key: adds global sigma_add^2
-                )
+            if self.num_tasks > 1:
+                # Multitask Likelihood (Learns a noise rank, usually diagonal + low rank)
+                likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=self.num_tasks)
             else:
-                likelihood = gpytorch.likelihoods.GaussianLikelihood()
+                # Single-task Likelihood
+                if self.use_weights and (train_w is not None):
+                    fixed_noise_norm = self._w_to_noise_norm(train_w)
+                
+                if fixed_noise_norm is not None:
+                    likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(
+                        noise=fixed_noise_norm, learn_additional_noise=True
+                    )
+                else:
+                    likelihood = gpytorch.likelihoods.GaussianLikelihood()
         self.likelihood = likelihood
 
+        # Select Model Class
         if gp_model_cls is None:
-            gp_model_cls = ExactGPModel  # your current homoscedastic model
+            if self.num_tasks > 1:
+                gp_model_cls = MultitaskExactGPModel  # <--- Selects Multitask Model
+                gp_model_kwargs["num_tasks"] = self.num_tasks
+            else:
+                gp_model_cls = ExactGPModel
 
         self.gp_model = gp_model_cls(
             train_x=train_x,
@@ -581,11 +601,8 @@ class GPyTorchRegressor(nn.Module):
         test_noise = None
         is_fixed_noise = isinstance(self.likelihood, gpytorch.likelihoods.FixedNoiseGaussianLikelihood)
 
-        if self.use_weights and is_fixed_noise:
-            if w is not None:
-                test_noise = self._w_to_noise_norm(w)
-            else:
-                print("Warning GP Forward: use_weights=True but dataset.w is None. Ignoring weights.")
+        if self.use_weights and is_fixed_noise and self.num_tasks == 1 and w is not None:
+            test_noise = self._w_to_noise_norm(w)
 
         with torch.no_grad():
             # gp_model.forward() will normalize x internally
@@ -598,7 +615,9 @@ class GPyTorchRegressor(nn.Module):
 
             mean_n = dist.mean
             mean = mean_n * self.y_std + self.y_mean
-            return mean.unsqueeze(-1)
+            if self.num_tasks == 1:
+                return mean.unsqueeze(-1)
+            return mean
 
     def predict_interval(self, x, alpha: float = 0.05, w=None):
         """Return (mean, lower, upper) in ORIGINAL y units, each (N,)."""
@@ -606,7 +625,7 @@ class GPyTorchRegressor(nn.Module):
         self.likelihood.eval()
         is_fixed_noise = isinstance(self.likelihood, gpytorch.likelihoods.FixedNoiseGaussianLikelihood)
         test_noise_norm = None
-        if self.use_weights and is_fixed_noise and (w is not None):
+        if self.use_weights and is_fixed_noise and (w is not None) and self.num_tasks == 1:
             test_noise_norm = self._w_to_noise_norm(w)
 
         with torch.no_grad(), gpytorch.settings.fast_pred_var():
