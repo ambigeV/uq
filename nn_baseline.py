@@ -1421,8 +1421,6 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
 
         return uq_metrics, cutoff_error_df
     
-        
-
 
 def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regression"):
     n_tasks = train_dc.y.shape[1]
@@ -1509,8 +1507,6 @@ def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, 
         test_results = dc_model.evaluate(test_dc, [metric], use_sample_weights=use_weights, per_task_metrics=True)
 
         # 4. Unpack the tuples safely
-        # *_agg:      Dict with scalar weighted average (mean across tasks)
-        # *_detailed: Dict with detailed scores (List if multitask, float if singletask)
         valid_agg, valid_detailed = valid_results
         test_agg,  test_detailed  = test_results
 

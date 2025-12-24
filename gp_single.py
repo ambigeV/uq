@@ -1,5 +1,5 @@
 # gp_single.py
-from gp_multi import MultitaskExactGPModel
+from gp_multi import MultitaskExactGPModel, MultitaskBernoulliLikelihood
 import torch
 import torch.nn as nn
 import gpytorch
@@ -384,6 +384,134 @@ class SVGPClassificationModel(gpytorch.models.ApproximateGP):
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
 
+class MultitaskSVGPClassificationModel(gpytorch.models.ApproximateGP):
+    """
+    Multitask SVGP using LMC.
+    STRICTLY enforces batch shapes to ensure (N, K) output.
+    """
+    def __init__(self, 
+                 train_x, 
+                 train_y, 
+                 likelihood, 
+                 num_tasks, 
+                 x_mean, 
+                 x_std, 
+                 normalize_x,
+                 num_inducing: int = 512, 
+                 kmeans_iters: int = 15,
+                 num_latents: int = 10, 
+                 kernel: str = "matern52"):
+        
+        self.normalize_x = normalize_x
+
+        # 1. Normalize train_x locally just for initialization
+        if self.normalize_x:
+            X_n = (train_x - x_mean) / x_std
+        else:
+            X_n = train_x
+
+        # 2. Inducing Points (Shared across latents)
+        if X_n.shape[0] <= num_inducing:
+            inducing_points = X_n.clone()
+        else:
+            inducing_points = self._kmeans_medoid_init(X_n, k=num_inducing, num_iters=kmeans_iters)
+
+        # 3. LMC Setup
+        if num_latents is None:
+            num_latents = num_tasks
+            
+        print(f"--> Building LMC Model: {num_tasks} Tasks, {num_latents} Latents")
+
+        # Variational Dist: Batch size = num_latents (Critical!)
+        variational_distribution = gpytorch.variational.CholeskyVariationalDistribution(
+            num_inducing_points=inducing_points.shape[0], 
+            batch_shape=torch.Size([num_latents]) 
+        )
+
+        # Base Strategy: Handles q(u) for Q latents
+        variational_strategy = gpytorch.variational.VariationalStrategy(
+            self, 
+            inducing_points, 
+            variational_distribution, 
+            learn_inducing_locations=True
+        )
+
+        # LMC Strategy: Mixes (Q, N) -> (N, K)
+        # latent_dim=0 because our base output is (Batch=Q, N)
+        lmc_strategy = gpytorch.variational.LMCVariationalStrategy(
+            variational_strategy, 
+            num_tasks=num_tasks, 
+            num_latents=num_latents, 
+            latent_dim=-1
+        )
+
+        super().__init__(lmc_strategy)
+
+        # Store stats
+        self.register_buffer("x_mean", x_mean)
+        self.register_buffer("x_std", x_std)
+
+        # 4. Mean & Kernel (MUST HAVE BATCH_SHAPE)
+        # This ensures forward() returns (Q, N), not (N,)
+        self.mean_module = gpytorch.means.ConstantMean(
+            batch_shape=torch.Size([num_latents])
+        )
+        
+        input_dim = train_x.shape[-1]
+        kernel = kernel.lower()
+        if kernel == "rbf":
+            base_k = gpytorch.kernels.RBFKernel(
+                ard_num_dims=input_dim, 
+                batch_shape=torch.Size([num_latents])
+            )
+        elif kernel == "matern32":
+            base_k = gpytorch.kernels.MaternKernel(
+                nu=1.5, ard_num_dims=input_dim, 
+                batch_shape=torch.Size([num_latents])
+            )
+        elif kernel == "matern52":
+            base_k = gpytorch.kernels.MaternKernel(
+                nu=2.5, ard_num_dims=input_dim, 
+                batch_shape=torch.Size([num_latents])
+            )
+        else:
+            raise ValueError(f"Unknown kernel '{kernel}'.")
+
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            base_k, 
+            batch_shape=torch.Size([num_latents])
+        )
+
+    @staticmethod
+    def _kmeans_medoid_init(X: torch.Tensor, k: int, num_iters: int = 15) -> torch.Tensor:
+        # (Same as before)
+        N, D = X.shape
+        device = X.device
+        perm = torch.randperm(N, device=device)
+        centers = X[perm[:k]].clone()
+        for _ in range(num_iters):
+            dist2 = torch.cdist(X, centers, p=2.0) ** 2
+            labels = dist2.argmin(dim=1)
+            for j in range(k):
+                mask = (labels == j)
+                if mask.any(): centers[j] = X[mask].mean(dim=0)
+        dist2_ck = torch.cdist(centers, X, p=2.0) ** 2
+        nearest_idx = dist2_ck.argmin(dim=1)
+        return X[nearest_idx]
+
+    def _norm_x(self, x: torch.Tensor) -> torch.Tensor:
+        if self.normalize_x:
+            return (x - self.x_mean) / self.x_std
+        return x
+
+    def forward(self, x):
+        x_n = self._norm_x(x)
+        # Returns (Q, N) because mean/covar modules have batch_shape=Q
+        mean_x = self.mean_module(x_n)
+        covar_x = self.covar_module(x_n)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+
 class GPyTorchClassifier(nn.Module):
     """
     Wrapper for Binary Classification.
@@ -405,6 +533,11 @@ class GPyTorchClassifier(nn.Module):
         self.register_buffer("train_x_raw", train_x)
         self.register_buffer("train_y_raw", train_y)
 
+        # multi-task head
+        self.num_tasks = 1
+        if train_y.ndim == 2 and train_y.shape[1] > 1:
+            self.num_tasks = train_y.shape[1]
+
         # Decide X normalization
         if normalize_x == "auto":
             # Assume ECFP (binary) -> skip norm
@@ -424,10 +557,25 @@ class GPyTorchClassifier(nn.Module):
 
         # Don't register buffers here for mean/std, they are passed to the inner GP
 
-        # Setup Likelihood (Bernoulli)
         if likelihood is None:
-            likelihood = gpytorch.likelihoods.BernoulliLikelihood()
+            if self.num_tasks > 1:
+                # Multitask: Use Custom Probit Likelihood (defined previously)
+                likelihood = MultitaskBernoulliLikelihood()
+            else:
+                # Single-task: Standard Bernoulli
+                likelihood = gpytorch.likelihoods.BernoulliLikelihood()
         self.likelihood = likelihood
+
+        if gp_model_cls is None:
+            if self.num_tasks > 1:
+                # Multitask: Use LMC Model (defined previously)
+                print("Using multitasking...")
+                gp_model_cls = MultitaskSVGPClassificationModel
+                gp_model_kwargs["num_tasks"] = self.num_tasks
+            else:
+                # Single-task: Use Standard SVGP Model
+                print("Using SingleTasking...")
+                gp_model_cls = SVGPClassificationModel
 
         # Initialize Inner GP (It will store x_mean/x_std and use them in forward)
         self.gp_model = gp_model_cls(
@@ -439,7 +587,7 @@ class GPyTorchClassifier(nn.Module):
             normalize_x=self.normalize_x,
             **gp_model_kwargs
         )
-
+    
     def forward(self, x):
         """
         Returns Probabilities P(y=1|x), shape (N, 1).
@@ -450,7 +598,12 @@ class GPyTorchClassifier(nn.Module):
         pred_dist = self.likelihood(latent_dist)
         probs = pred_dist.mean  # Bernoulli mean is P(y=1)
 
-        return probs.unsqueeze(-1)
+        # 4. Shape consistency:
+        # If Single Task, ensure (N, 1) to match (N, 1) labels
+        # If Multitask, return (N, K) directly
+        if self.num_tasks == 1:
+            return probs.unsqueeze(-1)
+        return probs
 
 
 class GPyTorchRegressor(nn.Module):
@@ -563,6 +716,7 @@ class GPyTorchRegressor(nn.Module):
                 gp_model_kwargs["num_tasks"] = self.num_tasks
             else:
                 gp_model_cls = ExactGPModel
+
 
         self.gp_model = gp_model_cls(
             train_x=train_x,

@@ -11,38 +11,94 @@ from sklearn.metrics import roc_auc_score, roc_curve, accuracy_score
 
 class WeightedVariationalELBO(gpytorch.mlls.VariationalELBO):
     def forward(self, variational_dist_f, target, weights=None, **kwargs):
-        # 1. Determine Batch Size (B)
-        num_batch = variational_dist_f.event_shape[0]
+        # 1. Determine Batch Size
+        num_batch = target.size(0)
 
-        # 2. Compute Weighted Likelihood Sum
-        #    We perform the sum manually here to inject weights
-        #    Output of expected_log_prob is usually (num_samples, batch_size) or (batch_size,)
+        # 2. Compute Likelihood
+        #    Shape could be [S, B] (Single Task) or [S, B, T] (Multitask)
         log_prob = self.likelihood.expected_log_prob(target, variational_dist_f, **kwargs)
 
-        #    Handle shape mismatch if using MC sampling
+        # 3. Apply Weights
         if weights is not None:
-            if weights.shape != log_prob.shape:
-                # If log_prob has MC dim (S, B) and weights is (B,), broadcast weights
-                if log_prob.ndim > weights.ndim:
-                    weights = weights.expand_as(log_prob)
+            if weights.device != log_prob.device:
+                weights = weights.to(log_prob.device)
+            
+            # --- CRITICAL FIX FOR MULTITASK ---
+            # Check if log_prob has a trailing 'Task' dimension that weights lacks.
+            # broadcasting aligns right-to-left. 
+            # If log_prob is [..., 783, 2] and weights is [783], we need weights to be [783, 1].
+            if log_prob.ndim > weights.ndim and log_prob.shape[-1] != weights.shape[-1]:
+                weights = weights.unsqueeze(-1)
+            
+            # Handle MC Sample dimension (broadcast weights from [B, 1] to [S, B, 1])
+            if log_prob.ndim > weights.ndim:
+                 weights = weights.expand_as(log_prob)
 
-            # Apply Weights (Element-wise multiplication)
+            # Element-wise multiplication
             log_prob = log_prob * weights
 
-        #    Sum over the batch (and samples if present) to get a scalar Sum
-        #    Note: .sum(-1) sums over the batch dimension in GPyTorch logic here
-        log_likelihood_sum = log_prob.sum(-1)
+        # 4. Reduce
+        #    Sum over Batch (-1 if Single Task, -2 if Multitask?)
+        #    Actually, simply summing over ALL non-batch dimensions is safer, 
+        #    then averaging over MC samples.
+        
+        #    GPyTorch standard: Sum over data indices, then average over MC samples.
+        #    If Multitask [S, B, T]: Sum over T, Sum over B -> [S]
+        
+        # Sum over the trailing dimensions (Task and/or Batch) until we hit MC dim
+        # If log_prob is [S, B, T], we want to sum over T and B.
+        # If log_prob is [S, B], we want to sum over B.
+        
+        dims_to_sum = list(range(1, log_prob.ndim)) if log_prob.ndim > 1 else [0]
+        # However, to be safe and strictly follow ELBO logic:
+        # Sum over all dimensions except the first (MC samples), then mean over first.
+        
+        if log_prob.ndim > 1:
+            log_likelihood_sum = log_prob.sum(dim=list(range(1, log_prob.ndim))) # Sum (Batch, Tasks) -> [S]
+            log_likelihood_sum = log_likelihood_sum.mean() # Mean over S -> Scalar
+        else:
+            log_likelihood_sum = log_prob.sum()
 
-        #    Handle MC dimension if it exists (sum over batch, mean over samples)
-        if log_likelihood_sum.ndim > 0:
-            log_likelihood_sum = log_likelihood_sum.mean()
-
-        # 3. Divide by Batch Size (Turn Sum into Mean) -> Matches GPyTorch Scale
+        # 5. Scale
         log_likelihood_mean = log_likelihood_sum.div(num_batch)
         kl_divergence = self.model.variational_strategy.kl_divergence().div(self.num_data / self.beta)
 
-        # 5. Combine
         return log_likelihood_mean - kl_divergence
+
+# class WeightedVariationalELBO(gpytorch.mlls.VariationalELBO):
+#     def forward(self, variational_dist_f, target, weights=None, **kwargs):
+#         # 1. Determine Batch Size (B)
+#         num_batch = variational_dist_f.event_shape[0]
+
+#         # 2. Compute Weighted Likelihood Sum
+#         #    We perform the sum manually here to inject weights
+#         #    Output of expected_log_prob is usually (num_samples, batch_size) or (batch_size,)
+#         log_prob = self.likelihood.expected_log_prob(target, variational_dist_f, **kwargs)
+
+#         #    Handle shape mismatch if using MC sampling
+#         if weights is not None:
+#             if weights.shape != log_prob.shape:
+#                 # If log_prob has MC dim (S, B) and weights is (B,), broadcast weights
+#                 if log_prob.ndim > weights.ndim:
+#                     weights = weights.expand_as(log_prob)
+
+#             # Apply Weights (Element-wise multiplication)
+#             log_prob = log_prob * weights
+
+#         #    Sum over the batch (and samples if present) to get a scalar Sum
+#         #    Note: .sum(-1) sums over the batch dimension in GPyTorch logic here
+#         log_likelihood_sum = log_prob.sum(-1)
+
+#         #    Handle MC dimension if it exists (sum over batch, mean over samples)
+#         if log_likelihood_sum.ndim > 0:
+#             log_likelihood_sum = log_likelihood_sum.mean()
+
+#         # 3. Divide by Batch Size (Turn Sum into Mean) -> Matches GPyTorch Scale
+#         log_likelihood_mean = log_likelihood_sum.div(num_batch)
+#         kl_divergence = self.model.variational_strategy.kl_divergence().div(self.num_data / self.beta)
+
+#         # 5. Combine
+#         return log_likelihood_mean - kl_divergence
 
 
 class GPTrainer:
@@ -506,8 +562,7 @@ class GPClassificationTrainer:
 
         self.train_w = None
         if self.use_weights and train_dataset.w is not None:
-            w_np = train_dataset.w.flatten()
-
+            w_np = train_dataset.w
             # CRITICAL: Normalize weights to avoid breaking the KL balance
             # If weights sum to 1e6, the likelihood overwhelms the KL prior => Overfitting.
             # We scale them so the mean is 1.0.
@@ -544,6 +599,9 @@ class GPClassificationTrainer:
             if hasattr(self.gp.covar_module, "base_kernel"):
                 if hasattr(self.gp.covar_module.base_kernel, "feature_extractor"):
                     feat_params = list(self.gp.covar_module.base_kernel.feature_extractor.parameters())
+                elif isinstance(self.gp.covar_module.base_kernel, gpytorch.kernels.Kernel): 
+                     # LMC structure is complex, fallback to generic 'other' if needed
+                     pass
         except Exception:
             pass
         feat_ids = {id(p) for p in feat_params}
@@ -560,8 +618,11 @@ class GPClassificationTrainer:
     def _dc_to_torch(self, dataset):
         X = torch.from_numpy(dataset.X).float().to(self.device)
         y = torch.from_numpy(dataset.y).float().to(self.device)
-        if y.ndim == 2:
+
+        # Only squeeze if it is actually Single Task
+        if y.ndim == 2 and y.shape[1] == 1:
             y = y.squeeze(-1)
+
         return X, y
 
     def train(self):
@@ -577,6 +638,14 @@ class GPClassificationTrainer:
             self.opt_adam.zero_grad()
 
             output = self.gp(self.train_x)
+
+            print("train_y:", self.train_y.shape, self.train_y.dtype)
+
+            print("output batch_shape:", output.batch_shape)
+            print("output event_shape:", output.event_shape)
+
+            s = output.rsample(torch.Size([10]))
+            print("f samples:", s.shape)
 
             # --- INJECT WEIGHTS HERE ---
             if self.use_weights:
@@ -786,51 +855,46 @@ class GPClassificationTrainer:
 
     def evaluate(self, dataset: dc.data.NumpyDataset, use_weights: bool = True):
         """
-        Evaluate and return AUC and Accuracy.
-        Supports weighted metrics if dataset.w is present and use_weights=True.
+        Evaluate AUC and Accuracy using helper functions.
+        Returns:
+            - Scalar float if Single-Task
+            - List of floats if Multi-Task
         """
         self.model.eval()
         self.likelihood.eval()
 
-        X, y_true_t = self._dc_to_torch(dataset)
+        # Only convert X to torch for prediction
+        X = torch.from_numpy(dataset.X).float().to(self.device)
 
         with torch.no_grad():
-            # Model forward accepts raw X
-            probs_t = self.model(X)  # (N, 1)
+            # Returns (N, 1) or (N, K)
+            probs_t = self.model(X)
 
-        y_true = dataset.y.flatten()
-        probs = probs_t.cpu().numpy().flatten()
+        # Convert to numpy for metric calculation
+        probs = probs_t.cpu().numpy()
+        y_true = dataset.y
+        weights = dataset.w
 
-        # Handle Weights
-        weights = None
-        if use_weights and dataset.w is not None:
-            weights = dataset.w.flatten()
-            # Basic safety: ensure no negative weights
-            weights = np.clip(weights, a_min=0.0, a_max=None)
+        # 1. Calculate Metrics via Helpers
+        # These functions handle [N, 1] vs [N, K] internally
+        test_auc = auc_from_probs(y_true, probs, weights=weights, use_weights=use_weights)
+        test_acc = acc_from_probs(y_true, probs, weights=weights, use_weights=use_weights)
 
-        # 1. AUC (Weighted)
-        try:
-            auc = roc_auc_score(y_true, probs, sample_weight=weights)
-        except ValueError:
-            # Can happen if only one class is present in y_true
-            auc = 0.5
-
-            # 2. ROC Curve Data (Weighted)
-        # Returns: fpr, tpr, thresholds
-        fpr, tpr, thresholds = roc_curve(y_true, probs, sample_weight=weights)
-
-        # 3. Accuracy (Weighted)
-        preds_cls = (probs > 0.5).astype(int)
-        acc = accuracy_score(y_true, preds_cls, sample_weight=weights)
-
-        print(f"Test Set | AUC: {auc:.4f} | Accuracy: {acc:.4f} | Weighted: {weights is not None}")
+        # 2. Print Results
+        if isinstance(test_auc, list):
+            # Multitask: formatting list for readability
+            auc_str = ", ".join([f"{x:.3f}" for x in test_auc])
+            acc_str = ", ".join([f"{x:.3f}" for x in test_acc])
+            print(f"Test Set (Multitask) | AUCs: [{auc_str}] | Accs: [{acc_str}]")
+        else:
+            # Single-task
+            print(f"Test Set | AUC: {test_auc:.4f} | Accuracy: {test_acc:.4f} | Weighted: {use_weights}")
 
         return {
-            "auc": auc,
-            "acc": acc,
-            "roc_data": {"fpr": fpr, "tpr": tpr, "thresholds": thresholds},
-            "probs": probs,
-            "y_true": y_true
+            "auc": test_auc,
+            "acc": test_acc,
+            "probs": probs,     # (N, K) or (N, 1)
+            "y_true": y_true    # (N, K) or (N, 1)
         }
 
 
@@ -1445,3 +1509,4 @@ class EnsembleGPTrainer:
         lower = mean_mix - z * std_mix
         upper = mean_mix + z * std_mix
         return mean_mix, lower, upper
+

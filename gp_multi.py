@@ -51,3 +51,11 @@ class MultitaskExactGPModel(gpytorch.models.ExactGP):
         # Crucial: Must return MultitaskMultivariateNormal for MLL to work
         return gpytorch.distributions.MultitaskMultivariateNormal(mean_x, covar_x)
 
+
+class MultitaskBernoulliLikelihood(gpytorch.likelihoods.Likelihood):
+    def forward(self, function_samples, **kwargs):
+        # 1. Probit Link (Normal CDF)
+        output_probs = torch.distributions.Normal(0, 1).cdf(function_samples)
+        
+        # 2. Independent Wrapper (Treats the last dim 'K' as the event dim)
+        return torch.distributions.Independent(torch.distributions.Bernoulli(probs=output_probs), 1)

@@ -6,7 +6,46 @@ import numpy as np
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
-from sklearn.metrics import mean_squared_error, roc_auc_score
+from sklearn.metrics import mean_squared_error, roc_auc_score, accuracy_score
+
+
+def acc_from_probs(y_true, probs, weights=None, use_weights=False):
+    """
+    Calculates Accuracy.
+    - If Single-Task: Returns float.
+    - If Multi-Task: Returns list of floats.
+    """
+    # Standardize shapes
+    if y_true.ndim == 1: y_true = y_true.reshape(-1, 1)
+    if probs.ndim == 1:  probs = probs.reshape(-1, 1)
+    
+    n_tasks = y_true.shape[1]
+    
+    if use_weights and weights is not None:
+        if weights.ndim == 1: weights = weights.reshape(-1, 1)
+    else:
+        weights = None
+
+    # Convert probabilities to binary class predictions (0 or 1)
+    preds = (probs > 0.5).astype(int)
+
+    acc_list = []
+    for t in range(n_tasks):
+        y_t = y_true[:, t]
+        pred_t = preds[:, t]
+        w_t = weights[:, t] if weights is not None else None
+        
+        try:
+            score = accuracy_score(y_t, pred_t, sample_weight=w_t)
+        except ValueError:
+            score = 0.0  # Fallback if something unexpected happens
+            
+        acc_list.append(score)
+
+    if n_tasks == 1:
+        return acc_list[0]
+    else:
+        return acc_list
 
 
 def auc_from_probs(y_true, probs, weights=None, use_weights=False):

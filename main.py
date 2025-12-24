@@ -10,9 +10,9 @@ import torch
 import gpytorch
 from gp_single import GPyTorchRegressor, SVGPModel, FeatureNet, \
     DeepFeatureKernel, NNGPExactGPModel, NNSVGPLearnedInducing, \
-    GPyTorchClassifier, SVGPClassificationModel
+    GPyTorchClassifier, SVGPClassificationModel, MultitaskSVGPClassificationModel
 from gp_trainer import GPTrainer, EnsembleGPTrainer, GPClassificationTrainer
-from data_utils import calculate_cutoff_error_data
+from data_utils import calculate_cutoff_error_data, acc_from_probs, auc_from_probs
 import numpy as np
 import pandas as pd
 import csv
@@ -703,7 +703,7 @@ def main_gp(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regr
             model=gp_model,
             train_dataset=train_dc,
             lr=0.05,
-            num_iters=20,
+            num_iters=200,
             device="cpu",
             log_interval=40,
         )
@@ -736,15 +736,23 @@ def main_gp(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regr
         )
         print("UQ:", uq_metrics)
     else:
+        num_tasks = 1
+        if y_np.ndim == 2:
+            num_tasks = y_np.shape[1]
+        cls = SVGPClassificationModel
+        if num_tasks > 1:
+            cls = MultitaskSVGPClassificationModel
+
         # 1. Instantiate Classifier
         gp_model = GPyTorchClassifier(
             train_x=X_train_torch,
             train_y=y_train_torch,
             normalize_x="auto",  # Set to True if not using ECFP/Binary features
             # SVGP Specific Args
-            gp_model_cls=SVGPClassificationModel,
+            gp_model_cls=cls,
             num_inducing=max(512, N//10),  # 128 is a good balance for speed/accuracy
-            kernel="matern52"  # usually better than RBF for molecular data
+            kernel="matern52",  # usually better than RBF for molecular data
+            num_tasks = num_tasks
         )
 
         # 2. Instantiate Trainer
@@ -753,7 +761,7 @@ def main_gp(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regr
             train_dataset=train_dc,
             lr=0.01,  # Adam LR (Kernel/Feature Extractor)
             ngd_lr=0.1,  # Natural Gradient LR (Variational Parameters)
-            num_iters=200,
+            num_iters=20,
             device="cpu",
             log_interval=40,
             warmup_iters=5,
@@ -769,8 +777,8 @@ def main_gp(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regr
         valid_metrics = trainer.evaluate(valid_dc, use_weights=use_weights)
         test_metrics = trainer.evaluate(test_dc, use_weights=use_weights)
 
-        print(f"\n[GP Classification] Validation AUC: {valid_metrics['auc']:.4f} | Acc: {valid_metrics['acc']:.4f}")
-        print(f"[GP Classification] Test AUC:       {test_metrics['auc']:.4f} | Acc: {test_metrics['acc']:.4f}")
+        print(f"\n[GP Classification] Validation AUC: {valid_metrics['auc']} | Acc: {valid_metrics['acc']}")
+        print(f"[GP Classification] Test AUC:       {test_metrics['auc']} | Acc: {test_metrics['acc']}")
 
         # 5. UQ Analysis: Calibration (ECE)
         test_probs = test_metrics["probs"]
@@ -1501,13 +1509,13 @@ if __name__ == "__main__":
     # main_nngp_svgp_exact_ensemble_all()
     # main_nn()
     tasks, train_dc, valid_dc, test_dc, transformers = load_dataset(
-        # dataset_name="tox21",
-        dataset_name="qm8",
+        dataset_name="tox21",
+        # dataset_name="qm8",
         split="random",
         task_indices=[0,1]
     )
 
-    res1, res2 = main_gp(valid_dc, valid_dc, test_dc, run_id=0, use_weights=True)
+    res1, res2 = main_gp(valid_dc, valid_dc, test_dc, run_id=0, use_weights=True, mode="classification")
     print(res1)
     print(res2)
 
