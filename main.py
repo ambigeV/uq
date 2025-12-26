@@ -761,11 +761,11 @@ def main_gp(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regr
             train_dataset=train_dc,
             lr=0.01,  # Adam LR (Kernel/Feature Extractor)
             ngd_lr=0.1,  # Natural Gradient LR (Variational Parameters)
-            num_iters=20,
+            num_iters=100,
             device="cpu",
             log_interval=40,
             warmup_iters=5,
-            use_weights=use_weights
+            use_weights=False
         )
 
         # 3. Train
@@ -784,8 +784,6 @@ def main_gp(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regr
         test_probs = test_metrics["probs"]
         test_y = test_metrics["y_true"]
 
-        ece_score = compute_ece(test_probs, test_y, n_bins=20)
-        print(f"[GP Classification] Test ECE (UQ):  {ece_score:.4f}")
 
         # mean_test, lower_test, upper_test = trainer.predict_interval(test_dc, alpha=0.05, use_weights=use_weights)
         cutoff_error_df = calculate_cutoff_classification_data(test_probs,
@@ -1502,6 +1500,7 @@ def main_gp_all(dataset_name: str = "delaney",
         # Call save function
         save_summary_to_csv(method_results, n_runs, csv_filename)
 
+
 if __name__ == "__main__":
     # main_svgp_ensemble_all()
     # main_nngp_exact()
@@ -1512,10 +1511,10 @@ if __name__ == "__main__":
         dataset_name="tox21",
         # dataset_name="qm8",
         split="random",
-        task_indices=[0,1]
+        task_indices=[0]
     )
 
-    res1, res2 = main_gp(valid_dc, valid_dc, test_dc, run_id=0, use_weights=True, mode="classification")
+    res1, res2 = main_gp(train_dc, valid_dc, test_dc, run_id=0, use_weights=True, mode="classification")
     print(res1)
     print(res2)
 

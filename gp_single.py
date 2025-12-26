@@ -292,6 +292,7 @@ class SVGPClassificationModel(gpytorch.models.ApproximateGP):
             num_inducing: int = 512,
             kmeans_iters: int = 15,
             kernel: str = "matern52",
+            num_tasks: int = 0
     ):
         self.normalize_x = normalize_x
 
@@ -391,7 +392,7 @@ class MultitaskSVGPClassificationModel(gpytorch.models.ApproximateGP):
     """
     def __init__(self, 
                  train_x, 
-                 train_y, 
+                 train_y,
                  likelihood, 
                  num_tasks, 
                  x_mean, 
@@ -399,7 +400,7 @@ class MultitaskSVGPClassificationModel(gpytorch.models.ApproximateGP):
                  normalize_x,
                  num_inducing: int = 512, 
                  kmeans_iters: int = 15,
-                 num_latents: int = 10, 
+                 num_latents: int = 5,
                  kernel: str = "matern52"):
         
         self.normalize_x = normalize_x
@@ -603,6 +604,12 @@ class GPyTorchClassifier(nn.Module):
         # If Multitask, return (N, K) directly
         if self.num_tasks == 1:
             return probs.unsqueeze(-1)
+        else:
+            if probs.ndim == 3:
+                probs = probs.mean(dim=0)
+
+        print("GPytorchClassifier forward: ", probs.shape)
+
         return probs
 
 

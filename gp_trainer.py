@@ -7,6 +7,7 @@ import numpy as np
 from gpytorch.optim import NGD
 from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score
 from sklearn.metrics import roc_auc_score, roc_curve, accuracy_score
+from data_utils import auc_from_probs, acc_from_probs
 
 
 class WeightedVariationalELBO(gpytorch.mlls.VariationalELBO):
@@ -638,15 +639,6 @@ class GPClassificationTrainer:
             self.opt_adam.zero_grad()
 
             output = self.gp(self.train_x)
-
-            print("train_y:", self.train_y.shape, self.train_y.dtype)
-
-            print("output batch_shape:", output.batch_shape)
-            print("output event_shape:", output.event_shape)
-
-            s = output.rsample(torch.Size([10]))
-            print("f samples:", s.shape)
-
             # --- INJECT WEIGHTS HERE ---
             if self.use_weights:
                 loss = -self.mll(output, self.train_y, weights=self.train_w)
@@ -874,6 +866,8 @@ class GPClassificationTrainer:
         probs = probs_t.cpu().numpy()
         y_true = dataset.y
         weights = dataset.w
+        print("------- GP Classification Trainer Evaluate (probs):", probs.shape)
+        print("------- GP Classification Trainer Evaluate (y_true):", y_true.shape)
 
         # 1. Calculate Metrics via Helpers
         # These functions handle [N, 1] vs [N, K] internally
