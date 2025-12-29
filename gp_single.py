@@ -175,8 +175,25 @@ class FeatureNet(nn.Module):
         self.post_bn  = nn.BatchNorm1d(feat_dim, affine=True)   # [MODIFIED] LayerNorm -> BatchNorm1d
 
     def forward(self, x):
+        # 1. Run MLP 
+        # Output shape: (..., N, D_feat)
         z = self.backbone(x)
-        return self.post_bn(z)                                  # [MODIFIED] apply BN here
+        
+        # 2. Apply BatchNorm safely
+        # Check if we have extra dimensions (like the 'Q' batch dim from Multitask)
+        if z.ndim > 2:
+            original_shape = z.shape
+            # Flatten: (Q, N, D) -> (Q*N, D)
+            z_flat = z.view(-1, z.size(-1))
+            
+            # Normalize
+            z_norm = self.post_bn(z_flat)
+            
+            # Restore: (Q*N, D) -> (Q, N, D)
+            return z_norm.view(original_shape)
+        else:
+            # Standard single-task case (N, D)
+            return self.post_bn(z)
 
 
 class DeepFeatureKernel(gpytorch.kernels.Kernel):
@@ -242,7 +259,9 @@ class NNSVGPLearnedInducing(gpytorch.models.ApproximateGP):
                  feature_extractor: nn.Module = None,
                  num_inducing: int = 800,
                  kernel: str = "matern52",
-                 inducing_idx: torch.Tensor = None):
+                 inducing_idx: torch.Tensor = None,
+                 num_tasks: int = 1,          
+                 num_latents: int = 5):    
 
         N, device = train_x.size(0), train_x.device
         if inducing_idx is None:
@@ -251,24 +270,39 @@ class NNSVGPLearnedInducing(gpytorch.models.ApproximateGP):
 
         with torch.no_grad():
             feat_dim = feature_extractor(train_x[:min(2048, N)]).shape[-1]
+        
+        if num_tasks > 1:
+            if num_latents is None: num_latents = num_tasks  # Default Q = K
+            batch_shape = torch.Size([num_latents])
+            print(f"--> [NNSVGP] Multitask Mode: {num_tasks} Tasks, {num_latents} Latents (LMC)")
+        else:
+            num_latents = None
+            batch_shape = torch.Size([]) # Single task
 
         k = kernel.lower()
-        if   k == "rbf":      base = gpytorch.kernels.RBFKernel(ard_num_dims=feat_dim)
-        elif k == "matern32": base = gpytorch.kernels.MaternKernel(nu=1.5, ard_num_dims=feat_dim)
-        elif k == "matern52": base = gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=feat_dim)
+        if   k == "rbf":      base = gpytorch.kernels.RBFKernel(ard_num_dims=feat_dim, batch_shape=batch_shape)
+        elif k == "matern32": base = gpytorch.kernels.MaternKernel(nu=1.5, ard_num_dims=feat_dim, batch_shape=batch_shape)
+        elif k == "matern52": base = gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=feat_dim, batch_shape=batch_shape)
         else: raise ValueError("kernel must be 'rbf' | 'matern32' | 'matern52'")
 
-        q  = CholeskyVariationalDistribution(inducing_inputs.size(0))
+        q  = CholeskyVariationalDistribution(inducing_inputs.size(0), batch_shape=batch_shape)
         vs = VariationalStrategy(self, inducing_points=inducing_inputs,
                                  variational_distribution=q,
                                  learn_inducing_locations=True)   # learned inputs
         # vs = WhitenedVariationalStrategy(vs)
+        if num_tasks > 1:
+            vs = gpytorch.variational.LMCVariationalStrategy(
+                vs, 
+                num_tasks=num_tasks, 
+                num_latents=num_latents, 
+                latent_dim=-1
+            )
         super().__init__(vs)
 
-        self.mean_module = gpytorch.means.ConstantMean()
+        self.mean_module = gpytorch.means.ConstantMean(batch_shape=batch_shape)
         deep = DeepFeatureKernel(feature_extractor, base,
-                                 x_mean=None, x_std=None, normalize_x=False)  # [MODIFIED] no norm
-        self.covar_module = gpytorch.kernels.ScaleKernel(deep)
+                                 x_mean=None, x_std=None, normalize_x=False)
+        self.covar_module = gpytorch.kernels.ScaleKernel(deep, batch_shape=batch_shape)
         self.likelihood = likelihood
 
     def forward(self, x):

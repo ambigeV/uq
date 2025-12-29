@@ -961,8 +961,27 @@ class EnsembleGPTrainer:
 
     def set_weights(self, w):
         w = np.asarray(w, dtype=float)
+        
+        # 1. Standardize shape to (K, T)
+        # If input is 1D (K,), treat it as single-task (K, 1)
+        if w.ndim == 1:
+            w = w[:, None]
+            
         w = np.maximum(w, 0)
-        w = w / (w.sum() + 1e-12)
+        
+        # 2. Normalize per task (Column-wise sum)
+        # Sum down axis 0 (models) to get shape (1, T)
+        sums = w.sum(axis=0, keepdims=True)
+        
+        # 3. Safe division (Avoid NaNs if a column is all zeros)
+        # np.divide handles broadcasting automatically: (K, T) / (1, T)
+        w = np.divide(w, sums, out=np.zeros_like(w), where=sums!=0)
+        
+        # Optional: If a column summed to 0, fallback to uniform weights for that task
+        zero_cols = (sums.flatten() == 0)
+        if np.any(zero_cols):
+            w[:, zero_cols] = 1.0 / w.shape[0]
+
         self.weights_ = w
 
     def _collect_probs(self, dataset):
@@ -979,10 +998,36 @@ class EnsembleGPTrainer:
                     p = out 
                 else:
                     p = out
-                
-            Probs.append(p.detach().cpu().numpy().reshape(-1))
             
-        P = np.stack(Probs, axis=0)  # Shape (K, N)
+        # Normalize shape to (N, T)
+            # If model output is 1D (N,), make it (N, 1)
+            if p.ndim == 1: 
+                p = p.unsqueeze(-1)
+            
+            Probs.append(p.detach().cpu().numpy())
+            
+        P = np.stack(Probs, axis=0)  # Shape (K, N, T)
+
+        # 2. Handle Targets (y) -> (N, T)
+        y = dataset.y
+        if y.ndim == 1: 
+            y = y.reshape(-1, 1)
+        
+        # 3. Handle Sample Weights (sw) -> (N, T)
+        if w_batch is not None:
+            sw = w_batch.detach().cpu().numpy()
+            if sw.ndim == 1: 
+                sw = sw.reshape(-1, 1)
+            
+            sums = sw.sum(axis=0, keepdims=True)
+            # Avoid division by zero
+            sw = np.divide(sw, sums, out=np.zeros_like(sw), where=sums!=0)
+            # Scale back so mean weight is approx 1.0
+            sw = sw * sw.shape[0]
+        else:
+            sw = np.ones_like(y)
+            
+        return P, y, sw
         
         # Get labels
         y = dataset.y.reshape(-1) if getattr(dataset, "y", None) is not None else None
@@ -1027,18 +1072,27 @@ class EnsembleGPTrainer:
         return mu, var
 
     def predict_mixture_probs_w(self, dataset, w=None):
-        # 1. Collect raw probabilities from all models
-        # (Using the _collect_probs we defined earlier)
+        # 1. Collect raw probabilities from all models -> Shape (K, N, T)
+        # (Relies on the updated _collect_probs we defined previously)
         P, _, _ = self._collect_probs(dataset)
+        K, N, T = P.shape
 
-        # 2. Determine ensemble weights
-        # (Assuming you have this helper, otherwise use self.weights_)
-        w = self._get_weights_or_uniform() if w is None else np.asarray(w, dtype=float)
+        # 2. Determine ensemble weights -> Shape (K, T)
+        w = np.asarray(w, dtype=float)
+
+        # Ensure w is (K, T)
+        if w.ndim == 1: 
+            w = w[:, None]
+        # If w is (K, 1) but P has multiple tasks, broadcast w
+        if w.shape[1] == 1 and T > 1:
+            w = np.tile(w, (1, T))
+
+        # 3. Linear Opinion Pool (Weighted Average)
+        # Broadcast w: (K, 1, T) to multiply against P: (K, N, T)
+        w_broad = w[:, None, :] 
         
-        # 3. Linear Opinion Pool (Weighted Average of Probabilities)
-        # P shape: (K, N), w shape: (K,)
-        # Broadcast w over the rows of P and sum
-        probs_ensemble = (w[:, None] * P).sum(axis=0)
+        # Sum over models (axis 0) -> Result (N, T)
+        probs_ensemble = (w_broad * P).sum(axis=0)
         
         return probs_ensemble
 
@@ -1221,26 +1275,33 @@ class EnsembleGPTrainer:
     # (a) Brier Score Stacking (Equivalent to MSE for probabilities)
     @staticmethod
     def _fit_brier_weights(P, y, sw, l2=1e-3):
-        P = torch.as_tensor(P, dtype=torch.double)
-        y = torch.as_tensor(y, dtype=torch.double)
-        sw = torch.as_tensor(sw, dtype=torch.double)
-        K, N = P.shape
+        P = torch.as_tensor(P, dtype=torch.double)   # (K, N, T)
+        y = torch.as_tensor(y, dtype=torch.double)   # (N, T)
+        sw = torch.as_tensor(sw, dtype=torch.double) # (N, T)
+        
+        K, N, T = P.shape
 
-        logits = torch.nn.Parameter(torch.zeros(K, dtype=torch.double))
+        # PARAMETER CHANGE: Logits is now (K, T)
+        logits = torch.nn.Parameter(torch.zeros(K, T, dtype=torch.double))
+        
         opt = torch.optim.LBFGS([logits], lr=1.0, max_iter=60, line_search_fn='strong_wolfe')
 
         def closure():
             opt.zero_grad()
-            w = torch.softmax(logits, dim=0)
-            # Linear Pool: P_ens = sum(w_k * P_k)
-            p_ens = (w[:, None] * P).sum(dim=0)
+            w = torch.softmax(logits, dim=0) # (K, T)
             
-            # Weighted Brier Score: sw * (y - p)^2
-            loss = (sw * (y - p_ens) ** 2).mean() + 0.5 * l2 * (logits ** 2).sum() / max(N, 1)
+            # Broadcast w: (K, 1, T) * P: (K, N, T)
+            w_broad = w[:, None, :]
+            
+            p_ens = (w_broad * P).sum(dim=0) # (N, T)
+            
+            # Weighted Brier Score (MSE)
+            mse = (sw * (y - p_ens) ** 2).mean()
+            loss = mse + 0.5 * l2 * (logits ** 2).mean()
+            
             loss.backward()
             return loss
 
-        # ... (optimization loop same as before) ...
         prev = float('inf')
         for _ in range(200):
             loss = opt.step(closure)
@@ -1249,33 +1310,45 @@ class EnsembleGPTrainer:
             
         with torch.no_grad():
             w = torch.softmax(logits, dim=0).cpu().numpy()
-        return w
-
+        return w # Returns (K, T)
+   
     @staticmethod
     def _fit_nll_class_weights(P, y, sw, l2=1e-3):
-        P = torch.as_tensor(P, dtype=torch.double)
-        y = torch.as_tensor(y, dtype=torch.double)
-        sw = torch.as_tensor(sw, dtype=torch.double)
-        K, N = P.shape
+        # Convert to tensors
+        P = torch.as_tensor(P, dtype=torch.double)   # (K, N, T)
+        y = torch.as_tensor(y, dtype=torch.double)   # (N, T)
+        sw = torch.as_tensor(sw, dtype=torch.double) # (N, T)
+        
+        K, N, T = P.shape
         eps = 1e-15
 
-        logits = torch.nn.Parameter(torch.zeros(K, dtype=torch.double))
+        # PARAMETER CHANGE: Logits is now (K, T)
+        logits = torch.nn.Parameter(torch.zeros(K, T, dtype=torch.double))
+        
         opt = torch.optim.LBFGS([logits], lr=1.0, max_iter=60, line_search_fn='strong_wolfe')
 
         def closure():
             opt.zero_grad()
-            w = torch.softmax(logits, dim=0)
-            p_ens = (w[:, None] * P).sum(dim=0)
+            # Softmax over dimension 0 (models) to get weights per task
+            w = torch.softmax(logits, dim=0) # Shape (K, T)
+            
+            # Broadcast w: (K, T) -> (K, 1, T) to match P: (K, N, T)
+            w_broad = w[:, None, :]
+            
+            # Ensemble Prob: Sum over models (dim 0)
+            p_ens = (w_broad * P).sum(dim=0) # Result shape (N, T)
             p_safe = torch.clamp(p_ens, eps, 1.0 - eps)
             
             # Weighted Binary Cross Entropy
             bce = -(y * torch.log(p_safe) + (1 - y) * torch.log(1 - p_safe))
-            loss = (sw * bce).mean() + 0.5 * l2 * (logits ** 2).sum() / max(N, 1)
+            
+            # Weighted mean over N and T
+            loss = (sw * bce).mean() + 0.5 * l2 * (logits ** 2).mean()
             
             loss.backward()
             return loss
 
-        # ... (optimization loop same as before) ...
+        # Optimization loop
         prev = float('inf')
         for _ in range(200):
             loss = opt.step(closure)
@@ -1284,7 +1357,7 @@ class EnsembleGPTrainer:
 
         with torch.no_grad():
             w = torch.softmax(logits, dim=0).cpu().numpy()
-        return w
+        return w # Returns (K, T)
 
     def calibrate_class_weights(self, calib_dc, method="nll", **kwargs):
         """
@@ -1293,12 +1366,12 @@ class EnsembleGPTrainer:
         - mse:       Minimizes Brier Score (Weighted)
         - nll:       Minimizes Binary Cross Entropy (Weighted)
         """
-        # 1. Collect Probabilities and Sample Weights
         P, y, sw = self._collect_probs(calib_dc)
+        K, N, T = P.shape
 
         if method == "uniform":
-            K = P.shape[0]
-            w = np.ones(K) / K
+            # Create a uniform matrix of shape (K, T)
+            w = np.ones((K, T)) / K
             
         elif method == "mse" or method == "brier":
             if y is None: raise ValueError("mse/brier calibration requires labels (y).")
@@ -1361,40 +1434,39 @@ class EnsembleGPTrainer:
         """
         # 1. Get Ensemble Predictions (Probabilities)
         probs = self.predict_mixture_probs_w(dataset, w=w)
-        y_true = dataset.y.flatten()
 
-        # 2. Handle Data Weights (Data-Awareness)
-        # Allow overriding use_weights arg, otherwise fallback to class attribute
+        y_true = dataset.y
+        if y_true.ndim == 1: y_true = y_true[:, None]
+
+        d_weights = dataset.w
+        if d_weights is None:
+            d_weights = np.ones_like(y_true)
+        if d_weights.ndim == 1: d_weights = d_weights[:, None]
+
+        # Handle use_weights override
         if use_weights is None:
             use_weights = getattr(self, "use_weights", False)
 
-        if use_weights and dataset.w is not None:
-            wei = dataset.w.flatten()
-            # Normalize weights for stability in sklearn metrics
-            if wei.sum() > 0:
-                wei = wei / wei.mean()
-        else:
-            wei = None # sklearn treats None as uniform weights
+        # 3. Calculate Metrics via Helpers
+        # Assumes these functions handle (N, T) inputs and return list[float] or float
+        test_auc = auc_from_probs(y_true, probs, weights=d_weights, use_weights=use_weights)
+        test_acc = acc_from_probs(y_true, probs, weights=d_weights, use_weights=use_weights)
 
-        # 3. Compute Metrics
-        from sklearn.metrics import roc_auc_score, accuracy_score
-        
-        # AUC
-        try:
-            auc = roc_auc_score(y_true, probs, sample_weight=wei)
-        except ValueError:
-            # Handles edge case: only one class present in batch
-            auc = 0.5
-            
-        # Accuracy (Threshold 0.5)
-        preds = (probs > 0.5).astype(int)
-        acc = accuracy_score(y_true, preds, sample_weight=wei)
+        # 4. Print Results (Matching your Role Model format)
+        if isinstance(test_auc, list):
+            # Multitask: formatting list for readability
+            auc_str = ", ".join([f"{x:.3f}" for x in test_auc])
+            acc_str = ", ".join([f"{x:.3f}" for x in test_acc])
+            print(f"Ensemble Test (Multitask) | AUCs: [{auc_str}] | Accs: [{acc_str}]")
+        else:
+            # Single-task
+            print(f"Ensemble Test | AUC: {test_auc:.4f} | Accuracy: {test_acc:.4f} | Weighted: {use_weights}")
 
         return {
-            "auc": auc,
-            "acc": acc,
-            "probs": probs,
-            "y_true": y_true
+            "auc": test_auc,
+            "acc": test_acc,
+            "probs": probs,    # (N, T)
+            "y_true": y_true   # (N, T)
         }
     
     @staticmethod

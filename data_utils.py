@@ -644,6 +644,9 @@ def evaluate_uq_metrics_classification(
     # Handle Uncertainty (Entropy) input
     if uncertainty is not None:
         if uncertainty.ndim == 1: uncertainty = uncertainty.reshape(-1, 1)
+    else:
+        uncertainty = calculate_entropy(probs)
+        if uncertainty.ndim == 1: uncertainty = uncertainty.reshape(-1, 1)
     
     n_tasks = y_true.shape[1]
 
