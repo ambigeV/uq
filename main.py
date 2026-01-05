@@ -3,7 +3,11 @@ import gc
 import deepchem as dc
 from data_utils import prepare_datasets, evaluate_uq_metrics_from_interval, \
     compute_ece, calculate_cutoff_classification_data, evaluate_uq_metrics_classification
-from nn_baseline import train_nn_baseline, train_nn_deep_ensemble, train_nn_mc_dropout, train_evd_baseline
+from nn_baseline import train_nn_baseline, train_nn_deep_ensemble, train_nn_mc_dropout, train_evd_baseline, \
+    evaluate_nn_baseline, evaluate_nn_evd, evaluate_nn_mc_dropout, evaluate_nn_deep_ensemble, \
+    MyTorchRegressor, MyTorchClassifier, MyTorchRegressorMC, MyTorchClassifierHeteroscedastic, \
+    DenseNormalGamma, DenseDirichlet
+from model_utils import load_neural_network_model, load_neural_network_ensemble
 from deepchem.molnet import load_qm7, load_delaney, load_qm8, load_qm9, load_lipo, load_freesolv, load_tox21
 
 import torch
@@ -1499,6 +1503,150 @@ def main_gp_all(dataset_name: str = "delaney",
 
         # Call save function
         save_summary_to_csv(method_results, n_runs, csv_filename)
+
+
+def evaluate_once_nn(
+    dataset_name: str,
+    run_id: int = 0,
+    split: str = "random",
+    mode: str = "regression",
+    use_weights: bool = False,
+    task_indices: Optional[List[int]] = None,
+    model_base_path: str = "./saved_models",
+    model_prefix: str = None
+):
+    """
+    Evaluate saved neural network models on test data.
+    This function loads models saved by run_once_nn() and evaluates them.
+    
+    Args:
+        dataset_name: Name of the dataset (e.g., "delaney", "qm7")
+        run_id: Run ID to match saved models
+        split: Data split type ("random" or "scaffold")
+        mode: "regression" or "classification"
+        use_weights: Whether to use sample weights
+        task_indices: List of task indices (for multitask)
+        model_base_path: Base directory where models are saved
+        model_prefix: Optional prefix for model names (e.g., "delaney_random")
+                     If None, will construct from dataset_name and split
+        
+    Returns:
+        dict: Results dictionary with same format as run_once_nn()
+    """
+    # Load test data (we only need test set for evaluation)
+    tasks, train_dc, valid_dc, test_dc, transformers = load_dataset(
+        dataset_name=dataset_name,
+        split=split,
+        task_indices=task_indices
+    )
+    
+    # Determine model prefix
+    if model_prefix is None:
+        task_suffix = ""
+        if task_indices is not None:
+            task_suffix = "_tasks_" + "_".join(map(str, task_indices))
+        model_prefix = f"{split}_{dataset_name}{task_suffix}"
+    
+    n_features = test_dc.X.shape[1]
+    n_tasks = test_dc.y.shape[1]
+    
+    print(f"\n=== Evaluating saved NN models for {dataset_name}, run_id={run_id} ===")
+    results = {}
+    all_cutoff_dfs = []
+    
+    # Determine if weights should be used
+    if dataset_name in ["tox21"]:
+        use_weights = True
+    
+    # 1. Evaluate nn_evd
+    evd_path = os.path.join(model_base_path, f"nn_evd_{mode}_run_{run_id}.pt")
+    if os.path.exists(evd_path):
+        print(f"Loading evidential model from: {evd_path}")
+        if mode == "regression":
+            model = DenseNormalGamma(n_features, n_tasks)
+        else:
+            model = DenseDirichlet(n_features, n_tasks * 2)
+        
+        dc_model = load_neural_network_model(model, evd_path)
+        uq_metrics, cutoff_df = evaluate_nn_evd(dc_model, test_dc, use_weights=use_weights, mode=mode)
+        results["nn_evd"] = uq_metrics
+        cutoff_df['Method'] = "nn_evd"
+        all_cutoff_dfs.append(cutoff_df)
+    else:
+        print(f"Warning: Model not found at {evd_path}")
+    
+    # 2. Evaluate nn_baseline (if not qm8)
+    if dataset_name not in ["qm8"]:
+        baseline_path = os.path.join(model_base_path, f"nn_baseline_{mode}_run_{run_id}.pt")
+        if os.path.exists(baseline_path):
+            print(f"Loading baseline model from: {baseline_path}")
+            if mode == "regression":
+                model = MyTorchRegressor(n_features, n_tasks)
+            else:
+                model = MyTorchClassifier(n_features, n_tasks)
+            
+            dc_model = load_neural_network_model(model, baseline_path)
+            uq_metrics = evaluate_nn_baseline(dc_model, test_dc, use_weights=use_weights, mode=mode)
+            results["nn_baseline"] = uq_metrics
+        else:
+            print(f"Warning: Model not found at {baseline_path}")
+    
+    # 3. Evaluate nn_mc_dropout
+    mc_dropout_path = os.path.join(model_base_path, f"nn_mc_dropout_{mode}_run_{run_id}.pt")
+    if os.path.exists(mc_dropout_path):
+        print(f"Loading MC-Dropout model from: {mc_dropout_path}")
+        if mode == "regression":
+            model = MyTorchRegressorMC(n_features, n_tasks)
+        else:
+            model = MyTorchClassifierHeteroscedastic(n_features, n_tasks, dropout_rate=0.2)
+        
+        dc_model = load_neural_network_model(model, mc_dropout_path)
+        uq_metrics, cutoff_df = evaluate_nn_mc_dropout(dc_model, test_dc, n_samples=100, use_weights=use_weights, mode=mode)
+        results["nn_mc_dropout"] = uq_metrics
+        cutoff_df['Method'] = "nn_mc_dropout"
+        all_cutoff_dfs.append(cutoff_df)
+    else:
+        print(f"Warning: Model not found at {mc_dropout_path}")
+    
+    # 4. Evaluate nn_deep_ensemble
+    ensemble_metadata_path = os.path.join(model_base_path, f"nn_deep_ensemble_{mode}_run_{run_id}_metadata.pt")
+    if os.path.exists(ensemble_metadata_path):
+        print(f"Loading deep ensemble from: {ensemble_metadata_path}")
+        if mode == "regression":
+            model_class = MyTorchRegressor
+        else:
+            model_class = MyTorchClassifier
+        
+        models = load_neural_network_ensemble(ensemble_metadata_path, model_class, n_features, n_tasks, mode)
+        uq_metrics, cutoff_df = evaluate_nn_deep_ensemble(models, test_dc, use_weights=use_weights, mode=mode)
+        results["nn_deep_ensemble"] = uq_metrics
+        cutoff_df['Method'] = "nn_deep_ensemble"
+        all_cutoff_dfs.append(cutoff_df)
+    else:
+        print(f"Warning: Ensemble metadata not found at {ensemble_metadata_path}")
+    
+    # Save cutoff data
+    if all_cutoff_dfs:
+        combined_cutoff_df = pd.concat(all_cutoff_dfs, ignore_index=True)
+        task_suffix = ""
+        if task_indices is not None:
+            task_suffix = "_tasks_" + "_".join(map(str, task_indices))
+        output_filename = f"./cdata_{mode}/figure/{split}_{dataset_name}{task_suffix}_NN_cutoff_run_{run_id}_evaluated.csv"
+        os.makedirs(os.path.dirname(output_filename), exist_ok=True)
+        combined_cutoff_df.to_csv(output_filename, index=False)
+        print(f"Cutoff data saved to: {output_filename}")
+    
+    del train_dc, valid_dc, test_dc, tasks, transformers
+    gc.collect()
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    return results
+
+
+# Note: GP models are not saved/reloaded due to memory constraints (training data required)
+# If you need GP evaluation, you should retrain or use a different approach
 
 
 # if __name__ == "__main__":

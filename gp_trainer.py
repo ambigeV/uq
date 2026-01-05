@@ -8,6 +8,7 @@ from gpytorch.optim import NGD
 from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score
 from sklearn.metrics import roc_auc_score, roc_curve, accuracy_score
 from data_utils import auc_from_probs, acc_from_probs
+from model_utils import save_gpytorch_model
 
 
 class WeightedVariationalELBO(gpytorch.mlls.VariationalELBO):
@@ -116,11 +117,17 @@ class GPTrainer:
         warmup_iters: int = 5,
         clip_grad: float = 1.0,
         add_prior_term: bool = False,
+        save_model: bool = False,
+        save_path: str = "./saved_models",
+        model_name: str = "gp_model",
     ):
         self.model = model.to(device)
         self.device = device
         self.num_iters = num_iters
         self.log_interval = log_interval
+        self.save_model = save_model
+        self.save_path = save_path
+        self.model_name = model_name
 
         self.likelihood = self.model.likelihood
         self.gp = self.model.gp_model
@@ -441,6 +448,16 @@ class GPTrainer:
                     f"[Iter {i:03d}] Loss: {loss.item():.4f} | {ls_str} | {os_str} | {noise_str} | "
                     f"{feat_str} | {pred_str}"  # [MODIFIED]
                 )
+        
+        # Save model after training if requested
+        if self.save_model:
+            save_gpytorch_model(
+                self.model,
+                trainer=self,
+                save_path=self.save_path,
+                model_name=self.model_name,
+                create_dir=True
+            )
 
     def evaluate_mse(self, dataset: dc.data.NumpyDataset, use_weights=False) -> float:
         self.model.eval()
@@ -545,7 +562,10 @@ class GPClassificationTrainer:
             ngd_lr: float = 0.1,  # Specific to Variational
             warmup_iters: int = 5,
             clip_grad: float = 1.0,  # Optional clipping
-            use_weights: bool = False
+            use_weights: bool = False,
+            save_model: bool = False,
+            save_path: str = "./saved_models",
+            model_name: str = "gp_classification_model"
     ):
         self.model = model.to(device)
         self.device = device
@@ -554,6 +574,9 @@ class GPClassificationTrainer:
         self.warmup_iters = warmup_iters
         self.clip_grad = clip_grad
         self.use_weights = use_weights
+        self.save_model = save_model
+        self.save_path = save_path
+        self.model_name = model_name
 
         self.gp = self.model.gp_model
         self.likelihood = self.model.likelihood
@@ -658,6 +681,16 @@ class GPClassificationTrainer:
 
             if i % self.log_interval == 0 or i == self.num_iters:
                 self._log_step(i, loss.item())
+        
+        # Save model after training if requested
+        if self.save_model:
+            save_gpytorch_model(
+                self.model,
+                trainer=self,
+                save_path=self.save_path,
+                model_name=self.model_name,
+                create_dir=True
+            )
 
     def _set_feature_extractor_grad(self, requires_grad: bool):
         try:
