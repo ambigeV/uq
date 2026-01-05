@@ -980,7 +980,8 @@ class EnsembleGPTrainer:
     def train(self):
         for i, t in enumerate(self.trainers, 1):
             print(f"[Ensemble] Training model {i}/{len(self.trainers)}")
-            t.train()
+            with gpytorch.settings.cholesky_jitter(1e-4), gpytorch.settings.cholesky_max_tries(10):
+                t.train()
 
     def _dc_to_torch(self, dataset: dc.data.NumpyDataset):
         X = torch.from_numpy(dataset.X).float().to(self.device)

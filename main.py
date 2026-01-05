@@ -528,26 +528,26 @@ def main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc, E=5, run_id=0
                 "log_interval": 40,
             })
         else:
-            feat = FeatureNet(in_dim=in_dim, feat_dim=128, hidden=(256, 128), dropout=0.0)
+            feat = FeatureNet(in_dim=in_dim, feat_dim=64, hidden=(128, 64), dropout=0.0)
             gp_model_i = GPyTorchClassifier(
                 train_x=X_train_torch,
                 train_y=y_train_torch,
                 normalize_x=False,
                 gp_model_cls=NNSVGPLearnedInducing,
                 feature_extractor=feat,
-                num_inducing = max(512, Ni//10, Ni),
+                num_inducing = max(min(512, Ni//5), Ni//10),
                 kernel="matern52",
                 num_tasks=num_tasks
             )
             items.append({
                 "model": gp_model_i,
                 "train_dataset": ds_i,
-                "lr": 0.01,
+                "lr": 0.005,
                 "nn_lr": 1e-3,
                 "ngd_lr": 0.02,
                 "warmup_iters": 5,
                 "clip_grad": 1.0,
-                "num_iters": 500,
+                "num_iters": 300,
                 "log_interval": 40,
             })
 
@@ -1376,19 +1376,19 @@ def run_once_gp(dataset_name: str,
             cut_offs[idx]['Method'] = "nngp_ensemble_{}".format(cur["name"])
             all_cutoff_dfs.append(cut_offs[idx])
 
-    result, cut_offs = main_svgp_ensemble_all(train_dc, valid_dc, test_dc,
-                                              run_id=run_id, use_weights=use_weights, mode=mode)
-    for idx, cur in enumerate(result):
-        results["svgp_ensemble_{}".format(cur["name"])] = cur["uq_metrics"]
-        cut_offs[idx]['Method'] = "svgp_ensemble_{}".format(cur["name"])
-        all_cutoff_dfs.append(cut_offs[idx])    
-
     result, cut_offs = main_nngp_svgp_exact_ensemble_all(train_dc, valid_dc, test_dc,
                                                          run_id=run_id, use_weights=use_weights, mode=mode)
     for idx, cur in enumerate(result):
         results["nnsvgp_ensemble_{}".format(cur["name"])] = cur["uq_metrics"]
         cut_offs[idx]['Method'] = "nnsvgp_ensemble_{}".format(cur["name"])
         all_cutoff_dfs.append(cut_offs[idx])
+
+    result, cut_offs = main_svgp_ensemble_all(train_dc, valid_dc, test_dc,
+                                              run_id=run_id, use_weights=use_weights, mode=mode)
+    for idx, cur in enumerate(result):
+        results["svgp_ensemble_{}".format(cur["name"])] = cur["uq_metrics"]
+        cut_offs[idx]['Method'] = "svgp_ensemble_{}".format(cur["name"])
+        all_cutoff_dfs.append(cut_offs[idx])    
 
     # Concatenate all DataFrames into a single one
     combined_cutoff_df = pd.concat(all_cutoff_dfs, ignore_index=True)
