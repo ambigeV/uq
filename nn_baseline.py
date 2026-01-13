@@ -763,7 +763,19 @@ def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0, use_weigh
     models = []
 
     for i in range(M):
-        model = MyTorchRegressor(n_features, n_tasks)
+        # Ensure each model gets different initialization by using a different seed
+        # This is critical for ensemble diversity - without this, all models would
+        # be initialized identically if a global seed was set, defeating the purpose of ensembling
+        ensemble_seed = run_id * 1000 + i  # Unique seed per model in ensemble
+        import random
+        random.seed(ensemble_seed)
+        np.random.seed(ensemble_seed)
+        torch.manual_seed(ensemble_seed)
+        
+        if mode == "regression":
+            model = MyTorchRegressor(n_features, n_tasks)
+        else:
+            model = MyTorchClassifier(n_features, n_tasks)
         
         if mode == "regression":
             loss = dc.models.losses.L2Loss()
@@ -788,7 +800,7 @@ def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0, use_weigh
                 mode=mode,
             )
 
-        dc_model.fit(train_dc, nb_epoch=50)
+        dc_model.fit(train_dc, nb_epoch=100)
         models.append(dc_model)
     
     # Save ensemble if requested (saves all members + metadata)
