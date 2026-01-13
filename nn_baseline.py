@@ -9,6 +9,7 @@ import math
 from data_utils import evaluate_uq_metrics_from_interval, evaluate_uq_metrics_classification, \
     calculate_cutoff_error_data, calculate_cutoff_classification_data, roc_auc_score, auc_from_probs
 from deepchem.models.losses import Loss, _make_pytorch_shapes_consistent
+from model_utils import save_neural_network_model
 
 
 # ============================================================
@@ -755,7 +756,7 @@ class DeepEnsembleClassifier:
 # ------------------------------
 # Deep Ensemble
 # ------------------------------
-def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0, use_weights=False, mode="regression"):
+def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0, use_weights=False, mode="regression", save_model=False, save_path="./saved_models"):
     n_tasks = train_dc.y.shape[1]
     n_features = train_dc.X.shape[1]
 
@@ -789,6 +790,17 @@ def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0, use_weigh
 
         dc_model.fit(train_dc, nb_epoch=50)
         models.append(dc_model)
+    
+    # Save ensemble if requested (saves all members + metadata)
+    if save_model:
+        from model_utils import save_neural_network_ensemble
+        save_neural_network_ensemble(
+            models,
+            save_path,
+            model_name=f"nn_deep_ensemble_{mode}_run_{run_id}",
+            mode=mode,
+            create_dir=True
+        )
 
     if mode == "regression":
         ensemble = DeepEnsembleRegressor(models)
@@ -1085,7 +1097,7 @@ class MCDropoutClassifierWrapper:
         return mean_prob, entropy
 
 
-def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, run_id=0, use_weights=False, mode="regression"):
+def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, run_id=0, use_weights=False, mode="regression", save_model=False, save_path="./saved_models"):
     """
     Train heteroscedastic MC-dropout NN and:
       - compute MSE with deterministic predictions (eval mode, no dropout)
@@ -1129,6 +1141,15 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, 
 
     # ----- Train -----
     dc_model.fit(train_dc, nb_epoch=100)
+    
+    # Save model if requested
+    if save_model:
+        save_neural_network_model(
+            dc_model, 
+            save_path, 
+            model_name=f"nn_mc_dropout_{mode}_run_{run_id}",
+            create_dir=True
+        )
 
     if mode == "regression":
         # Instantiate the FIXED wrapper
@@ -1248,7 +1269,7 @@ class GradientClippingCallback:
 # dc_model.fit(train_dc, nb_epoch=100, callbacks=[clip_callback])
 
 
-def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run_id=0, use_weights=False, mode="regression"):
+def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run_id=0, use_weights=False, mode="regression", save_model=False, save_path="./saved_models"):
     """
     Train Deep Evidential Regression (DER) NN and:
       - compute MSE with the analytical mean prediction (gamma)
@@ -1294,6 +1315,15 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
         # --- 2. Train ---
         print(f"Training Deep Evidential Regression with lambda (reg_coeff) = {reg_coeff}")
         dc_model.fit(train_dc, nb_epoch=300, callbacks=[gradientClip])
+        
+        # Save model if requested
+        if save_model:
+            save_neural_network_model(
+                dc_model, 
+                save_path, 
+                model_name=f"nn_evd_{mode}_run_{run_id}",
+                create_dir=True
+            )
         device = next(dc_model.model.parameters()).device
 
         # Convert numpy data to PyTorch tensors (DeepChem .X are typically numpy arrays)
@@ -1367,6 +1397,15 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
         # --- 2. Train ---
         print(f"Training Deep Evidential Classification")
         dc_model.fit(train_dc, nb_epoch=300, callbacks=[gradientClip])
+        
+        # Save model if requested
+        if save_model:
+            save_neural_network_model(
+                dc_model, 
+                save_path, 
+                model_name=f"nn_evd_{mode}_run_{run_id}",
+                create_dir=True
+            )
         device = next(dc_model.model.parameters()).device
 
         # Convert numpy data to PyTorch tensors (DeepChem .X are typically numpy arrays)
@@ -1422,7 +1461,7 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
         return uq_metrics, cutoff_error_df
     
 
-def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regression"):
+def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regression", save_model=False, save_path="./saved_models"):
     n_tasks = train_dc.y.shape[1]
     n_features = train_dc.X.shape[1]
 
@@ -1452,6 +1491,15 @@ def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, 
 
     if mode == "regression":
         dc_model.fit(train_dc, nb_epoch=80)
+        
+        # Save model if requested
+        if save_model:
+            save_neural_network_model(
+                dc_model, 
+                save_path, 
+                model_name=f"nn_baseline_{mode}_run_{run_id}",
+                create_dir=True
+            )
 
         metric = dc.metrics.Metric(dc.metrics.mean_squared_error)
         metric_name = metric.name
@@ -1496,6 +1544,15 @@ def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, 
     else:
         # 1. Train the model
         dc_model.fit(train_dc, nb_epoch=80)
+        
+        # Save model if requested
+        if save_model:
+            save_neural_network_model(
+                dc_model, 
+                save_path, 
+                model_name=f"nn_baseline_{mode}_run_{run_id}",
+                create_dir=True
+            )
 
         # 2. Define the metric (Using ROC-AUC as in your snippet)
         metric = dc.metrics.Metric(dc.metrics.roc_auc_score)
@@ -1542,3 +1599,267 @@ def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, 
             "Avg_Entropy": None,
             "Spearman_Err_Unc": None,
         }
+
+
+# ============================================================
+# Evaluation Functions (for reloaded models)
+# ============================================================
+
+def evaluate_nn_baseline(dc_model, test_dc, use_weights=False, mode="regression"):
+    """
+    Evaluate a trained neural network baseline model on test data.
+    This function replicates the evaluation logic from train_nn_baseline()
+    but works with a pre-trained model.
+    
+    Args:
+        dc_model: Trained DeepChem TorchModel instance
+        test_dc: Test dataset
+        use_weights: Whether to use sample weights
+        mode: "regression" or "classification"
+        
+    Returns:
+        dict: UQ metrics dictionary (same format as train_nn_baseline)
+    """
+    if mode == "regression":
+        metric = dc.metrics.Metric(dc.metrics.mean_squared_error)
+        metric_name = metric.name
+        test_scores = dc_model.evaluate(test_dc, [metric], use_sample_weights=use_weights, per_task_metrics=True)
+        test_agg, test_detailed = test_scores
+        task_scores_test = test_detailed[metric_name]
+        
+        return {
+            "alpha": None,
+            "empirical_coverage": None,
+            "avg_pred_std": None,
+            "nll": None,
+            "ce": None,
+            "spearman_err_unc": None,
+            "MSE": task_scores_test,
+        }
+    else:
+        metric = dc.metrics.Metric(dc.metrics.roc_auc_score)
+        metric_name = metric.name
+        test_results = dc_model.evaluate(test_dc, [metric], use_sample_weights=use_weights, per_task_metrics=True)
+        test_agg, test_detailed = test_results
+        task_scores_test = test_detailed[metric_name]
+        
+        return {
+            "AUC": task_scores_test,
+            "NLL": None,
+            "Brier": None,
+            "ECE": None,
+            "Avg_Entropy": None,
+            "Spearman_Err_Unc": None,
+        }
+
+
+def evaluate_nn_evd(dc_model, test_dc, use_weights=False, mode="regression"):
+    """
+    Evaluate a trained evidential neural network model on test data.
+    
+    Args:
+        dc_model: Trained DeepChem TorchModel with evidential model
+        test_dc: Test dataset
+        use_weights: Whether to use sample weights
+        mode: "regression" or "classification"
+        
+    Returns:
+        tuple: (uq_metrics, cutoff_error_df)
+    """
+    device = next(dc_model.model.parameters()).device
+    test_X_tensor = torch.from_numpy(test_dc.X).float().to(device)
+    
+    with torch.no_grad():
+        mu_test, params_test, aleatoric_test, epistemic_test = dc_model.model(test_X_tensor)
+    
+    if mode == "regression":
+        total_var_test = aleatoric_test.cpu().numpy() + epistemic_test.cpu().numpy()
+        std_test = np.sqrt(total_var_test)
+        mu_test = mu_test.cpu().numpy()
+        if mu_test.ndim == 1:
+            mu_test = mu_test.reshape(-1, 1)
+        
+        cutoff_error_df = calculate_cutoff_error_data(mu_test, total_var_test, test_dc.y, test_dc.w, use_weights=use_weights)
+        test_mse = mse_from_mean_prediction(mu_test, test_dc, use_weights=use_weights)
+        
+        alpha = 0.05
+        z = norm.ppf(1 - alpha / 2.0)
+        lower = mu_test - z * std_test
+        upper = mu_test + z * std_test
+        
+        if std_test.ndim == 1:
+            std_test = std_test.reshape(-1, 1)
+        
+        uq_metrics = evaluate_uq_metrics_from_interval(
+            y_true=test_dc.y,
+            mean=mu_test,
+            lower=lower,
+            upper=upper,
+            alpha=alpha,
+            test_error=test_mse,
+            weights=test_dc.w,
+            use_weights=use_weights
+        )
+    else:
+        if isinstance(mu_test, torch.Tensor):
+            mu_test = mu_test.cpu().numpy()
+        
+        if mu_test.ndim > 1 and mu_test.shape[1] > 1:
+            mu_test = mu_test[:, 1::2]
+        
+        if mu_test.ndim == 1:
+            mu_test = mu_test.reshape(-1, 1)
+        
+        total_var_test = aleatoric_test.cpu().numpy() + epistemic_test.cpu().numpy()
+        cutoff_error_df = calculate_cutoff_classification_data(mu_test, test_dc.y, test_dc.w, use_weights=use_weights)
+        test_auc = auc_from_probs(test_dc.y, mu_test, test_dc.w, use_weights=use_weights)
+        
+        uq_metrics = evaluate_uq_metrics_classification(
+            y_true=test_dc.y,
+            probs=mu_test,
+            auc=test_auc,
+            uncertainty=total_var_test,
+            weights=test_dc.w,
+            use_weights=use_weights,
+            n_bins=20
+        )
+    
+    return uq_metrics, cutoff_error_df
+
+
+def evaluate_nn_mc_dropout(dc_model, test_dc, n_samples=100, use_weights=False, mode="regression"):
+    """
+    Evaluate a trained MC-Dropout neural network model on test data.
+    
+    Args:
+        dc_model: Trained DeepChem TorchModel with MC-Dropout
+        test_dc: Test dataset
+        n_samples: Number of MC samples for uncertainty estimation
+        use_weights: Whether to use sample weights
+        mode: "regression" or "classification"
+        
+    Returns:
+        tuple: (uq_metrics, cutoff_error_df)
+    """
+    if mode == "regression":
+        mc_model = MCDropoutRegressorRefined(dc_model, n_samples=n_samples)
+        mean_test, std_test = mc_model.predict_uncertainty(test_dc)
+        
+        if mean_test.ndim == 1:
+            mean_test = mean_test.reshape(-1, 1)
+        
+        cutoff_error_df = calculate_cutoff_error_data(mean_test, std_test, test_dc.y, test_dc.w, use_weights=use_weights)
+        test_mse = mse_from_mean_prediction(mean_test, test_dc, use_weights=use_weights)
+        
+        alpha = 0.05
+        z = norm.ppf(1 - alpha / 2.0)
+        lower = mean_test - z * std_test
+        upper = mean_test + z * std_test
+        
+        if std_test.ndim == 1:
+            std_test = std_test.reshape(-1, 1)
+        
+        uq_metrics = evaluate_uq_metrics_from_interval(
+            y_true=test_dc.y,
+            mean=mean_test,
+            lower=lower,
+            upper=upper,
+            alpha=alpha,
+            test_error=test_mse,
+            weights=test_dc.w,
+            use_weights=use_weights
+        )
+    else:
+        mc_wrapper = MCDropoutClassifierWrapper(dc_model, n_samples=n_samples)
+        mean_probs, entropy = mc_wrapper.predict_uncertainty(test_dc)
+        
+        n_tasks = test_dc.y.shape[1]
+        if n_tasks == 1 and mean_probs.shape[1] == 2:
+            probs_positive = mean_probs[:, 1].reshape(-1, 1)
+            entropy = entropy.reshape(-1, 1)
+        else:
+            probs_positive = mean_probs
+        
+        test_auc = auc_from_probs(test_dc.y, probs_positive, test_dc.w, use_weights=use_weights)
+        
+        uq_metrics = evaluate_uq_metrics_classification(
+            y_true=test_dc.y,
+            probs=probs_positive,
+            auc=test_auc,
+            uncertainty=entropy,
+            weights=test_dc.w,
+            use_weights=use_weights,
+            n_bins=20
+        )
+        
+        cutoff_error_df = calculate_cutoff_classification_data(
+            probs_positive,
+            test_dc.y,
+            weights=test_dc.w,
+            use_weights=use_weights
+        )
+    
+    return uq_metrics, cutoff_error_df
+
+
+def evaluate_nn_deep_ensemble(models, test_dc, use_weights=False, mode="regression"):
+    """
+    Evaluate a deep ensemble on test data.
+    
+    Args:
+        models: List of trained DeepChem TorchModel instances
+        test_dc: Test dataset
+        use_weights: Whether to use sample weights
+        mode: "regression" or "classification"
+        
+    Returns:
+        tuple: (uq_metrics, cutoff_error_df)
+    """
+    if mode == "regression":
+        ensemble = DeepEnsembleRegressor(models)
+        mean_test, lower_test, upper_test = ensemble.predict_interval(test_dc)
+        cutoff_error_df = calculate_cutoff_error_data(mean_test, upper_test-lower_test, test_dc.y, test_dc.w, use_weights=use_weights)
+        test_error = mse_from_mean_prediction(mean_test, test_dc, use_weights=use_weights)
+        
+        uq_metrics = evaluate_uq_metrics_from_interval(
+            y_true=test_dc.y,
+            mean=mean_test,
+            lower=lower_test,
+            upper=upper_test,
+            weights=test_dc.w,
+            use_weights=use_weights,
+            alpha=0.05,
+            test_error=test_error,
+        )
+    else:
+        ensemble = DeepEnsembleClassifier(models)
+        mean_probs, H_total, H_exp, MI = ensemble.predict_uncertainty(test_dc)
+        
+        n_tasks = test_dc.y.shape[1]
+        if n_tasks == 1 and mean_probs.shape[1] == 2:
+            probs_positive = mean_probs[:, 1].reshape(-1, 1)
+            entropy = H_total.reshape(-1, 1)
+        else:
+            probs_positive = mean_probs
+        
+        test_auc = auc_from_probs(test_dc.y, probs_positive, test_dc.w, use_weights=use_weights)
+        uncertainty = H_total
+        
+        uq_metrics = evaluate_uq_metrics_classification(
+            y_true=test_dc.y,
+            probs=probs_positive,
+            auc=test_auc,
+            uncertainty=uncertainty,
+            weights=test_dc.w,
+            use_weights=use_weights,
+            n_bins=20
+        )
+        
+        cutoff_error_df = calculate_cutoff_classification_data(
+            probs_positive,
+            test_dc.y,
+            weights=test_dc.w,
+            use_weights=use_weights
+        )
+    
+    return uq_metrics, cutoff_error_df

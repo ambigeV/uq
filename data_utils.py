@@ -360,8 +360,6 @@ def calculate_cutoff_classification_data(probs, y_true, weights=None, use_weight
 
 #     return pd.DataFrame(results)
 
-import pandas as pd
-import numpy as np
 
 def calculate_cutoff_error_data(mean_test, var_test, y_true, weights=None, use_weights=False):
     """

@@ -5,9 +5,26 @@ import os
 import numpy as np
 
 # --- Configuration (Unchanged) ---
-DATASETS = ["delaney", "lipo", 'qm7', 'qm8']
-DATA_DIR = "./cdata"
+# DATASETS = ["delaney", "lipo", 'qm7', 'qm8', 'tox21']
+DATASETS = ['tox21']
+DATA_DIR = "./cdata_classification"
 SPLIT = "scaffold"
+
+import pandas as pd
+import glob
+import os
+import re
+
+# --- Configuration ---
+os.makedirs(DATA_DIR, exist_ok=True)
+
+DATASETS = ['tox21']
+SPLITS = [SPLIT]
+MODEL_TYPES = ['NN', 'GP']
+TARGET_IDS = [0, 3]  # K = 2
+TASK_STR = "tasks_0_3"
+SOURCE_DIR = "./cdata_classification"
+DATA_DIR = f"./cdata_classification_aggregated/{TASK_STR}"
 
 METRICS_TO_PLOT = {
     'MSE_mean': 'MSE (Lower is Better)',
@@ -15,6 +32,13 @@ METRICS_TO_PLOT = {
     'nll_mean': 'NLL (Lower is Better)',
     'empirical_coverage_mean': 'Coverage (Closer to 0.95 is Ideal)',
     'spearman_err_unc_mean': 'Spearman Rho (Higher is Better)',
+}
+METRICS_TO_PLOT = {
+    'AUC_mean': 'AUC (Larger is Better)',
+    'Brier_mean': 'Brier (Lower is Better)',
+    'ECE_mean': 'ECE (Lower is Better)',
+    'NLL_mean': 'NLL (Lower is Better)',
+    'Spearman_Err_Unc_mean': 'Spearman Cor (Larger is Better)',
 }
 
 # --- Fixed Order and Short Names for Plotting ---
@@ -196,9 +220,11 @@ def plot_metrics_per_dataset(df):
                 ax.axhline(0.95, color='r', linestyle='--', linewidth=1, label='Ideal Coverage (95%)')
                 ax.legend(loc='lower left', fontsize=10)
 
-            # Add a small text annotation showing the minimum/maximum value
+            LOWER_IS_BETTER_METRICS = ['Brier_mean', 'ECE_mean', 'NLL_mean', 'MSE_mean', 'ce_mean']
+
             if not df_mean[metric_col].isnull().all():
-                is_lower_better = 'Lower is Better' in title
+                # Check if the current metric is in our 'Lower' list
+                is_lower_better = metric_col in LOWER_IS_BETTER_METRICS
 
                 if is_lower_better:
                     best_method = df_mean.loc[df_mean[metric_col].idxmin(), 'Method_Name_Cleaned']
@@ -210,6 +236,21 @@ def plot_metrics_per_dataset(df):
                 ax.text(0.02, 0.98, f'Best: {best_method}',
                         transform=ax.transAxes, fontsize=10,
                         verticalalignment='top', color=color)
+
+            # # Add a small text annotation showing the minimum/maximum value
+            # if not df_mean[metric_col].isnull().all():
+            #     is_lower_better = 'Lower is Better' in title
+            #
+            #     if is_lower_better:
+            #         best_method = df_mean.loc[df_mean[metric_col].idxmin(), 'Method_Name_Cleaned']
+            #         color = 'darkgreen'
+            #     else:
+            #         best_method = df_mean.loc[df_mean[metric_col].idxmax(), 'Method_Name_Cleaned']
+            #         color = 'darkred'
+            #
+            #     ax.text(0.02, 0.98, f'Best: {best_method}',
+            #             transform=ax.transAxes, fontsize=10,
+            #             verticalalignment='top', color=color)
 
         # 4. Hide any unused subplots (the 6th slot)
         for j in range(i + 1, len(axes)):
@@ -234,11 +275,114 @@ def plot_metrics_per_dataset(df):
         plt.close(fig)
 
 
+# ... (Keep all your existing imports, configurations, and functions above) ...
+
+# --- NEW FUNCTIONality 1: Per Task Plotting ---
+
+# ... (Keep all your existing configuration and mapping code here) ...
+
+def process_per_task_plots():
+    """
+    Functionality 1: Generates individual plots for each Task ID (id_0, id_1, etc.)
+    by combining NN and GP results for that specific task.
+    """
+    print("\n--- Generating Per-Task Plots ---")
+    for dataset in DATASETS:
+        for split in SPLITS:
+            for tid in TARGET_IDS:
+                task_label = f"{dataset}_task_id_{tid}"
+                task_dfs = []
+
+                for m_type in MODEL_TYPES:
+                    fname = f"{m_type}_{split}_{dataset}_{TASK_STR}_id_{tid}_c.csv"
+                    fpath = os.path.join(SOURCE_DIR, fname)
+
+                    if os.path.exists(fpath):
+                        df = pd.read_csv(fpath)
+                        # Identify and clean using your existing logic
+                        method_col = 'Method' if 'Method' in df.columns else df.columns[-1]
+                        df['Method_Name_Cleaned'] = df[method_col].astype(str).apply(lambda x: METHOD_MAP.get(x, x))
+                        df['Dataset'] = task_label
+                        task_dfs.append(df)
+
+                if task_dfs:
+                    combined = pd.concat(task_dfs, ignore_index=True)
+                    plot_metrics_per_dataset(combined)
+
+
+def process_average_task_plots():
+    """
+    Functionality 2: Averages the results across all TARGET_IDS
+    and generates a single summary plot for the multi-task configuration.
+    """
+    print("\n--- Generating Average-Task Plots ---")
+    for dataset in DATASETS:
+        for split in SPLITS:
+            all_models_avg = []
+
+            for m_type in MODEL_TYPES:
+                model_task_dfs = []
+                for tid in TARGET_IDS:
+                    fname = f"{m_type}_{split}_{dataset}_{TASK_STR}_id_{tid}_c.csv"
+                    fpath = os.path.join(SOURCE_DIR, fname)
+                    if os.path.exists(fpath):
+                        model_task_dfs.append(pd.read_csv(fpath))
+
+                if model_task_dfs:
+                    # Merge id_0 and id_1 then average
+                    temp_combined = pd.concat(model_task_dfs, ignore_index=True)
+                    method_col = 'Method' if 'Method' in temp_combined.columns else temp_combined.columns[-1]
+
+                    avg_df = temp_combined.groupby(method_col, as_index=False).mean(numeric_only=True)
+                    avg_df['Method_Name_Cleaned'] = avg_df[method_col].astype(str).apply(lambda x: METHOD_MAP.get(x, x))
+                    avg_df['Dataset'] = f"{dataset}_AVERAGE"
+                    all_models_avg.append(avg_df)
+
+            if all_models_avg:
+                final_df = pd.concat(all_models_avg, ignore_index=True)
+                plot_metrics_per_dataset(final_df)
+
+
+# --- Logic Correction for the Best Method Annotation ---
+# (Note: Apply this logic inside your plot_metrics_per_dataset function
+# where it handles the 'Best' text annotation)
+
+"""
+REPLACEMENT LOGIC FOR THE 'BEST' TEXT IN plot_metrics_per_dataset:
+
+# Define which metrics follow 'Lower is Better'
+LOWER_IS_BETTER_METRICS = ['Brier_mean', 'ECE_mean', 'NLL_mean', 'MSE_mean', 'ce_mean']
+
+if not df_mean[metric_col].isnull().all():
+    # Check if the current metric is in our 'Lower' list
+    is_lower_better = metric_col in LOWER_IS_BETTER_METRICS
+
+    if is_lower_better:
+        best_method = df_mean.loc[df_mean[metric_col].idxmin(), 'Method_Name_Cleaned']
+        color = 'darkgreen'
+    else:
+        best_method = df_mean.loc[df_mean[metric_col].idxmax(), 'Method_Name_Cleaned']
+        color = 'darkred'
+
+    ax.text(0.02, 0.98, f'Best: {best_method}',
+            transform=ax.transAxes, fontsize=10,
+            verticalalignment='top', color=color)
+"""
+
 if __name__ == "__main__":
     try:
-        final_df = load_and_clean_data(DATASETS, SPLIT)
-        plot_metrics_per_dataset(final_df)
+        # Run both functionalities
+        process_per_task_plots()
+        process_average_task_plots()
 
     except Exception as e:
-        print(f"\nAn error occurred during plot generation: {e}")
-        print("Please check your input CSV files, column names, and the DATASETS list.")
+        print(f"\nAn error occurred: {e}")
+
+# if __name__ == "__main__":
+#     try:
+#         final_df = load_and_clean_data(DATASETS, SPLIT)
+#         plot_metrics_per_dataset(final_df)
+#
+#     except Exception as e:
+#         print(f"\nAn error occurred during plot generation: {e}")
+#         print("Please check your input CSV files, column names, and the DATASETS list.")
