@@ -577,7 +577,240 @@ class MyTorchRegressorMC(nn.Module):
 
 
 # ============================================================
-# 2. Helper Evaluation
+# 2. Unified Model Architecture (ChemProp-style)
+# ============================================================
+
+class UnifiedModel(nn.Module):
+    """
+    Unified model architecture following ChemProp style with component-wise building.
+    Supports baseline, MC-dropout, and evidential models for both regression and classification.
+    """
+    
+    def __init__(self, classification: bool = False, model_type: str = "baseline", n_tasks: int = 1, **kwargs):
+        """
+        Args:
+            classification: Whether this is a classification model
+            model_type: "baseline", "mc_dropout", or "evidential"
+            n_tasks: Number of output tasks
+            **kwargs: Additional configuration (dropout_rate, etc.)
+        """
+        super(UnifiedModel, self).__init__()
+        self.classification = classification
+        self.model_type = model_type
+        self.n_tasks = n_tasks
+        self.encoder = None
+        self.ffn = None
+        self.config = kwargs
+        self.config['n_tasks'] = n_tasks  # Store n_tasks in config for forward method
+        
+        # For evidential models
+        if model_type == "evidential":
+            self.confidence = True
+            self.conf_type = "evidence"
+        else:
+            self.confidence = False
+            self.conf_type = None
+    
+    def create_encoder(self, n_features: int, **kwargs):
+        """
+        Creates the encoder (currently identity for vector input, can be extended for graph input).
+        Following ChemProp's create_encoder pattern.
+        
+        Args:
+            n_features: Input feature dimension
+            **kwargs: Additional encoder config
+        """
+        # For now, encoder is identity (direct vector input)
+        # This can be extended to include graph encoders (MPN) later
+        self.encoder_dim = n_features
+        self.encoder = nn.Identity()
+    
+    def create_ffn(self, n_features: int, n_tasks: int, **kwargs):
+        """
+        Creates the feed-forward network following ChemProp's create_ffn pattern.
+        
+        Args:
+            n_features: Input feature dimension
+            n_tasks: Number of output tasks
+            **kwargs: Additional FFN config (dropout_rate, etc.)
+        """
+        dropout_rate = kwargs.get('dropout_rate', 0.1)
+        first_linear_dim = n_features
+        
+        # Determine output size based on model type
+        output_size = n_tasks
+        if self.model_type == "mc_dropout":
+            # Output mean and log_var: 2 * n_tasks
+            output_size = 2 * n_tasks
+        elif self.model_type == "evidential":
+            if self.classification:
+                # Dirichlet: 2 * n_tasks (alpha for each class per task)
+                output_size = 2 * n_tasks
+            else:
+                # Normal-Inverse-Gamma: 4 * n_tasks (gamma, v, alpha, beta)
+                output_size = 4 * n_tasks
+        
+        # Build FFN layers
+        if self.model_type == "baseline":
+            # Standard baseline: n_features -> 256 -> 128 -> n_tasks
+            ffn_layers = [
+                nn.Linear(first_linear_dim, 256),
+                nn.ReLU(),
+                nn.Linear(256, 128),
+                nn.ReLU(),
+                nn.Linear(128, output_size)
+            ]
+        elif self.model_type == "mc_dropout":
+            # MC-Dropout: feature net + output head
+            self.feature_net = nn.Sequential(
+                nn.Linear(first_linear_dim, 128),
+                nn.ReLU(),
+                nn.Dropout(p=dropout_rate),
+                nn.Linear(128, 64),
+                nn.ReLU(),
+                nn.Dropout(p=dropout_rate),
+            )
+            self.out_head = nn.Linear(64, output_size)
+            self.n_tasks = n_tasks
+            return  # Early return for MC-dropout
+        elif self.model_type == "evidential":
+            # Evidential: n_features -> 128 -> 64 -> output_size
+            ffn_layers = [
+                nn.Linear(first_linear_dim, 128),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Linear(128, 64),
+                nn.BatchNorm1d(64),
+                nn.ReLU(),
+                nn.Linear(64, output_size)
+            ]
+        else:
+            raise ValueError(f"Unknown model_type: {self.model_type}")
+        
+        self.ffn = nn.Sequential(*ffn_layers)
+    
+    def forward(self, x):
+        """
+        Forward pass through encoder and FFN.
+        Returns probs for classification baseline (sigmoid applied) to work with SigmoidCrossEntropy loss.
+        """
+        # Encode (currently identity)
+        encoded = self.encoder(x)
+        
+        # MC-Dropout has special structure
+        if self.model_type == "mc_dropout":
+            h = self.feature_net(encoded)
+            raw = self.out_head(h)
+            
+            if self.classification:
+                # For classification: return raw output (B, 2*n_tasks) = [mu_logits | log_var]
+                # This matches MyTorchClassifierHeteroscedastic which returns self.dense(x)
+                return raw
+            else:
+                # For regression: return tuple (mean, var, packed) to match output_types
+                # Split into mean and log_var
+                T = self.n_tasks
+                mean = raw[..., :T]
+                log_var = raw[..., T:]
+                var = torch.exp(log_var)
+                packed = raw
+                
+                return mean, var, packed
+        
+        # Standard forward through FFN
+        output = self.ffn(encoded)
+        
+        # Evidential models need post-processing
+        if self.model_type == "evidential":
+            if self.classification:
+                # Dirichlet: convert to alpha parameters
+                evidence = torch.exp(output)
+                alpha = evidence + 1
+                # n_tasks is stored in self.n_tasks
+                alpha_reshaped = alpha.view(-1, self.n_tasks, 2)
+                S = torch.sum(alpha_reshaped, dim=2, keepdim=True)
+                prob = alpha_reshaped / S
+                epistemic = 2.0 / S
+                prob_safe = prob + 1e-8
+                aleatoric = -torch.sum(prob * torch.log(prob_safe), dim=2, keepdim=True)
+                
+                prob = prob.view(x.shape[0], -1)
+                alpha = alpha
+                aleatoric = aleatoric.view(x.shape[0], -1)
+                epistemic = epistemic.view(x.shape[0], -1)
+                
+                return prob, alpha, aleatoric, epistemic
+            else:
+                # Normal-Inverse-Gamma: split and process
+                eps = 1e-6
+                MAX_ALPHA = 100.0
+                mu, logv, logalpha, logbeta = output.chunk(4, dim=-1)
+                
+                v = F.softplus(logv)
+                v = torch.clamp(v, min=eps)
+                alpha = F.softplus(logalpha) + 1
+                alpha = torch.clamp(alpha, min=eps + 1, max=MAX_ALPHA)
+                beta = F.softplus(logbeta)
+                beta = torch.clamp(beta, min=eps)
+                
+                aleatoric = beta / (alpha - 1)
+                epistemic = beta / (v * (alpha - 1))
+                
+                return mu, torch.cat([mu, v, alpha, beta], dim=-1), aleatoric, epistemic
+        
+        # Baseline: return probs for classification (sigmoid applied) to match original MyTorchClassifier
+        # SigmoidCrossEntropy expects probs as input
+        if self.classification and self.model_type == "baseline":
+            logits = output
+            probs = torch.sigmoid(logits)
+            return probs
+        
+        return output
+
+
+def build_model(
+    model_type: str,
+    n_features: int,
+    n_tasks: int,
+    mode: str = "regression",
+    **kwargs
+) -> nn.Module:
+    """
+    Builds a unified model following ChemProp's build_model pattern.
+    
+    Args:
+        model_type: "baseline", "mc_dropout", or "evidential"
+        n_features: Input feature dimension
+        n_tasks: Number of output tasks
+        mode: "regression" or "classification"
+        **kwargs: Additional config (dropout_rate, etc.)
+    
+    Returns:
+        A UnifiedModel instance with encoder and FFN initialized
+    """
+    classification = (mode == "classification")
+    
+    # Create model
+    model = UnifiedModel(classification=classification, model_type=model_type, n_tasks=n_tasks, **kwargs)
+    
+    # Build components (ChemProp style)
+    model.create_encoder(n_features, **kwargs)
+    model.create_ffn(n_features, n_tasks, **kwargs)
+    
+    # Initialize weights (optional, following ChemProp pattern)
+    def initialize_weights(module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+    
+    model.apply(initialize_weights)
+    
+    return model
+
+
+# ============================================================
+# 3. Helper Evaluation
 # ============================================================
 
 import numpy as np
@@ -764,18 +997,14 @@ def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0, use_weigh
 
     for i in range(M):
         # Ensure each model gets different initialization by using a different seed
-        # This is critical for ensemble diversity - without this, all models would
-        # be initialized identically if a global seed was set, defeating the purpose of ensembling
+        # This is critical for ensemble diversity
         ensemble_seed = run_id * 1000 + i  # Unique seed per model in ensemble
         import random
         random.seed(ensemble_seed)
         np.random.seed(ensemble_seed)
         torch.manual_seed(ensemble_seed)
         
-        if mode == "regression":
-            model = MyTorchRegressor(n_features, n_tasks)
-        else:
-            model = MyTorchClassifier(n_features, n_tasks)
+        model = build_model("baseline", n_features, n_tasks, mode=mode)
         
         if mode == "regression":
             loss = dc.models.losses.L2Loss()
@@ -800,7 +1029,7 @@ def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0, use_weigh
                 mode=mode,
             )
 
-        dc_model.fit(train_dc, nb_epoch=100)
+        dc_model.fit(train_dc, nb_epoch=50)
         models.append(dc_model)
     
     # Save ensemble if requested (saves all members + metadata)
@@ -1120,7 +1349,7 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, 
 
     if mode == "regression":
         # ----- Build model & DeepChem wrapper -----
-        model = MyTorchRegressorMC(n_features, n_tasks)    # your MC + log-var net
+        model = build_model("mc_dropout", n_features, n_tasks, mode=mode, dropout_rate=0.1)
         loss  = HeteroscedasticL2Loss()                   # Kendall & Gal-style loss
 
         dc_model = dc.models.TorchModel(
@@ -1140,7 +1369,7 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, 
             n_classes = 2
 
         # Model outputs: (B, 2*K) = [mu_logits | log_var]
-        model = MyTorchClassifierHeteroscedastic(n_features, n_classes=n_tasks, dropout_rate=0.2)
+        model = build_model("mc_dropout", n_features, n_tasks, mode="classification", dropout_rate=0.2)
         loss = HeteroscedasticClassificationLoss(n_samples=20)  # MC samples for training integration
         
         dc_model = dc.models.TorchModel(
@@ -1298,13 +1527,12 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
     if mode == "regression":
         # --- 1. Build Model & DeepChem wrapper (Using the structure from the second code block) ---
         # The model outputs 4 parameters (gamma, v, alpha, beta) for each task.
-        # We assume 'DenseNormalGamma' is the model structure (mu, v, alpha, beta)
-        model = DenseNormalGamma(n_features, n_tasks)
+        model = build_model("evidential", n_features, n_tasks, mode="regression")
 
         # The custom evidential loss func(y_true, evidential_output)
-        loss = EvidentialRegressionLoss(coeff=reg_coeff)
+        loss = EvidentialRegressionLoss(reg_coeff=reg_coeff)
     else:
-        model = DenseDirichlet(n_features, n_tasks * 2)
+        model = build_model("evidential", n_features, n_tasks, mode="classification")
 
         loss = EvidentialClassificationLoss()
 
@@ -1477,7 +1705,7 @@ def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, 
     n_tasks = train_dc.y.shape[1]
     n_features = train_dc.X.shape[1]
 
-    model = MyTorchRegressor(n_features, n_tasks)
+    model = build_model("baseline", n_features, n_tasks, mode=mode)
     if mode == "regression":
         loss = dc.models.losses.L2Loss()
 

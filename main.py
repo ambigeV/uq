@@ -1705,18 +1705,18 @@ if __name__ == "__main__":
                     help="List of task indices to use (e.g., --tasks 0 2)")
     args = parser.parse_args()
 
-    main_gp_all(dataset_name=args.dataset,
-                n_runs=args.n_runs,
-                split=args.split,
-                base_seed=args.base_seed,
-                mode = args.mode,
-                use_weights = (args.mode == "classification"),
-                task_indices=args.tasks)
+    # main_gp_all(dataset_name=args.dataset,
+    #             n_runs=args.n_runs,
+    #             split=args.split,
+    #             base_seed=args.base_seed,
+    #             mode = args.mode,
+    #             use_weights = (args.mode == "classification"),
+    #             task_indices=args.tasks)
 
-    # main_nn(dataset_name=args.dataset,
-    #         n_runs=args.n_runs,
-    #         split=args.split,
-    #         base_seed=args.base_seed,
-    #         mode = args.mode,
-    #         use_weights = (args.mode == "classification"),
-    #         task_indices=args.tasks)
+    main_nn(dataset_name=args.dataset,
+            n_runs=args.n_runs,
+            split=args.split,
+            base_seed=args.base_seed,
+            mode = args.mode,
+            use_weights = (args.mode == "classification"),
+            task_indices=args.tasks)
