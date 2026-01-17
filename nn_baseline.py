@@ -804,7 +804,7 @@ def build_model(
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
     
-    model.apply(initialize_weights)
+    # model.apply(initialize_weights)
     
     return model
 
@@ -1349,6 +1349,7 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, 
 
     if mode == "regression":
         # ----- Build model & DeepChem wrapper -----
+        # model = MyTorchRegressorMC(n_features=n_features, n_tasks=n_tasks)
         model = build_model("mc_dropout", n_features, n_tasks, mode=mode, dropout_rate=0.1)
         loss  = HeteroscedasticL2Loss()                   # Kendall & Gal-style loss
 
@@ -1431,7 +1432,6 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, 
 
         print(f"[NN MC-DROPOUT] Test MSE: {test_mse}")
         print(f"[NN MC-DROPOUT] UQ Metrics: {uq_metrics}")
-
     else:
         mc_wrapper = MCDropoutClassifierWrapper(dc_model, n_samples=n_samples)
         mean_probs, entropy = mc_wrapper.predict_uncertainty(test_dc)

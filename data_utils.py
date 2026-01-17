@@ -3,7 +3,6 @@ import deepchem as dc
 from typing import Tuple
 import math
 import numpy as np
-import numpy as np
 import pandas as pd
 from scipy.stats import norm
 from sklearn.metrics import mean_squared_error, roc_auc_score, accuracy_score
