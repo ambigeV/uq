@@ -6,10 +6,24 @@ import torch.nn.functional as F
 import deepchem as dc
 from scipy.stats import norm
 import math
+from typing import Optional
 from data_utils import evaluate_uq_metrics_from_interval, evaluate_uq_metrics_classification, \
     calculate_cutoff_error_data, calculate_cutoff_classification_data, roc_auc_score, auc_from_probs
 from deepchem.models.losses import Loss, _make_pytorch_shapes_consistent
 from model_utils import save_neural_network_model
+# Import graph encoder components from nn.py
+from nn import (
+    BatchMolGraph,
+    MolGraph,
+    graphdata_to_batchmolgraph,
+    BondMessagePassing,
+    AtomMessagePassing,
+    MeanAggregation,
+    SumAggregation,
+    DMPNNEncoder,
+    create_dmpnn_encoder,
+    UnifiedTorchModel
+)
 
 
 # ============================================================
@@ -471,10 +485,12 @@ class DenseDirichlet(nn.Module):
         # or keep them structured. DeepChem usually expects (Batch, N) outputs.
         # Let's flatten everything back to (Batch, N) to match typical API expectations.
         
-        prob = prob.view(x.shape[0], -1)       # (Batch, 2*T)
+        # Use alpha.shape[0] for batch size (x might be BatchMolGraph for graph data if used with UnifiedModel)
+        batch_size = alpha.shape[0]
+        prob = prob.view(batch_size, -1)       # (Batch, 2*T)
         alpha = alpha                          # (Batch, 2*T) - Already flat
-        aleatoric = aleatoric.view(x.shape[0], -1) # (Batch, T)
-        epistemic = epistemic.view(x.shape[0], -1) # (Batch, T)
+        aleatoric = aleatoric.view(batch_size, -1) # (Batch, T)
+        epistemic = epistemic.view(batch_size, -1) # (Batch, T)
 
         return prob, alpha, aleatoric, epistemic
 
@@ -611,31 +627,68 @@ class UnifiedModel(nn.Module):
             self.confidence = False
             self.conf_type = None
     
-    def create_encoder(self, n_features: int, **kwargs):
+    def create_encoder(self, n_features: int, encoder_type: str = "identity", **kwargs):
         """
-        Creates the encoder (currently identity for vector input, can be extended for graph input).
+        Creates the encoder (identity for vector input, DMPNN for graph input).
         Following ChemProp's create_encoder pattern.
         
         Args:
-            n_features: Input feature dimension
+            n_features: Input feature dimension (for identity) or atom feature dim (for graph)
+            encoder_type: "identity" (default) or "dmpnn"
             **kwargs: Additional encoder config
+                - For dmpnn: d_v, d_e, d_h, depth, aggregation, batch_norm, etc.
         """
-        # For now, encoder is identity (direct vector input)
-        # This can be extended to include graph encoders (MPN) later
-        self.encoder_dim = n_features
-        self.encoder = nn.Identity()
+        self.encoder_type = encoder_type
+        
+        if encoder_type == "identity":
+            # Current behavior: pass-through for vector features
+            self.encoder_dim = n_features
+            self.encoder = nn.Identity()
+        
+        elif encoder_type == "dmpnn":
+            # DMPNN encoder for graph input
+            d_v = kwargs.get('d_v', n_features)  # Atom features (default: n_features)
+            d_e = kwargs.get('d_e', 14)          # Bond features (default from chemprop)
+            d_h = kwargs.get('encoder_hidden_dim', 300)  # Hidden/output dimension
+            depth = kwargs.get('encoder_depth', 3)
+            aggregation = kwargs.get('aggregation', 'mean')
+            batch_norm = kwargs.get('encoder_batch_norm', False)
+            mp_type = kwargs.get('message_passing_type', 'bond')
+            dropout = kwargs.get('encoder_dropout', 0.0)
+            activation = kwargs.get('encoder_activation', 'relu')
+            bias = kwargs.get('encoder_bias', True)
+            
+            # Create DMPNN encoder
+            self.encoder = create_dmpnn_encoder(
+                d_v=d_v,
+                d_e=d_e,
+                d_h=d_h,
+                depth=depth,
+                aggregation=aggregation,
+                batch_norm=batch_norm,
+                message_passing_type=mp_type,
+                dropout=dropout,
+                activation=activation,
+                bias=bias,
+            )
+            self.encoder_dim = d_h  # Output dimension of graph encoder
+        
+        else:
+            raise ValueError(f"Unknown encoder_type: {encoder_type}. "
+                            f"Supported: 'identity', 'dmpnn'")
     
     def create_ffn(self, n_features: int, n_tasks: int, **kwargs):
         """
         Creates the feed-forward network following ChemProp's create_ffn pattern.
         
         Args:
-            n_features: Input feature dimension
+            n_features: Input feature dimension (DEPRECATED - use self.encoder_dim)
             n_tasks: Number of output tasks
             **kwargs: Additional FFN config (dropout_rate, etc.)
         """
         dropout_rate = kwargs.get('dropout_rate', 0.1)
-        first_linear_dim = n_features
+        # FIX: Use encoder_dim instead of n_features to match encoder output
+        first_linear_dim = self.encoder_dim
         
         # Determine output size based on model type
         output_size = n_tasks
@@ -689,33 +742,57 @@ class UnifiedModel(nn.Module):
         
         self.ffn = nn.Sequential(*ffn_layers)
     
-    def forward(self, x):
+    def forward(self, x, V_d: Optional[torch.Tensor] = None, X_d: Optional[torch.Tensor] = None):
         """
         Forward pass through encoder and FFN.
-        Returns probs for classification baseline (sigmoid applied) to work with SigmoidCrossEntropy loss.
+        Handles both vector input (identity encoder) and graph input (DMPNN encoder).
+        
+        Args:
+            x: Input data
+                - For identity encoder: (batch_size, n_features) tensor
+                - For DMPNN encoder: BatchMolGraph object or list of GraphData objects
+            V_d: Optional vertex descriptors (for graph encoder)
+            X_d: Optional additional graph-level descriptors (for future pre-trained features)
+        
+        Returns:
+            Model output (varies by model_type)
         """
-        # Encode (currently identity)
-        encoded = self.encoder(x)
+        # Encode: handles both vector and graph input
+        if self.encoder_type == "dmpnn":
+            # Graph encoder expects BatchMolGraph
+            # DeepChem may pass list of GraphData objects, so convert if needed
+            if not isinstance(x, BatchMolGraph):
+                # Try to convert from GraphData list
+                try:
+                    from nn import graphdata_to_batchmolgraph
+                    if isinstance(x, (list, tuple)) and len(x) > 0:
+                        # Check if it's a list of GraphData objects
+                        if hasattr(x[0], 'node_features') or hasattr(x[0], 'num_node_features'):
+                            x = graphdata_to_batchmolgraph(x)
+                        else:
+                            raise TypeError(f"Expected BatchMolGraph or list of GraphData for encoder_type='dmpnn', got {type(x)}")
+                    else:
+                        raise TypeError(f"Expected BatchMolGraph or list of GraphData for encoder_type='dmpnn', got {type(x)}")
+                except Exception as e:
+                    raise TypeError(f"Could not convert input to BatchMolGraph for encoder_type='dmpnn'. Got {type(x)}. Error: {e}")
+            encoded = self.encoder(x, V_d, X_d)
+        else:
+            # Identity encoder expects vector input (B, n_features)
+            encoded = self.encoder(x)
         
         # MC-Dropout has special structure
         if self.model_type == "mc_dropout":
             h = self.feature_net(encoded)
             raw = self.out_head(h)
             
-            if self.classification:
-                # For classification: return raw output (B, 2*n_tasks) = [mu_logits | log_var]
-                # This matches MyTorchClassifierHeteroscedastic which returns self.dense(x)
-                return raw
-            else:
-                # For regression: return tuple (mean, var, packed) to match output_types
-                # Split into mean and log_var
-                T = self.n_tasks
-                mean = raw[..., :T]
-                log_var = raw[..., T:]
-                var = torch.exp(log_var)
-                packed = raw
-                
-                return mean, var, packed
+            # Split into mean and log_var
+            T = self.n_tasks
+            mean = raw[..., :T]
+            log_var = raw[..., T:]
+            var = torch.exp(log_var)
+            packed = raw
+
+            return mean, var, packed
         
         # Standard forward through FFN
         output = self.ffn(encoded)
@@ -734,10 +811,12 @@ class UnifiedModel(nn.Module):
                 prob_safe = prob + 1e-8
                 aleatoric = -torch.sum(prob * torch.log(prob_safe), dim=2, keepdim=True)
                 
-                prob = prob.view(x.shape[0], -1)
+                # Use output.shape[0] for batch size (x might be BatchMolGraph for graph data)
+                batch_size = output.shape[0]
+                prob = prob.view(batch_size, -1)
                 alpha = alpha
-                aleatoric = aleatoric.view(x.shape[0], -1)
-                epistemic = epistemic.view(x.shape[0], -1)
+                aleatoric = aleatoric.view(batch_size, -1)
+                epistemic = epistemic.view(batch_size, -1)
                 
                 return prob, alpha, aleatoric, epistemic
             else:
@@ -773,6 +852,7 @@ def build_model(
     n_features: int,
     n_tasks: int,
     mode: str = "regression",
+    encoder_type: str = "identity",
     **kwargs
 ) -> nn.Module:
     """
@@ -780,10 +860,11 @@ def build_model(
     
     Args:
         model_type: "baseline", "mc_dropout", or "evidential"
-        n_features: Input feature dimension
+        n_features: Input feature dimension (for identity) or atom feature dim (for graph)
         n_tasks: Number of output tasks
         mode: "regression" or "classification"
-        **kwargs: Additional config (dropout_rate, etc.)
+        encoder_type: "identity" (default) or "dmpnn"
+        **kwargs: Additional config (dropout_rate, encoder_hidden_dim, etc.)
     
     Returns:
         A UnifiedModel instance with encoder and FFN initialized
@@ -794,17 +875,13 @@ def build_model(
     model = UnifiedModel(classification=classification, model_type=model_type, n_tasks=n_tasks, **kwargs)
     
     # Build components (ChemProp style)
-    model.create_encoder(n_features, **kwargs)
-    model.create_ffn(n_features, n_tasks, **kwargs)
+    model.create_encoder(n_features, encoder_type=encoder_type, **kwargs)
+    model.create_ffn(n_features, n_tasks, **kwargs)  # n_features kept for backward compat, but FFN uses encoder_dim
     
-    # Initialize weights (optional, following ChemProp pattern)
-    def initialize_weights(module):
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-    
-    # model.apply(initialize_weights)
+    # NOTE: Do NOT override PyTorch's default initialization here.
+    # The original MC-Dropout head relied on default init, and reinitializing
+    # with a different scheme (e.g., Xavier) degraded performance, especially
+    # for QM7. If you want custom init, add it carefully and retune hyperparameters.
     
     return model
 
@@ -977,6 +1054,7 @@ class DeepEnsembleClassifier:
         H_aleatoric = H_member.mean(axis=0)
 
         # 3. Epistemic Uncertainty (Mutual Information)
+        # 3. Epistemic Uncertainty (Mutual Information)
         # MI = Total - Aleatoric
         # Shape: (N, T)
         MI = H_total - H_aleatoric
@@ -987,11 +1065,49 @@ class DeepEnsembleClassifier:
         return p_mean, H_total, H_aleatoric, MI
 
 # ------------------------------
+# Helper function to extract n_features from dataset
+# ------------------------------
+def get_n_features(dataset, encoder_type: str = "identity"):
+    """
+    Extract n_features from dataset, handling both vector and graph data.
+    
+    Args:
+        dataset: DeepChem dataset
+        encoder_type: "identity" (vector) or "dmpnn" (graph)
+    
+    Returns:
+        n_features: Feature dimension
+    """
+    if encoder_type == "dmpnn":
+        # For graph data, X contains GraphData objects
+        # Extract atom feature dimension from first graph
+        if hasattr(dataset.X, '__len__') and len(dataset.X) > 0:
+            first_graph = dataset.X[0]
+            if hasattr(first_graph, 'num_node_features'):
+                return first_graph.num_node_features
+            elif hasattr(first_graph, 'node_features'):
+                return first_graph.node_features.shape[1]
+            else:
+                raise ValueError("Cannot extract node_features from GraphData object")
+        else:
+            raise ValueError("Dataset X is empty or invalid for graph mode")
+    else:
+        # For vector data, X is a numpy array
+        if hasattr(dataset.X, 'shape'):
+            if len(dataset.X.shape) >= 2:
+                return dataset.X.shape[1]
+            else:
+                return dataset.X.shape[0] if len(dataset.X.shape) == 1 else 1
+        else:
+            raise ValueError(f"Cannot extract features from dataset.X (type: {type(dataset.X)})")
+
+
+# ------------------------------
 # Deep Ensemble
 # ------------------------------
-def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0, use_weights=False, mode="regression", save_model=False, save_path="./saved_models"):
+def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0, use_weights=False, mode="regression", save_model=False, save_path="./saved_models", encoder_type="identity"):
     n_tasks = train_dc.y.shape[1]
-    n_features = train_dc.X.shape[1]
+    n_features = get_n_features(train_dc, encoder_type=encoder_type)
 
     models = []
 
@@ -1004,30 +1120,52 @@ def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0, use_weigh
         np.random.seed(ensemble_seed)
         torch.manual_seed(ensemble_seed)
         
-        model = build_model("baseline", n_features, n_tasks, mode=mode)
+        model = build_model("baseline", n_features, n_tasks, mode=mode, encoder_type=encoder_type)
         
         if mode == "regression":
             loss = dc.models.losses.L2Loss()
 
-            dc_model = dc.models.TorchModel(
-                model=model,
-                loss=loss,
-                output_types=['prediction'],
-                batch_size=64,
-                learning_rate=1e-3,
-                mode=mode,
-            )
+            if encoder_type == "dmpnn":
+                dc_model = UnifiedTorchModel(
+                    model=model,
+                    loss=loss,
+                    output_types=['prediction'],
+                    batch_size=64,
+                    learning_rate=1e-3,
+                    mode=mode,
+                    encoder_type=encoder_type,
+                )
+            else:
+                dc_model = dc.models.TorchModel(
+                    model=model,
+                    loss=loss,
+                    output_types=['prediction'],
+                    batch_size=64,
+                    learning_rate=1e-3,
+                    mode=mode,
+                )
         
         else:
             loss = dc.models.losses.SigmoidCrossEntropy()
-            dc_model = dc.models.TorchModel(
-                model=model,
-                loss=loss,
-                output_types=['prediction'],
-                batch_size=64,
-                learning_rate=1e-3,
-                mode=mode,
-            )
+            if encoder_type == "dmpnn":
+                dc_model = UnifiedTorchModel(
+                    model=model,
+                    loss=loss,
+                    output_types=['prediction'],
+                    batch_size=64,
+                    learning_rate=1e-3,
+                    mode=mode,
+                    encoder_type=encoder_type,
+                )
+            else:
+                dc_model = dc.models.TorchModel(
+                    model=model,
+                    loss=loss,
+                    output_types=['prediction'],
+                    batch_size=64,
+                    learning_rate=1e-3,
+                    mode=mode,
+                )
 
         dc_model.fit(train_dc, nb_epoch=50)
         models.append(dc_model)
@@ -1075,7 +1213,7 @@ def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0, use_weigh
         n_tasks = test_dc.y.shape[1]
         if n_tasks == 1 and mean_probs.shape[1] == 2:
             probs_positive = mean_probs[:, 1].reshape(-1, 1) # Force (N, 1)
-            entropy = entropy.reshape(-1, 1)
+            # entropy = entropy.reshape(-1, 1)
         else:
             probs_positive = mean_probs # Already (N, T)
 
@@ -1338,29 +1476,39 @@ class MCDropoutClassifierWrapper:
         return mean_prob, entropy
 
 
-def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, run_id=0, use_weights=False, mode="regression", save_model=False, save_path="./saved_models"):
+def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, run_id=0, use_weights=False, mode="regression", save_model=False, save_path="./saved_models", encoder_type="identity"):
     """
     Train heteroscedastic MC-dropout NN and:
       - compute MSE with deterministic predictions (eval mode, no dropout)
       - compute UQ using DeepChem's predict_uncertainty (MC + aleatoric)
     """
     n_tasks    = train_dc.y.shape[1]
-    n_features = train_dc.X.shape[1]
+    n_features = get_n_features(train_dc, encoder_type=encoder_type)
 
     if mode == "regression":
         # ----- Build model & DeepChem wrapper -----
-        # model = MyTorchRegressorMC(n_features=n_features, n_tasks=n_tasks)
-        model = build_model("mc_dropout", n_features, n_tasks, mode=mode, dropout_rate=0.1)
+        model = build_model("mc_dropout", n_features, n_tasks, mode=mode, dropout_rate=0.1, encoder_type=encoder_type)
         loss  = HeteroscedasticL2Loss()                   # Kendall & Gal-style loss
 
-        dc_model = dc.models.TorchModel(
-            model=model,
-            loss=loss,
-            output_types=['prediction', 'variance', 'loss'],
-            batch_size=64,
-            learning_rate=1e-3,
-            mode='regression'
-        )
+        if encoder_type == "dmpnn":
+            dc_model = UnifiedTorchModel(
+                model=model,
+                loss=loss,
+                output_types=['prediction', 'variance', 'loss'],
+                batch_size=64,
+                learning_rate=1e-3,
+                mode='regression',
+                encoder_type=encoder_type
+            )
+        else:
+            dc_model = dc.models.TorchModel(
+                model=model,
+                loss=loss,
+                output_types=['prediction', 'variance', 'loss'],
+                batch_size=64,
+                learning_rate=1e-3,
+                mode='regression'
+            )
     else:
         y = np.asarray(train_dc.y)
 
@@ -1370,16 +1518,28 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, 
             n_classes = 2
 
         # Model outputs: (B, 2*K) = [mu_logits | log_var]
-        model = build_model("mc_dropout", n_features, n_tasks, mode="classification", dropout_rate=0.2)
+        model = build_model("mc_dropout", n_features, n_tasks, mode="classification", dropout_rate=0.2, encoder_type=encoder_type)
         loss = HeteroscedasticClassificationLoss(n_samples=20)  # MC samples for training integration
         
-        dc_model = dc.models.TorchModel(
-        model=model,
-        loss=loss,
-        output_types=['prediction'],
-        batch_size=64,
-        learning_rate=1e-3,
-        mode='classification')
+        if encoder_type == "dmpnn":
+            dc_model = UnifiedTorchModel(
+                model=model,
+                loss=loss,
+                output_types=['prediction'],
+                batch_size=64,
+                learning_rate=1e-3,
+                mode='classification',
+                encoder_type=encoder_type
+            )
+        else:
+            dc_model = dc.models.TorchModel(
+                model=model,
+                loss=loss,
+                output_types=['prediction'],
+                batch_size=64,
+                learning_rate=1e-3,
+                mode='classification'
+            )
 
     # ----- Train -----
     dc_model.fit(train_dc, nb_epoch=100)
@@ -1432,6 +1592,7 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, 
 
         print(f"[NN MC-DROPOUT] Test MSE: {test_mse}")
         print(f"[NN MC-DROPOUT] UQ Metrics: {uq_metrics}")
+
     else:
         mc_wrapper = MCDropoutClassifierWrapper(dc_model, n_samples=n_samples)
         mean_probs, entropy = mc_wrapper.predict_uncertainty(test_dc)
@@ -1510,7 +1671,7 @@ class GradientClippingCallback:
 # dc_model.fit(train_dc, nb_epoch=100, callbacks=[clip_callback])
 
 
-def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run_id=0, use_weights=False, mode="regression", save_model=False, save_path="./saved_models"):
+def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run_id=0, use_weights=False, mode="regression", save_model=False, save_path="./saved_models", encoder_type="identity"):
     """
     Train Deep Evidential Regression (DER) NN and:
       - compute MSE with the analytical mean prediction (gamma)
@@ -1520,41 +1681,57 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
         train_dc, valid_dc, test_dc: DeepChem datasets.
         reg_coeff (float): The regularization coefficient lambda (λ) for the loss.
         alpha (float): The significance level for confidence interval calculation.
+        encoder_type: "identity" (vector) or "dmpnn" (graph)
     """
     n_tasks = train_dc.y.shape[1]
-    n_features = train_dc.X.shape[1]
+    n_features = get_n_features(train_dc, encoder_type=encoder_type)
 
     if mode == "regression":
         # --- 1. Build Model & DeepChem wrapper (Using the structure from the second code block) ---
         # The model outputs 4 parameters (gamma, v, alpha, beta) for each task.
-        model = build_model("evidential", n_features, n_tasks, mode="regression")
+        model = build_model("evidential", n_features, n_tasks, mode="regression", encoder_type=encoder_type)
 
         # The custom evidential loss func(y_true, evidential_output)
         loss = EvidentialRegressionLoss(reg_coeff=reg_coeff)
     else:
-        model = build_model("evidential", n_features, n_tasks, mode="classification")
+        model = build_model("evidential", n_features, n_tasks, mode="classification", encoder_type=encoder_type)
 
         loss = EvidentialClassificationLoss()
 
     gradientClip = GradientClippingCallback()
 
     if mode == "regression":
-        dc_model = dc.models.TorchModel(
-            model=model,
-            loss=loss,
-            # The output types match the return structure of DenseNormalGamma:
-            output_types=['prediction', 'loss', 'var1', 'var2'],
-            batch_size=128,
-            learning_rate=1e-4,
-            # wandb=True,  # Set to True
-            # model_dir='deep-evidential-regression-run-{}'.format(run_id),
-            log_frequency=40,
-            mode='regression'
-        )
+        if encoder_type == "dmpnn":
+            dc_model = UnifiedTorchModel(
+                model=model,
+                loss=loss,
+                # The output types match the return structure of DenseNormalGamma:
+                output_types=['prediction', 'loss', 'var1', 'var2'],
+                batch_size=128,
+                learning_rate=1e-4,
+                # wandb=True,  # Set to True
+                # model_dir='deep-evidential-regression-run-{}'.format(run_id),
+                log_frequency=40,
+                mode='regression',
+                encoder_type=encoder_type
+            )
+        else:
+            dc_model = dc.models.TorchModel(
+                model=model,
+                loss=loss,
+                # The output types match the return structure of DenseNormalGamma:
+                output_types=['prediction', 'loss', 'var1', 'var2'],
+                batch_size=128,
+                learning_rate=1e-4,
+                # wandb=True,  # Set to True
+                # model_dir='deep-evidential-regression-run-{}'.format(run_id),
+                log_frequency=40,
+                mode='regression'
+            )
 
         # --- 2. Train ---
         print(f"Training Deep Evidential Regression with lambda (reg_coeff) = {reg_coeff}")
-        dc_model.fit(train_dc, nb_epoch=300, callbacks=[gradientClip])
+        dc_model.fit(train_dc, nb_epoch=30, callbacks=[gradientClip])
         
         # Save model if requested
         if save_model:
@@ -1566,9 +1743,21 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
             )
         device = next(dc_model.model.parameters()).device
 
-        # Convert numpy data to PyTorch tensors (DeepChem .X are typically numpy arrays)
-        valid_X_tensor = torch.from_numpy(valid_dc.X).float().to(device)
-        test_X_tensor = torch.from_numpy(test_dc.X).float().to(device)
+        # Convert data to appropriate format
+        # For graph data, we need to convert GraphData to BatchMolGraph
+        # For vector data, convert numpy arrays to tensors
+        if encoder_type == "dmpnn":
+            from nn import graphdata_to_batchmolgraph
+            valid_bmg = graphdata_to_batchmolgraph(valid_dc.X)
+            test_bmg = graphdata_to_batchmolgraph(test_dc.X)
+            valid_bmg.to(device)
+            test_bmg.to(device)
+            valid_X_tensor = valid_bmg
+            test_X_tensor = test_bmg
+        else:
+            # Convert numpy data to PyTorch tensors (DeepChem .X are typically numpy arrays)
+            valid_X_tensor = torch.from_numpy(valid_dc.X).float().to(device)
+            test_X_tensor = torch.from_numpy(test_dc.X).float().to(device)
 
         # Get predictions for the validation set
         with torch.no_grad():
@@ -1621,22 +1810,37 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
 
         return uq_metrics, cutoff_error_df
     else:
-        dc_model = dc.models.TorchModel(
-            model=model,
-            loss=loss,
-            # The output types match the return structure of DenseNormalGamma:
-            output_types=['prediction', 'loss', 'var1', 'var2'],
-            batch_size=128,
-            learning_rate=1e-4,
-            # wandb=True,  # Set to True
-            # model_dir='deep-evidential-regression-run-{}'.format(run_id),
-            log_frequency=40,
-            mode='classification'
-        )
+        if encoder_type == "dmpnn":
+            dc_model = UnifiedTorchModel(
+                model=model,
+                loss=loss,
+                # The output types match the return structure of DenseNormalGamma:
+                output_types=['prediction', 'loss', 'var1', 'var2'],
+                batch_size=128,
+                learning_rate=1e-4,
+                # wandb=True,  # Set to True
+                # model_dir='deep-evidential-regression-run-{}'.format(run_id),
+                log_frequency=1,
+                mode='classification',
+                encoder_type=encoder_type
+            )
+        else:
+            dc_model = dc.models.TorchModel(
+                model=model,
+                loss=loss,
+                # The output types match the return structure of DenseNormalGamma:
+                output_types=['prediction', 'loss', 'var1', 'var2'],
+                batch_size=128,
+                learning_rate=1e-4,
+                # wandb=True,  # Set to True
+                # model_dir='deep-evidential-regression-run-{}'.format(run_id),
+                log_frequency=1,
+                mode='classification'
+            )
 
         # --- 2. Train ---
         print(f"Training Deep Evidential Classification")
-        dc_model.fit(train_dc, nb_epoch=300, callbacks=[gradientClip])
+        dc_model.fit(train_dc, nb_epoch=30, callbacks=[gradientClip])
         
         # Save model if requested
         if save_model:
@@ -1648,9 +1852,21 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
             )
         device = next(dc_model.model.parameters()).device
 
-        # Convert numpy data to PyTorch tensors (DeepChem .X are typically numpy arrays)
-        valid_X_tensor = torch.from_numpy(valid_dc.X).float().to(device)
-        test_X_tensor = torch.from_numpy(test_dc.X).float().to(device)
+        # Convert data to appropriate format
+        # For graph data, we need to convert GraphData to BatchMolGraph
+        # For vector data, convert numpy arrays to tensors
+        if encoder_type == "dmpnn":
+            from nn import graphdata_to_batchmolgraph
+            valid_bmg = graphdata_to_batchmolgraph(valid_dc.X)
+            test_bmg = graphdata_to_batchmolgraph(test_dc.X)
+            valid_bmg.to(device)
+            test_bmg.to(device)
+            valid_X_tensor = valid_bmg
+            test_X_tensor = test_bmg
+        else:
+            # Convert numpy data to PyTorch tensors (DeepChem .X are typically numpy arrays)
+            valid_X_tensor = torch.from_numpy(valid_dc.X).float().to(device)
+            test_X_tensor = torch.from_numpy(test_dc.X).float().to(device)
 
         # Get predictions for the validation set
         with torch.no_grad():
@@ -1701,33 +1917,57 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
         return uq_metrics, cutoff_error_df
     
 
-def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regression", save_model=False, save_path="./saved_models"):
+def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, mode="regression", save_model=False, save_path="./saved_models", encoder_type="identity"):
     n_tasks = train_dc.y.shape[1]
-    n_features = train_dc.X.shape[1]
+    n_features = get_n_features(train_dc, encoder_type=encoder_type)
 
-    model = build_model("baseline", n_features, n_tasks, mode=mode)
+    model = build_model("baseline", n_features, n_tasks, mode=mode, encoder_type=encoder_type)
     if mode == "regression":
         loss = dc.models.losses.L2Loss()
 
-        dc_model = dc.models.TorchModel(
-            model=model,
-            loss=loss,
-            output_types=['prediction'],
-            batch_size=64,
-            learning_rate=1e-3,
-            mode='regression',
-        )
+        # Use UnifiedTorchModel only for graph data, regular TorchModel for vector data
+        if encoder_type == "dmpnn":
+            dc_model = UnifiedTorchModel(
+                model=model,
+                loss=loss,
+                output_types=['prediction'],
+                batch_size=64,
+                learning_rate=1e-3,
+                mode='regression',
+                encoder_type=encoder_type,
+            )
+        else:
+            dc_model = dc.models.TorchModel(
+                model=model,
+                loss=loss,
+                output_types=['prediction'],
+                batch_size=64,
+                learning_rate=1e-3,
+                mode='regression',
+            )
     else:
         loss = dc.models.losses.SigmoidCrossEntropy()
 
-        dc_model = dc.models.TorchModel(
-            model=model,
-            loss=loss,
-            output_types=['prediction'],
-            batch_size=64,
-            learning_rate=1e-3,
-            mode='classification',
-        )
+        # Use UnifiedTorchModel only for graph data, regular TorchModel for vector data
+        if encoder_type == "dmpnn":
+            dc_model = UnifiedTorchModel(
+                model=model,
+                loss=loss,
+                output_types=['prediction'],
+                batch_size=64,
+                learning_rate=1e-3,
+                mode='classification',
+                encoder_type=encoder_type,
+            )
+        else:
+            dc_model = dc.models.TorchModel(
+                model=model,
+                loss=loss,
+                output_types=['prediction'],
+                batch_size=64,
+                learning_rate=1e-3,
+                mode='classification',
+            )
 
     if mode == "regression":
         dc_model.fit(train_dc, nb_epoch=80)

@@ -59,37 +59,63 @@ def save_summary_to_csv(all_results, n_runs, out_path: str):
 def load_dataset(
     dataset_name: str = "delaney", 
     split: str = "random", 
-    task_indices: Optional[List[int]] = None
+    task_indices: Optional[List[int]] = None,
+    use_graph: bool = False
 ):
     """
     dataset_name: {"qm7", "qm8", "delaney", "lipo", "tox21"}
     task_indices: List of indices to keep. e.g., [0] for first task, 
                   [0, 2] for 1st and 3rd. If None, keeps ALL tasks.
+    use_graph: If True, use DMPNN graph featurizer instead of vector featurizer
     """
     # 1. Load Raw Data
+    # Create DMPNN featurizer if needed
+    if use_graph:
+        graph_featurizer = dc.feat.DMPNNFeaturizer()
+    
     if dataset_name == "qm7":
-        FEATURIZER = "coulomb"
-        tasks, datasets, transformers = dc.molnet.load_qm7(splitter=split)
+        FEATURIZER = "coulomb" if not use_graph else "dmpnn"
+        if use_graph:
+            tasks, datasets, transformers = dc.molnet.load_qm7(splitter=split, featurizer=graph_featurizer)
+        else:
+            tasks, datasets, transformers = dc.molnet.load_qm7(splitter=split)
     elif dataset_name == "qm8":
-        FEATURIZER = "coulomb"
-        tasks, datasets, transformers = dc.molnet.load_qm8(splitter=split)
+        FEATURIZER = "coulomb" if not use_graph else "dmpnn"
+        if use_graph:
+            tasks, datasets, transformers = dc.molnet.load_qm8(splitter=split, featurizer=graph_featurizer)
+        else:
+            tasks, datasets, transformers = dc.molnet.load_qm8(splitter=split)
     elif dataset_name == "delaney":
-        FEATURIZER = "ecfp"
-        tasks, datasets, transformers = dc.molnet.load_delaney(splitter=split)
+        FEATURIZER = "ecfp" if not use_graph else "dmpnn"
+        if use_graph:
+            tasks, datasets, transformers = dc.molnet.load_delaney(splitter=split, featurizer=graph_featurizer)
+        else:
+            tasks, datasets, transformers = dc.molnet.load_delaney(splitter=split)
     elif dataset_name == "lipo":
-        FEATURIZER = "ecfp"
-        tasks, datasets, transformers = dc.molnet.load_lipo(splitter=split)
+        FEATURIZER = "ecfp" if not use_graph else "dmpnn"
+        if use_graph:
+            tasks, datasets, transformers = dc.molnet.load_lipo(splitter=split, featurizer=graph_featurizer)
+        else:
+            tasks, datasets, transformers = dc.molnet.load_lipo(splitter=split)
     elif dataset_name == "tox21":
-        FEATURIZER = "ecfp"
-        tasks, datasets, transformers = dc.molnet.load_tox21(splitter=split)
+        FEATURIZER = "ecfp" if not use_graph else "dmpnn"
+        if use_graph:
+            tasks, datasets, transformers = dc.molnet.load_tox21(splitter=split, featurizer=graph_featurizer)
+        else:
+            tasks, datasets, transformers = dc.molnet.load_tox21(splitter=split)
     else:
         raise ValueError(f"Unknown dataset_name: {dataset_name}")
 
-    # 2. Flatten/Preprocess
-    train_dc, valid_dc, test_dc = prepare_datasets(
-        datasets,
-        featurizer_name=FEATURIZER
-    )
+    # 2. Flatten/Preprocess (only for vector featurizers)
+    if not use_graph:
+        train_dc, valid_dc, test_dc = prepare_datasets(
+            datasets,
+            featurizer_name=FEATURIZER
+        )
+    else:
+        # For graph featurizer, datasets already contain GraphData objects
+        # We'll handle conversion to BatchMolGraph during training
+        train_dc, valid_dc, test_dc = datasets
 
     # 3. Apply Task Mask (Slicing)
     if task_indices is not None:
@@ -1151,42 +1177,63 @@ def run_once_nn(dataset_name: str,
                 split: str = "random",
                 mode: str = "regression",
                 use_weights: bool = False,
-                task_indices: Optional[List[int]] = None): 
+                task_indices: Optional[List[int]] = None,
+                encoder_type: str = "identity",
+                use_graph: bool = False): 
     """
     One full run on a given dataset & featurizer with a fixed seed.
+    
+    Args:
+        dataset_name: Name of the dataset
+        seed: Random seed
+        run_id: Run identifier
+        split: Data split type ("random" or "scaffold")
+        mode: Task mode ("regression" or "classification")
+        use_weights: Whether to use class weights for classification
+        task_indices: Optional list of task indices to use
+        encoder_type: Type of encoder ("identity" or "dmpnn")
+        use_graph: If True, use DMPNN graph featurizer instead of vector featurizer
     """
     set_global_seed(seed)
 
     tasks, train_dc, valid_dc, test_dc, transformers = load_dataset(
         dataset_name=dataset_name,
         split=split,
-        task_indices=task_indices
+        task_indices=task_indices,
+        use_graph=use_graph
     )
 
     use_weights = False
     if dataset_name in ["tox21"]:
         use_weights = True
 
-    print(f"\n=== Run with seed={seed} on dataset={dataset_name}")
+    print(f"\n=== Run with seed={seed} on dataset={dataset_name}, use_graph={use_graph}, encoder_type={encoder_type}")
     results = {}
     all_cutoff_dfs = []
+    
+    # Determine encoder type based on data format (if not explicitly provided)
+    if encoder_type == "identity" and use_graph:
+        encoder_type = "dmpnn"
+    elif encoder_type == "dmpnn" and not use_graph:
+        raise ValueError("encoder_type='dmpnn' requires use_graph=True")
+    
     results["nn_evd"], cut_off_evd = train_evd_baseline(train_dc, valid_dc, test_dc,
-                                                        run_id=run_id, use_weights=use_weights, mode=mode)
+                                                        run_id=run_id, use_weights=use_weights, mode=mode, encoder_type=encoder_type)
 
     cut_off_evd['Method'] = "nn_evd"
     all_cutoff_dfs.append(cut_off_evd)
 
     if dataset_name not in ["qm8"]:
         results["nn_baseline"] = train_nn_baseline(train_dc, valid_dc, test_dc,
-                                                   run_id=run_id, use_weights=use_weights, mode=mode)
+                                                   run_id=run_id, use_weights=use_weights, mode=mode, encoder_type=encoder_type)
 
     results["nn_mc_dropout"], cut_off_dropout = train_nn_mc_dropout(train_dc, valid_dc, test_dc,
-                                                                    run_id=run_id, use_weights=use_weights, mode=mode)
+                                                                    run_id=run_id, use_weights=use_weights, mode=mode, encoder_type=encoder_type)
     cut_off_dropout['Method'] = "nn_mc_dropout"
     all_cutoff_dfs.append(cut_off_dropout)
 
     results["nn_deep_ensemble"], cut_off_ensemble = train_nn_deep_ensemble(train_dc, valid_dc, test_dc,
-                                                                           run_id=run_id, use_weights=use_weights, mode=mode)
+                                                                           run_id=run_id, use_weights=use_weights, mode=mode, encoder_type=encoder_type)
     cut_off_ensemble['Method'] = "nn_deep_ensemble"
     all_cutoff_dfs.append(cut_off_ensemble)
 
@@ -1229,7 +1276,9 @@ def main_nn(dataset_name: str = "delaney",
             base_seed: int = 0,
             mode: str = "regression",
             use_weights: bool = False,
-            task_indices: Optional[List[int]] = None): 
+            task_indices: Optional[List[int]] = None,
+            encoder_type: str = "identity",
+            use_graph: bool = False): 
 
     if task_indices is None:
         global_task_suffix = ""
@@ -1243,7 +1292,8 @@ def main_nn(dataset_name: str = "delaney",
         
         # Run the model
         run_res = run_once_nn(dataset_name=dataset_name, seed=seed, run_id=run_idx,
-                            split=split, mode=mode, use_weights=use_weights, task_indices=task_indices)
+                            split=split, mode=mode, use_weights=use_weights, task_indices=task_indices,
+                            encoder_type=encoder_type, use_graph=use_graph)
         
         for method, uq_dict in run_res.items():
             # Check if output is multitask (array) or single task (scalar)
@@ -1703,7 +1753,16 @@ if __name__ == "__main__":
                         choices=["regression", "classification"])
     parser.add_argument("--tasks", type=int, nargs='+', default=None,
                     help="List of task indices to use (e.g., --tasks 0 2)")
+    parser.add_argument("--encoder_type", type=str, default="identity",
+                        choices=["identity", "dmpnn"],
+                        help="Type of encoder: 'identity' for vector features, 'dmpnn' for graph features")
+    parser.add_argument("--use_graph", action="store_true",
+                        help="Use DMPNN graph featurizer instead of vector featurizer (sets encoder_type='dmpnn')")
     args = parser.parse_args()
+    
+    # If --use_graph is specified, override encoder_type
+    if args.use_graph:
+        args.encoder_type = "dmpnn"
 
     # main_gp_all(dataset_name=args.dataset,
     #             n_runs=args.n_runs,
@@ -1719,4 +1778,6 @@ if __name__ == "__main__":
             base_seed=args.base_seed,
             mode = args.mode,
             use_weights = (args.mode == "classification"),
-            task_indices=args.tasks)
+            task_indices=args.tasks,
+            encoder_type=args.encoder_type,
+            use_graph=args.use_graph)
