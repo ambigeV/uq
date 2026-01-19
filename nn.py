@@ -690,3 +690,25 @@ class UnifiedTorchModel(TorchModel):
         
         # Return BatchMolGraph (not wrapped in list, as model.forward expects it directly)
         return batch_molgraph, labels_tensors, weights_tensors
+    
+    def _compute_model_outputs(self, outputs, output_types):
+        """
+        Override to ensure MC dropout classification outputs are passed correctly.
+        
+        For MC dropout classification, the model returns a single tensor (B, 2*n_tasks),
+        but DeepChem's default behavior with output_types=['prediction'] might extract
+        only the first n_tasks elements. We override to pass the full tensor.
+        """
+        # For MC dropout classification, we need to pass the full output tensor
+        # Check if model is UnifiedModel with mc_dropout and classification
+        if hasattr(self.model, 'model_type') and hasattr(self.model, 'classification'):
+            if self.model.model_type == "mc_dropout" and self.model.classification:
+                # For MC dropout classification, return the full output as-is
+                # Don't let DeepChem extract/reshape it
+                if isinstance(outputs, torch.Tensor):
+                    # If it's a single tensor, wrap it in a list to match expected format
+                    # but ensure DeepChem doesn't extract from it
+                    return [outputs]
+        
+        # For all other cases, use parent's default behavior
+        return super(UnifiedTorchModel, self)._compute_model_outputs(outputs, output_types)

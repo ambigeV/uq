@@ -1288,8 +1288,31 @@ class MCDropoutRegressorRefined:
         torch_model = self.dc_model.model
         torch_model.train()  # Force Dropout ON
 
-        # Convert data to Tensor
-        X_b = torch.from_numpy(dataset.X).float().to(self.dc_model.device)
+        # Convert data to appropriate format (handle both vector and graph data)
+        X = dataset.X
+        # Check if it's graph data (object dtype or encoder_type="dmpnn")
+        is_graph_data = False
+        if hasattr(self.dc_model, 'encoder_type') and self.dc_model.encoder_type == "dmpnn":
+            is_graph_data = True
+        elif isinstance(X, np.ndarray) and X.dtype == np.object_:
+            is_graph_data = True
+        elif isinstance(X, (list, tuple)) and len(X) > 0:
+            from deepchem.feat import GraphData
+            if isinstance(X[0], GraphData):
+                is_graph_data = True
+        
+        if is_graph_data:
+            # Convert GraphData to BatchMolGraph
+            from nn import graphdata_to_batchmolgraph
+            if isinstance(X, np.ndarray) and X.dtype == np.object_:
+                X = X.tolist()
+            X_b = graphdata_to_batchmolgraph(X)
+            X_b = X_b.to(self.dc_model.device)
+        else:
+            # Convert vector data to Tensor
+            if not isinstance(X, np.ndarray):
+                X = np.asarray(X)
+            X_b = torch.from_numpy(X).float().to(self.dc_model.device)
 
         sampled_means = []
         sampled_vars = []
@@ -1374,19 +1397,46 @@ class MCDropoutClassifierWrapper:
     @torch.no_grad()
     def predict_uncertainty(self, dataset):
         X = dataset.X
-        if not isinstance(X, np.ndarray):
-            X = np.asarray(X)
-
+        
+        # Check if it's graph data (object dtype or encoder_type="dmpnn")
+        is_graph_data = False
+        if hasattr(self.dc_model, 'encoder_type') and self.dc_model.encoder_type == "dmpnn":
+            is_graph_data = True
+        elif isinstance(X, np.ndarray) and X.dtype == np.object_:
+            is_graph_data = True
+        elif isinstance(X, (list, tuple)) and len(X) > 0:
+            from deepchem.feat import GraphData
+            if isinstance(X[0], GraphData):
+                is_graph_data = True
+        
         model = self.dc_model.model
         device = next(model.parameters()).device
-        X_tensor = torch.from_numpy(X).float().to(device)
+        
+        if is_graph_data:
+            # Convert GraphData to BatchMolGraph
+            from nn import graphdata_to_batchmolgraph
+            if isinstance(X, np.ndarray) and X.dtype == np.object_:
+                X = X.tolist()
+            X_tensor = graphdata_to_batchmolgraph(X)
+            X_tensor = X_tensor.to(device)
+        else:
+            # Convert vector data to Tensor
+            if not isinstance(X, np.ndarray):
+                X = np.asarray(X)
+            X_tensor = torch.from_numpy(X).float().to(device)
 
         _enable_dropout_only(model)
 
         # --- 1. DETECT MODE (Single vs Multi-Task) ---
         # We peek at the output shape to decide between Softmax and Sigmoid
         with torch.no_grad():
-            dummy_out = model(X_tensor[:2])
+            # For graph data, use first 2 graphs; for vector data, use first 2 samples
+            if is_graph_data:
+                dummy_X = X[:2] if isinstance(X, list) else (X.tolist()[:2] if isinstance(X, np.ndarray) else X[:2])
+                dummy_input = graphdata_to_batchmolgraph(dummy_X).to(device)
+            else:
+                dummy_input = X_tensor[:2]
+            dummy_out = model(dummy_input)
             raw_dim = dummy_out.shape[-1]
             # Assuming model outputs [means, log_vars], so we divide by 2
             C = raw_dim // 2 
