@@ -840,12 +840,13 @@ class UnifiedModel(nn.Module):
                 
                 return mu, torch.cat([mu, v, alpha, beta], dim=-1), aleatoric, epistemic
         
-        # Baseline: return probs for classification (sigmoid applied) to match original MyTorchClassifier
-        # SigmoidCrossEntropy expects probs as input
+        # Baseline: return (probs, logits) tuple for classification
+        # probs: for inference/evaluation (predict, evaluate)
+        # logits: for training loss (SigmoidCrossEntropy expects logits)
         if self.classification and self.model_type == "baseline":
             logits = output
             probs = torch.sigmoid(logits)
-            return probs
+            return probs, logits
         
         return output
 
@@ -1002,40 +1003,27 @@ class DeepEnsembleRegressor:
 class DeepEnsembleClassifier:
     """
     Ensemble wrapper for Multitask Binary Classification.
-    Assumes base models output RAW LOGITS of shape (N_Samples, N_Tasks).
+    Assumes base models output (probs, logits) tuple with output_types=['prediction', 'loss'].
     """
     def __init__(self, models):
         self.models = models
 
-    def predict_raw(self, dataset):
-        """
-        Returns stacked raw LOGITS from base models.
-        Shape: (M_Models, N_Samples, N_Tasks)
-        """
-        preds = []
-        for m in self.models:
-            # Assumes m.predict returns (N, T) logits directly
-            out = m.predict(dataset)
-            preds.append(out)
-        return np.stack(preds, axis=0)
-
     def predict_proba(self, dataset):
         """
-        Applies Sigmoid to logits to get Probabilities.
+        Returns probabilities directly from model predictions (no sigmoid needed).
         Returns:
           p_mean:    (N, T) -> Mean probability (Ensemble Prediction)
           p_members: (M, N, T) -> Probabilities per model
         """
-        logits = self.predict_raw(dataset) # (M, N, T)
+        preds = []
+        for m in self.models:
+            # m.predict() returns probs (from 'prediction' output_type)
+            out = m.predict(dataset)
+            preds.append(out)
+        p_members = np.stack(preds, axis=0)  # (M, N, T)
         
-        # Stability clipping to prevent overflow in exp
-        logits = np.clip(logits, -50, 50)
-        
-        # Apply Sigmoid (Logic is correct: Logits -> Probs)
-        p_members = 1.0 / (1.0 + np.exp(-logits))
-        
-        # Average the PROBABILITIES, not the logits
-        p_mean = p_members.mean(axis=0) # (N, T)
+        # Average the PROBABILITIES
+        p_mean = p_members.mean(axis=0)  # (N, T)
         return p_mean, p_members
 
     def predict_uncertainty(self, dataset, eps=1e-10):
@@ -1143,7 +1131,7 @@ def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0, use_weigh
             dc_model = UnifiedTorchModel(
                 model=model,
                 loss=loss,
-                output_types=['prediction'],
+                output_types=['prediction', 'loss'],  # prediction=probs, loss=logits
                 batch_size=64,
                 learning_rate=1e-3,
                 mode=mode,
@@ -1895,7 +1883,7 @@ def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, 
         dc_model = UnifiedTorchModel(
             model=model,
             loss=loss,
-            output_types=['prediction'],
+            output_types=['prediction', 'loss'],  # prediction=probs, loss=logits
             batch_size=64,
             learning_rate=1e-3,
             mode='classification',
