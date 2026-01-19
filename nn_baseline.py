@@ -814,10 +814,12 @@ class UnifiedModel(nn.Module):
                 prob_safe = prob + 1e-8
                 aleatoric = -torch.sum(prob * torch.log(prob_safe), dim=2, keepdim=True)
                 
-                prob = prob.view(x.shape[0], -1)
+                # Get batch size from output tensor (works for both vector and graph data)
+                batch_size = output.shape[0]
+                prob = prob.view(batch_size, -1)
                 alpha = alpha
-                aleatoric = aleatoric.view(x.shape[0], -1)
-                epistemic = epistemic.view(x.shape[0], -1)
+                aleatoric = aleatoric.view(batch_size, -1)
+                epistemic = epistemic.view(batch_size, -1)
                 
                 return prob, alpha, aleatoric, epistemic
             else:
