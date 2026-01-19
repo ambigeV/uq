@@ -1243,15 +1243,18 @@ def run_once_nn(dataset_name: str,
     combined_cutoff_df = pd.concat(all_cutoff_dfs, ignore_index=True)
 
     # Define a consistent filename
-    # 1. Generate a suffix for the filename based on task_indices
+    # 1. Modify split name to include "_graph" if use_graph is True
+    split_name = f"{split}_graph" if use_graph else split
+    
+    # 2. Generate a suffix for the filename based on task_indices
     if task_indices is None:
         task_suffix = ""
     else:
         # e.g., turns [0, 2] into "_tasks_0_2"
         task_suffix = "_tasks_" + "_".join(map(str, task_indices))
 
-    # 2. Define the consistent filename with the suffix
-    output_filename = f"./cdata_{mode}/figure/{split}_{dataset_name}{task_suffix}_NN_cutoff_run_{run_id}.csv"
+    # 3. Define the consistent filename with the suffix
+    output_filename = f"./cdata_{mode}/figure/{split_name}_{dataset_name}{task_suffix}_NN_cutoff_run_{run_id}.csv"
 
     import os
     # 3. Create the directory if it does not exist
@@ -1322,6 +1325,9 @@ def main_nn(dataset_name: str = "delaney",
     output_dir = f"./cdata_{mode}"
     os.makedirs(output_dir, exist_ok=True)
 
+    # Modify split name to include "_graph" if use_graph is True
+    split_name = f"{split}_graph" if use_graph else split
+    
     for task_id, method_results in sorted(tasks_results_container.items()):
         
         # --- COMBINED SUFFIX LOGIC ---
@@ -1331,7 +1337,7 @@ def main_nn(dataset_name: str = "delaney",
         
         # Construct filename
         # Result: ./cdata_test/NN_random_chem_tasks_0_2_id_0_c.csv
-        csv_filename = f"{output_dir}/NN_{split}_{dataset_name}{final_suffix}_c.csv"
+        csv_filename = f"{output_dir}/NN_{split_name}_{dataset_name}{final_suffix}_c.csv"
 
         print(f"Saving Summary for TASK {task_id} to: {csv_filename}")
         

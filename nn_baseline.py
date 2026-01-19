@@ -485,12 +485,10 @@ class DenseDirichlet(nn.Module):
         # or keep them structured. DeepChem usually expects (Batch, N) outputs.
         # Let's flatten everything back to (Batch, N) to match typical API expectations.
         
-        # Use alpha.shape[0] for batch size (x might be BatchMolGraph for graph data if used with UnifiedModel)
-        batch_size = alpha.shape[0]
-        prob = prob.view(batch_size, -1)       # (Batch, 2*T)
+        prob = prob.view(x.shape[0], -1)       # (Batch, 2*T)
         alpha = alpha                          # (Batch, 2*T) - Already flat
-        aleatoric = aleatoric.view(batch_size, -1) # (Batch, T)
-        epistemic = epistemic.view(batch_size, -1) # (Batch, T)
+        aleatoric = aleatoric.view(x.shape[0], -1) # (Batch, T)
+        epistemic = epistemic.view(x.shape[0], -1) # (Batch, T)
 
         return prob, alpha, aleatoric, epistemic
 
@@ -792,7 +790,12 @@ class UnifiedModel(nn.Module):
             var = torch.exp(log_var)
             packed = raw
 
-            return mean, var, packed
+            # For classification, return packed (B, 2*T) directly for loss function
+            # For regression, return tuple for output_types=['prediction', 'variance', 'loss']
+            if self.classification:
+                return packed
+            else:
+                return mean, var, packed
         
         # Standard forward through FFN
         output = self.ffn(encoded)
@@ -811,12 +814,10 @@ class UnifiedModel(nn.Module):
                 prob_safe = prob + 1e-8
                 aleatoric = -torch.sum(prob * torch.log(prob_safe), dim=2, keepdim=True)
                 
-                # Use output.shape[0] for batch size (x might be BatchMolGraph for graph data)
-                batch_size = output.shape[0]
-                prob = prob.view(batch_size, -1)
+                prob = prob.view(x.shape[0], -1)
                 alpha = alpha
-                aleatoric = aleatoric.view(batch_size, -1)
-                epistemic = epistemic.view(batch_size, -1)
+                aleatoric = aleatoric.view(x.shape[0], -1)
+                epistemic = epistemic.view(x.shape[0], -1)
                 
                 return prob, alpha, aleatoric, epistemic
             else:
@@ -1125,47 +1126,27 @@ def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0, use_weigh
         if mode == "regression":
             loss = dc.models.losses.L2Loss()
 
-            if encoder_type == "dmpnn":
-                dc_model = UnifiedTorchModel(
-                    model=model,
-                    loss=loss,
-                    output_types=['prediction'],
-                    batch_size=64,
-                    learning_rate=1e-3,
-                    mode=mode,
-                    encoder_type=encoder_type,
-                )
-            else:
-                dc_model = dc.models.TorchModel(
-                    model=model,
-                    loss=loss,
-                    output_types=['prediction'],
-                    batch_size=64,
-                    learning_rate=1e-3,
-                    mode=mode,
-                )
+            dc_model = UnifiedTorchModel(
+                model=model,
+                loss=loss,
+                output_types=['prediction'],
+                batch_size=64,
+                learning_rate=1e-3,
+                mode=mode,
+                encoder_type=encoder_type,
+            )
         
         else:
             loss = dc.models.losses.SigmoidCrossEntropy()
-            if encoder_type == "dmpnn":
-                dc_model = UnifiedTorchModel(
-                    model=model,
-                    loss=loss,
-                    output_types=['prediction'],
-                    batch_size=64,
-                    learning_rate=1e-3,
-                    mode=mode,
-                    encoder_type=encoder_type,
-                )
-            else:
-                dc_model = dc.models.TorchModel(
-                    model=model,
-                    loss=loss,
-                    output_types=['prediction'],
-                    batch_size=64,
-                    learning_rate=1e-3,
-                    mode=mode,
-                )
+            dc_model = UnifiedTorchModel(
+                model=model,
+                loss=loss,
+                output_types=['prediction'],
+                batch_size=64,
+                learning_rate=1e-3,
+                mode=mode,
+                encoder_type=encoder_type,
+            )
 
         dc_model.fit(train_dc, nb_epoch=50)
         models.append(dc_model)
@@ -1701,37 +1682,23 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
     gradientClip = GradientClippingCallback()
 
     if mode == "regression":
-        if encoder_type == "dmpnn":
-            dc_model = UnifiedTorchModel(
-                model=model,
-                loss=loss,
-                # The output types match the return structure of DenseNormalGamma:
-                output_types=['prediction', 'loss', 'var1', 'var2'],
-                batch_size=128,
-                learning_rate=1e-4,
-                # wandb=True,  # Set to True
-                # model_dir='deep-evidential-regression-run-{}'.format(run_id),
-                log_frequency=40,
-                mode='regression',
-                encoder_type=encoder_type
-            )
-        else:
-            dc_model = dc.models.TorchModel(
-                model=model,
-                loss=loss,
-                # The output types match the return structure of DenseNormalGamma:
-                output_types=['prediction', 'loss', 'var1', 'var2'],
-                batch_size=128,
-                learning_rate=1e-4,
-                # wandb=True,  # Set to True
-                # model_dir='deep-evidential-regression-run-{}'.format(run_id),
-                log_frequency=40,
-                mode='regression'
-            )
+        dc_model = UnifiedTorchModel(
+            model=model,
+            loss=loss,
+            # The output types match the return structure of DenseNormalGamma:
+            output_types=['prediction', 'loss', 'var1', 'var2'],
+            batch_size=128,
+            learning_rate=1e-4,
+            # wandb=True,  # Set to True
+            # model_dir='deep-evidential-regression-run-{}'.format(run_id),
+            log_frequency=40,
+            mode='regression',
+            encoder_type=encoder_type
+        )
 
         # --- 2. Train ---
         print(f"Training Deep Evidential Regression with lambda (reg_coeff) = {reg_coeff}")
-        dc_model.fit(train_dc, nb_epoch=30, callbacks=[gradientClip])
+        dc_model.fit(train_dc, nb_epoch=300, callbacks=[gradientClip])
         
         # Save model if requested
         if save_model:
@@ -1810,37 +1777,23 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
 
         return uq_metrics, cutoff_error_df
     else:
-        if encoder_type == "dmpnn":
-            dc_model = UnifiedTorchModel(
-                model=model,
-                loss=loss,
-                # The output types match the return structure of DenseNormalGamma:
-                output_types=['prediction', 'loss', 'var1', 'var2'],
-                batch_size=128,
-                learning_rate=1e-4,
-                # wandb=True,  # Set to True
-                # model_dir='deep-evidential-regression-run-{}'.format(run_id),
-                log_frequency=1,
-                mode='classification',
-                encoder_type=encoder_type
-            )
-        else:
-            dc_model = dc.models.TorchModel(
-                model=model,
-                loss=loss,
-                # The output types match the return structure of DenseNormalGamma:
-                output_types=['prediction', 'loss', 'var1', 'var2'],
-                batch_size=128,
-                learning_rate=1e-4,
-                # wandb=True,  # Set to True
-                # model_dir='deep-evidential-regression-run-{}'.format(run_id),
-                log_frequency=1,
-                mode='classification'
-            )
+        dc_model = UnifiedTorchModel(
+            model=model,
+            loss=loss,
+            # The output types match the return structure of DenseNormalGamma:
+            output_types=['prediction', 'loss', 'var1', 'var2'],
+            batch_size=128,
+            learning_rate=1e-4,
+            # wandb=True,  # Set to True
+            # model_dir='deep-evidential-regression-run-{}'.format(run_id),
+            log_frequency=40,
+            mode='classification',
+            encoder_type=encoder_type
+        )
 
         # --- 2. Train ---
         print(f"Training Deep Evidential Classification")
-        dc_model.fit(train_dc, nb_epoch=30, callbacks=[gradientClip])
+        dc_model.fit(train_dc, nb_epoch=300, callbacks=[gradientClip])
         
         # Save model if requested
         if save_model:
@@ -1925,49 +1878,27 @@ def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, 
     if mode == "regression":
         loss = dc.models.losses.L2Loss()
 
-        # Use UnifiedTorchModel only for graph data, regular TorchModel for vector data
-        if encoder_type == "dmpnn":
-            dc_model = UnifiedTorchModel(
-                model=model,
-                loss=loss,
-                output_types=['prediction'],
-                batch_size=64,
-                learning_rate=1e-3,
-                mode='regression',
-                encoder_type=encoder_type,
-            )
-        else:
-            dc_model = dc.models.TorchModel(
-                model=model,
-                loss=loss,
-                output_types=['prediction'],
-                batch_size=64,
-                learning_rate=1e-3,
-                mode='regression',
-            )
+        dc_model = UnifiedTorchModel(
+            model=model,
+            loss=loss,
+            output_types=['prediction'],
+            batch_size=64,
+            learning_rate=1e-3,
+            mode='regression',
+            encoder_type=encoder_type,
+        )
     else:
         loss = dc.models.losses.SigmoidCrossEntropy()
 
-        # Use UnifiedTorchModel only for graph data, regular TorchModel for vector data
-        if encoder_type == "dmpnn":
-            dc_model = UnifiedTorchModel(
-                model=model,
-                loss=loss,
-                output_types=['prediction'],
-                batch_size=64,
-                learning_rate=1e-3,
-                mode='classification',
-                encoder_type=encoder_type,
-            )
-        else:
-            dc_model = dc.models.TorchModel(
-                model=model,
-                loss=loss,
-                output_types=['prediction'],
-                batch_size=64,
-                learning_rate=1e-3,
-                mode='classification',
-            )
+        dc_model = UnifiedTorchModel(
+            model=model,
+            loss=loss,
+            output_types=['prediction'],
+            batch_size=64,
+            learning_rate=1e-3,
+            mode='classification',
+            encoder_type=encoder_type,
+        )
 
     if mode == "regression":
         dc_model.fit(train_dc, nb_epoch=80)
