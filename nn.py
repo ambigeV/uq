@@ -597,11 +597,17 @@ class UnifiedTorchModel(TorchModel):
         Returns:
             Generator yielding tuples of (inputs, outputs, weights)
         """
+        # if self.encoder_type == "identity":
+        #     # Use parent's default generator for vector data
+        #     return super(UnifiedTorchModel, self).default_generator(
+        #         dataset, epochs, mode, deterministic, pad_batches, **kwargs
+        #     )
         if self.encoder_type == "identity":
-            # Use parent's default generator for vector data
-            return super(UnifiedTorchModel, self).default_generator(
+            yield from super(UnifiedTorchModel, self).default_generator(
                 dataset, epochs, mode, deterministic, pad_batches, **kwargs
             )
+            return
+
         
         # encoder_type == "dmpnn": Handle graph data
         for epoch in range(epochs):

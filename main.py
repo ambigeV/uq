@@ -4,7 +4,6 @@ import deepchem as dc
 from data_utils import prepare_datasets, evaluate_uq_metrics_from_interval, \
     compute_ece, calculate_cutoff_classification_data, evaluate_uq_metrics_classification
 from nn_baseline import train_nn_baseline, train_nn_deep_ensemble, train_nn_mc_dropout, train_evd_baseline, \
-    evaluate_nn_baseline, evaluate_nn_evd, evaluate_nn_mc_dropout, evaluate_nn_deep_ensemble, \
     MyTorchRegressor, MyTorchClassifier, MyTorchRegressorMC, MyTorchClassifierHeteroscedastic, \
     DenseNormalGamma, DenseDirichlet
 from model_utils import load_neural_network_model, load_neural_network_ensemble
