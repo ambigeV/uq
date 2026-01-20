@@ -1578,7 +1578,7 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, 
             )
 
     # ----- Train -----
-    dc_model.fit(train_dc, nb_epoch=100)
+    dc_model.fit(train_dc, nb_epoch=50)
 
     # Save model if requested
     if save_model:
@@ -1850,7 +1850,7 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
 
         # --- 2. Train ---
         print(f"Training Deep Evidential Classification")
-        dc_model.fit(train_dc, nb_epoch=300, callbacks=[gradientClip])
+        dc_model.fit(train_dc, nb_epoch=50, callbacks=[gradientClip])
 
         # Save model if requested
         if save_model:
