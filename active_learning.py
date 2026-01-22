@@ -616,6 +616,14 @@ def train_nn_baseline_active_learning(
     n_tasks = initial_train_dc.y.shape[1] if initial_train_dc.y.ndim > 1 else 1
     n_features = get_n_features(initial_train_dc, encoder_type=encoder_type)
     
+    # Set epochs based on encoder type
+    if encoder_type == "dmpnn":
+        initial_epochs = 50
+        fine_tune_epochs = 30
+    else:
+        initial_epochs = 100
+        fine_tune_epochs = 50
+    
     # Build and train initial model
     model = build_model("baseline", n_features, n_tasks, mode=mode, encoder_type=encoder_type)
     
@@ -642,9 +650,9 @@ def train_nn_baseline_active_learning(
             encoder_type=encoder_type,
         )
     
-    # Initial training (50 epochs)
-    print(f"[AL nn_baseline] Initial training with {len(initial_train_dc)} samples")
-    dc_model.fit(initial_train_dc, nb_epoch=50)
+    # Initial training
+    print(f"[AL nn_baseline] Initial training with {len(initial_train_dc)} samples ({initial_epochs} epochs)")
+    dc_model.fit(initial_train_dc, nb_epoch=initial_epochs)
     
     # Evaluate step 0
     current_train_dc = initial_train_dc
@@ -671,9 +679,9 @@ def train_nn_baseline_active_learning(
         # Update training set
         current_train_dc = combine_datasets(current_train_dc, queried_dc)
         
-        # Fine-tune model (30 epochs)
-        print(f"[AL nn_baseline] Fine-tuning with {len(current_train_dc)} samples")
-        dc_model.fit(current_train_dc, nb_epoch=20)
+        # Fine-tune model
+        print(f"[AL nn_baseline] Fine-tuning with {len(current_train_dc)} samples ({fine_tune_epochs} epochs)")
+        dc_model.fit(current_train_dc, nb_epoch=fine_tune_epochs)
         
         # Evaluate
         step_metrics = evaluate_model_on_test(dc_model, test_dc, "nn_baseline", mode, use_weights, encoder_type)
@@ -699,6 +707,14 @@ def train_nn_deep_ensemble_active_learning(
     """Active learning for nn_deep_ensemble method."""
     n_tasks = initial_train_dc.y.shape[1] if initial_train_dc.y.ndim > 1 else 1
     n_features = get_n_features(initial_train_dc, encoder_type=encoder_type)
+    
+    # Set epochs based on encoder type
+    if encoder_type == "dmpnn":
+        initial_epochs = 50
+        fine_tune_epochs = 30
+    else:
+        initial_epochs = 100
+        fine_tune_epochs = 50
     
     # Build and train initial ensemble
     models = []
@@ -734,10 +750,10 @@ def train_nn_deep_ensemble_active_learning(
                 encoder_type=encoder_type,
             )
         
-        dc_model.fit(initial_train_dc, nb_epoch=50)
+        dc_model.fit(initial_train_dc, nb_epoch=initial_epochs)
         models.append(dc_model)
     
-    print(f"[AL nn_deep_ensemble] Initial training with {len(initial_train_dc)} samples")
+    print(f"[AL nn_deep_ensemble] Initial training with {len(initial_train_dc)} samples ({initial_epochs} epochs)")
     
     # Evaluate step 0
     current_train_dc = initial_train_dc
@@ -764,10 +780,10 @@ def train_nn_deep_ensemble_active_learning(
         # Update training set
         current_train_dc = combine_datasets(current_train_dc, queried_dc)
         
-        # Fine-tune all ensemble members (20 epochs each)
-        print(f"[AL nn_deep_ensemble] Fine-tuning with {len(current_train_dc)} samples")
+        # Fine-tune all ensemble members
+        print(f"[AL nn_deep_ensemble] Fine-tuning with {len(current_train_dc)} samples ({fine_tune_epochs} epochs each)")
         for model in models:
-            model.fit(current_train_dc, nb_epoch=20)
+            model.fit(current_train_dc, nb_epoch=fine_tune_epochs)
         
         # Evaluate
         step_metrics = evaluate_model_on_test(models, test_dc, "nn_deep_ensemble", mode, use_weights, encoder_type)
@@ -792,6 +808,14 @@ def train_nn_mc_dropout_active_learning(
     """Active learning for nn_mc_dropout method."""
     n_tasks = initial_train_dc.y.shape[1] if initial_train_dc.y.ndim > 1 else 1
     n_features = get_n_features(initial_train_dc, encoder_type=encoder_type)
+    
+    # Set epochs based on encoder type
+    if encoder_type == "dmpnn":
+        initial_epochs = 50
+        fine_tune_epochs = 30
+    else:
+        initial_epochs = 100
+        fine_tune_epochs = 50
     
     # Build and train initial model
     if mode == "regression":
@@ -847,8 +871,8 @@ def train_nn_mc_dropout_active_learning(
                 mode='classification'
             )
     
-    print(f"[AL nn_mc_dropout] Initial training with {len(initial_train_dc)} samples")
-    dc_model.fit(initial_train_dc, nb_epoch=50)
+    print(f"[AL nn_mc_dropout] Initial training with {len(initial_train_dc)} samples ({initial_epochs} epochs)")
+    dc_model.fit(initial_train_dc, nb_epoch=initial_epochs)
     
     # Evaluate step 0
     current_train_dc = initial_train_dc
@@ -875,9 +899,9 @@ def train_nn_mc_dropout_active_learning(
         # Update training set
         current_train_dc = combine_datasets(current_train_dc, queried_dc)
         
-        # Fine-tune model (30 epochs)
-        print(f"[AL nn_mc_dropout] Fine-tuning with {len(current_train_dc)} samples")
-        dc_model.fit(current_train_dc, nb_epoch=20)
+        # Fine-tune model
+        print(f"[AL nn_mc_dropout] Fine-tuning with {len(current_train_dc)} samples ({fine_tune_epochs} epochs)")
+        dc_model.fit(current_train_dc, nb_epoch=fine_tune_epochs)
         
         # Evaluate
         step_metrics = evaluate_model_on_test(dc_model, test_dc, "nn_mc_dropout", mode, use_weights, encoder_type)
@@ -904,6 +928,14 @@ def train_evd_baseline_active_learning(
     n_tasks = initial_train_dc.y.shape[1] if initial_train_dc.y.ndim > 1 else 1
     n_features = get_n_features(initial_train_dc, encoder_type=encoder_type)
     
+    # Set epochs based on encoder type
+    if encoder_type == "dmpnn":
+        initial_epochs = 50
+        fine_tune_epochs = 30
+    else:
+        initial_epochs = 100
+        fine_tune_epochs = 50
+    
     # Build and train initial model
     if mode == "regression":
         model = build_model("evidential", n_features, n_tasks, mode="regression", encoder_type=encoder_type)
@@ -925,8 +957,8 @@ def train_evd_baseline_active_learning(
         encoder_type=encoder_type
     )
     
-    print(f"[AL nn_evd] Initial training with {len(initial_train_dc)} samples")
-    dc_model.fit(initial_train_dc, nb_epoch=50, callbacks=[gradientClip])
+    print(f"[AL nn_evd] Initial training with {len(initial_train_dc)} samples ({initial_epochs} epochs)")
+    dc_model.fit(initial_train_dc, nb_epoch=initial_epochs, callbacks=[gradientClip])
     
     # Evaluate step 0
     current_train_dc = initial_train_dc
@@ -953,9 +985,9 @@ def train_evd_baseline_active_learning(
         # Update training set
         current_train_dc = combine_datasets(current_train_dc, queried_dc)
         
-        # Fine-tune model (30 epochs)
-        print(f"[AL nn_evd] Fine-tuning with {len(current_train_dc)} samples")
-        dc_model.fit(current_train_dc, nb_epoch=20, callbacks=[gradientClip])
+        # Fine-tune model
+        print(f"[AL nn_evd] Fine-tuning with {len(current_train_dc)} samples ({fine_tune_epochs} epochs)")
+        dc_model.fit(current_train_dc, nb_epoch=fine_tune_epochs, callbacks=[gradientClip])
         
         # Evaluate
         step_metrics = evaluate_model_on_test(dc_model, test_dc, "nn_evd", mode, use_weights, encoder_type)
