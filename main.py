@@ -1298,13 +1298,37 @@ def main_nn(dataset_name: str = "delaney",
             use_weights: bool = False,
             task_indices: Optional[List[int]] = None,
             encoder_type: str = "identity",
-            use_graph: bool = False): 
+            use_graph: bool = False,
+            active_learning: bool = False): 
 
     if task_indices is None:
         global_task_suffix = ""
     else:
         global_task_suffix = "_tasks_" + "_".join(map(str, task_indices))
 
+    # Check if active learning is enabled
+    if active_learning:
+        from active_learning import run_active_learning_nn
+        
+        for run_idx in range(n_runs):
+            seed = base_seed + run_idx
+            print(f"\n=== Active Learning Run {run_idx} ===")
+            run_active_learning_nn(
+                dataset_name=dataset_name,
+                seed=seed,
+                run_id=run_idx,
+                split=split,
+                mode=mode,
+                use_weights=use_weights,
+                task_indices=task_indices,
+                encoder_type=encoder_type,
+                use_graph=use_graph,
+                initial_ratio=0.2,
+                query_ratio=0.05,
+                n_steps=10
+            )
+        return
+    
     tasks_results_container = collections.defaultdict(dict)
 
     for run_idx in range(n_runs):
@@ -1641,6 +1665,8 @@ if __name__ == "__main__":
                         help="Type of encoder: 'identity' for vector features, 'dmpnn' for graph features")
     parser.add_argument("--use_graph", action="store_true",
                         help="Use DMPNN graph featurizer instead of vector featurizer (sets encoder_type='dmpnn')")
+    parser.add_argument("--al", action="store_true",
+                        help="Enable active learning mode")
     args = parser.parse_args()
     
     # If --use_graph is specified, override encoder_type
@@ -1663,4 +1689,5 @@ if __name__ == "__main__":
             use_weights = (args.mode == "classification"),
             task_indices=args.tasks,
             encoder_type=args.encoder_type,
-            use_graph=args.use_graph)
+            use_graph=args.use_graph,
+            active_learning=args.al)
