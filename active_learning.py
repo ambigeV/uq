@@ -1058,9 +1058,10 @@ def run_active_learning_nn(
             
             all_results[method] = step_results
             
-            # Save results to CSV
+            # Save results to CSV (with task splitting)
             save_active_learning_results(
-                method, step_results, dataset_name, mode, run_id, split, encoder_type, use_graph
+                method, step_results, dataset_name, mode, run_id, split, 
+                task_indices, encoder_type, use_graph
             )
             
         except Exception as e:
@@ -1079,23 +1080,88 @@ def save_active_learning_results(
     mode: str,
     run_id: int,
     split: str,
+    task_indices: Optional[List[int]] = None,
     encoder_type: str = "identity",
     use_graph: bool = False
 ):
-    """Save active learning results to CSV."""
+    """
+    Save active learning results to CSV, splitting multitask results per task.
+    Matches naming convention from main.py.
+    """
     import os
-    
-    # Create DataFrame from step results
-    df = pd.DataFrame(step_results)
     
     # Create output directory
     output_dir = f"./cdata_{mode}"
     os.makedirs(output_dir, exist_ok=True)
     
-    # Create filename
+    # Create split name
     split_name = f"{split}_graph" if use_graph else split
-    filename = f"{output_dir}/AL_{method_name}_{split_name}_{dataset_name}_run_{run_id}.csv"
     
-    # Save
-    df.to_csv(filename, index=False)
-    print(f"Saved results to {filename}")
+    # Create task suffix (matches main.py format)
+    if task_indices is None:
+        global_task_suffix = ""
+    else:
+        global_task_suffix = "_tasks_" + "_".join(map(str, task_indices))
+    
+    # Check if results are multitask by examining first step
+    if not step_results:
+        return
+    
+    first_step = step_results[0]
+    # Find first non-None value to check if multitask
+    first_val = None
+    for v in first_step.values():
+        if v is not None and v != "step" and v != "train_size":
+            first_val = v
+            break
+    
+    is_multitask = isinstance(first_val, (list, np.ndarray)) and np.size(first_val) > 1
+    
+    if not is_multitask:
+        # Single task: save one file with task_id=0 (matches main.py format)
+        df = pd.DataFrame(step_results)
+        
+        # Create filename matching main.py format: AL_{method}_{split}_{dataset}{task_suffix}_id_0_run_{run_id}.csv
+        # Always include _id_0 for single task (matches main.py behavior)
+        final_suffix = f"{global_task_suffix}_id_0"
+        filename = f"{output_dir}/AL_{method_name}_{split_name}_{dataset_name}{final_suffix}_run_{run_id}.csv"
+        
+        df.to_csv(filename, index=False)
+        print(f"Saved results to {filename}")
+    else:
+        # Multitask: split results per task and save separate files (matches main.py format)
+        n_tasks_detected = len(first_val)
+        
+        for t in range(n_tasks_detected):
+            # Map index t to real task ID (matches main.py logic)
+            if task_indices is not None and len(task_indices) > t:
+                real_task_id = task_indices[t]
+            else:
+                real_task_id = t
+            
+            # Extract per-task results
+            task_step_results = []
+            for step_dict in step_results:
+                task_dict = {}
+                for k, v in step_dict.items():
+                    if k in ["step", "train_size"]:
+                        task_dict[k] = v
+                    elif v is not None:
+                        # Extract value for this task
+                        if isinstance(v, (list, np.ndarray)) and len(v) > t:
+                            task_dict[k] = v[t]
+                        else:
+                            task_dict[k] = v
+                    else:
+                        task_dict[k] = v
+                task_step_results.append(task_dict)
+            
+            # Create DataFrame for this task
+            df = pd.DataFrame(task_step_results)
+            
+            # Create filename matching main.py format: AL_{method}_{split}_{dataset}{task_suffix}_id_{task_id}_run_{run_id}.csv
+            final_suffix = f"{global_task_suffix}_id_{real_task_id}"
+            filename = f"{output_dir}/AL_{method_name}_{split_name}_{dataset_name}{final_suffix}_run_{run_id}.csv"
+            
+            df.to_csv(filename, index=False)
+            print(f"Saved results for task {real_task_id} to {filename}")
