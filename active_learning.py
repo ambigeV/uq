@@ -1012,7 +1012,7 @@ def run_active_learning_nn(
     task_indices: Optional[List[int]] = None,
     encoder_type: str = "identity",
     use_graph: bool = False,
-    initial_ratio: float = 0.1,
+    initial_ratio: Optional[float] = None,
     query_ratio: float = 0.05,
     n_steps: int = 10
 ) -> Dict[str, List[Dict]]:
@@ -1034,10 +1034,21 @@ def run_active_learning_nn(
         use_graph=use_graph
     )
     
+    # Set initial ratio based on dataset
+    # clintox uses 0.2, all others use 0.1
+    if dataset_name == "clintox":
+        actual_initial_ratio = 0.2
+    else:
+        actual_initial_ratio = 0.1
+    
+    # Override with provided initial_ratio if explicitly set (for flexibility)
+    if initial_ratio is not None:
+        actual_initial_ratio = initial_ratio
+    
     # Create initial split (ignore validation dataset)
     initial_train_dc, pool_dc = create_stratified_initial_split(
         train_dc,
-        initial_ratio=initial_ratio,
+        initial_ratio=actual_initial_ratio,
         mode=mode,
         random_state=seed
     )

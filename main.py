@@ -1323,7 +1323,7 @@ def main_nn(dataset_name: str = "delaney",
                 task_indices=task_indices,
                 encoder_type=encoder_type,
                 use_graph=use_graph,
-                initial_ratio=0.2,
+                initial_ratio=None,  # Will be set conditionally in active_learning.py
                 query_ratio=0.05,
                 n_steps=10
             )
