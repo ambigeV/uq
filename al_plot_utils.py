@@ -10,7 +10,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
-import glob
 import argparse
 from typing import List, Optional
 
@@ -76,27 +75,28 @@ def load_active_learning_results(
     
     for method in methods:
         for task_id in task_ids:
-            # Pattern: AL_{method}_{split}_{dataset}_tasks_{task_ids}_id_{task_id}_run_{run_id}.csv
+            # Format filename directly like plot_utils.py
             final_suffix = f"{global_task_suffix}_id_{task_id}"
-            pattern = os.path.join(output_dir, f"AL_{method}_{split_name}_{dataset_name}{final_suffix}_run_*.csv")
-            files = glob.glob(pattern)
-            
-            if not files:
-                print(f"Warning: No files found for pattern: {pattern}")
-                continue
             
             # Load all runs for this method and task
             method_data = []
-            for file_path in files:
-                try:
-                    df = pd.read_csv(file_path)
-                    df['method'] = method
-                    df['task_id'] = task_id
-                    df['run_id'] = int(file_path.split('_run_')[-1].split('.')[0])
-                    method_data.append(df)
-                except Exception as e:
-                    print(f"Error loading {file_path}: {e}")
-                    continue
+            for run_id in range(n_runs):
+                # Directly format filename: AL_{method}_{split}_{dataset}_tasks_{task_ids}_id_{task_id}_run_{run_id}.csv
+                fname = f"AL_{method}_{split_name}_{dataset_name}{final_suffix}_run_{run_id}.csv"
+                fpath = os.path.join(output_dir, fname)
+                
+                if os.path.exists(fpath):
+                    try:
+                        df = pd.read_csv(fpath)
+                        df['method'] = method
+                        df['task_id'] = task_id
+                        df['run_id'] = run_id
+                        method_data.append(df)
+                    except Exception as e:
+                        print(f"Error loading {fpath}: {e}")
+                        continue
+                else:
+                    print(f"Warning: File not found: {fpath}")
             
             if method_data:
                 all_data.extend(method_data)
