@@ -66,17 +66,28 @@ def load_active_learning_results(
     
     all_data = []
     
-    # Determine task IDs to process
+    # Determine task IDs to process and filename construction
+    # Based on active_learning.py saving logic:
+    # - If task_indices is None: saves as _id_0 (single task, no task specified)
+    # - If task_indices = [2] (single specified task): saves as _tasks_2_id_0 (always id_0 for single tasks)
+    # - If task_indices = [0, 2] (multitask): saves as _tasks_0_2_id_0 and _tasks_0_2_id_2
     if task_indices is None:
-        # Single task: use id_0
+        # Single task (no task specified): use id_0
         task_ids = [0]
+        filename_suffixes = [("_id_0", 0)]
+    elif len(task_indices) == 1:
+        # Single task but specified (e.g., task_indices=[2]): use _tasks_2_id_0
+        # The actual task_id is from task_indices, but filename uses id_0
+        single_task_id = task_indices[0]
+        task_ids = [single_task_id]
+        filename_suffixes = [(f"{global_task_suffix}_id_0", single_task_id)]
     else:
+        # Multitask (e.g., task_indices=[0, 2]): use actual task IDs in filename
         task_ids = task_indices
+        filename_suffixes = [(f"{global_task_suffix}_id_{tid}", tid) for tid in task_indices]
     
     for method in methods:
-        for task_id in task_ids:
-            # Format filename directly like plot_utils.py
-            final_suffix = f"{global_task_suffix}_id_{task_id}"
+        for final_suffix, actual_task_id in filename_suffixes:
             
             # Load all runs for this method and task
             method_data = []
@@ -89,7 +100,7 @@ def load_active_learning_results(
                     try:
                         df = pd.read_csv(fpath)
                         df['method'] = method
-                        df['task_id'] = task_id
+                        df['task_id'] = actual_task_id  # Use actual task_id from task_indices, not filename
                         df['run_id'] = run_id
                         method_data.append(df)
                     except Exception as e:
@@ -179,6 +190,7 @@ def plot_active_learning_curves(
     split: str,
     mode: str = "classification",
     task_id: Optional[int] = None,
+    task_indices: Optional[List[int]] = None,
     output_dir: Optional[str] = None
 ):
     """
@@ -191,10 +203,12 @@ def plot_active_learning_curves(
         split: Split type for filename
         mode: "regression" or "classification"
         task_id: Optional task ID (for multitask)
-        output_dir: Output directory (default: ./cdata_{mode})
+        task_indices: Optional list of task indices (for filename construction)
+        output_dir: Output directory (default: ./cdata_{mode}/{dataset_name})
     """
     if output_dir is None:
-        output_dir = f"./cdata_{mode}"
+        # Create subdirectory based on dataset name
+        output_dir = f"./cdata_{mode}/{dataset_name}"
     os.makedirs(output_dir, exist_ok=True)
     
     # Filter by task_id if specified
@@ -302,8 +316,21 @@ def plot_active_learning_curves(
     
     # Save figure
     plt.tight_layout(rect=[0, 0, 1.0, 0.98])
-    task_str = f"_task_{task_id}" if task_id is not None else ""
-    output_file = os.path.join(output_dir, f"AL_Curves_{split}_{dataset_name}{task_str}.png")
+    
+    # Construct filename: {task_indices_str}_task_{task_id}.png
+    # Example: 0_3_task_0.png, 0_3_task_3.png, or just task_0.png for single task
+    if task_indices is not None and len(task_indices) > 1:
+        # Multitask: use task indices in filename (e.g., 0_3_task_0.png)
+        task_indices_str = "_".join(map(str, task_indices))
+        filename = f"{task_indices_str}_task_{task_id}.png"
+    elif task_indices is not None and len(task_indices) == 1:
+        # Single specified task: use task index (e.g., 2_task_2.png)
+        filename = f"{task_indices[0]}_task_{task_id}.png"
+    else:
+        # Single task (no task specified): just use task_0.png
+        filename = f"task_{task_id}.png" if task_id is not None else "task_0.png"
+    
+    output_file = os.path.join(output_dir, filename)
     plt.savefig(output_file, bbox_inches='tight', dpi=300)
     print(f"\nFigure saved to: {output_file}")
     plt.close(fig)
@@ -442,7 +469,8 @@ def plot_active_learning_results(
             dataset_name=dataset_name,
             split=split,
             mode=mode,
-            task_id=task_id
+            task_id=task_id,
+            task_indices=task_indices
         )
         
         print_active_learning_table(
