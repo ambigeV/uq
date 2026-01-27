@@ -136,14 +136,22 @@ def aggregate_active_learning_results(
     
     aggregated = []
     
-    for (method, step), group in df.groupby(group_cols):
+    # Handle unpacking based on whether task_id is in group_cols
+    for group_key, group in df.groupby(group_cols):
+        # Unpack group_key based on number of grouping columns
+        if len(group_cols) == 3:  # method, step, task_id
+            method, step, task_id = group_key
+        else:  # method, step
+            method, step = group_key
+            task_id = None
+        
         row = {
             'method': method,
             'step': step,
         }
         
-        if 'task_id' in group_cols:
-            row['task_id'] = group['task_id'].iloc[0]
+        if task_id is not None:
+            row['task_id'] = task_id
         
         # Get train_size (should be same across runs for same step)
         if 'train_size' in group.columns:
