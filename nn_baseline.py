@@ -855,6 +855,43 @@ class UnifiedModel(nn.Module):
 
         return output
 
+    def latent(self, x, V_d: Optional[torch.Tensor] = None, X_d: Optional[torch.Tensor] = None):
+        """
+        Produce the latent representation for inference without accumulating gradients.
+        - For identity encoder: returns the second-to-last layer (last hidden layer before
+          the classification/regression head).
+        - For DMPNN encoder: returns the output of the DMPNN encoder (graph embedding).
+        """
+        with torch.no_grad():
+            if self.encoder_type == "dmpnn":
+                if not isinstance(x, BatchMolGraph):
+                    try:
+                        from nn import graphdata_to_batchmolgraph
+                        if isinstance(x, (list, tuple)) and len(x) > 0:
+                            if hasattr(x[0], 'node_features') or hasattr(x[0], 'num_node_features'):
+                                x = graphdata_to_batchmolgraph(x)
+                            else:
+                                raise TypeError(
+                                    f"Expected BatchMolGraph or list of GraphData for encoder_type='dmpnn', got {type(x)}")
+                        else:
+                            raise TypeError(
+                                f"Expected BatchMolGraph or list of GraphData for encoder_type='dmpnn', got {type(x)}")
+                    except Exception as e:
+                        raise TypeError(
+                            f"Could not convert input to BatchMolGraph for encoder_type='dmpnn'. Got {type(x)}. Error: {e}")
+                h = self.encoder(x, V_d, X_d)
+                return h.detach()
+            else:
+                encoded = self.encoder(x)
+                if self.model_type == "mc_dropout":
+                    h = self.feature_net(encoded)
+                    return h.detach()
+                else:
+                    h = encoded
+                    for i in range(len(self.ffn) - 1):
+                        h = self.ffn[i](h)
+                    return h.detach()
+
 
 def build_model(
         model_type: str,
@@ -1494,20 +1531,20 @@ class MCDropoutClassifierWrapper:
 
         e = 1e-10
 
-        # --- 3. ENTROPY CALCULATION ---
-        # [FIX 2] Calculate entropy based on the mode
+        # --- 3. ENTROPY AND EPISTEMIC (MI) ---
         if activation_fn == "softmax":
-            # Categorical Entropy: -sum(p log p)
-            # Returns (N,) -> reshaped to (N, 1)
-            entropy = -np.sum(mean_prob * np.log(mean_prob + e), axis=1)
-            entropy = entropy.reshape(-1, 1)
+            H_total = -np.sum(mean_prob * np.log(mean_prob + e), axis=1)  # (N,)
+            H_total = H_total.reshape(-1, 1)
+            H_member = -np.sum(mc_probs * np.log(mc_probs + e), axis=2)  # (S, N)
+            H_aleatoric = H_member.mean(axis=0).reshape(-1, 1)
         else:
-            # Binary Entropy Per Task: -[p log p + (1-p) log (1-p)]
-            # Returns (N, T) -> One uncertainty value per task
-            entropy = -(mean_prob * np.log(mean_prob + e) +
-                        (1 - mean_prob) * np.log(1 - mean_prob + e))
-
-        return mean_prob, entropy
+            H_total = -(mean_prob * np.log(mean_prob + e) +
+                        (1 - mean_prob) * np.log(1 - mean_prob + e))  # (N, T)
+            H_member = -(mc_probs * np.log(mc_probs + e) +
+                         (1 - mc_probs) * np.log(1 - mc_probs + e))  # (S, N, T)
+            H_aleatoric = H_member.mean(axis=0)
+        MI = np.maximum(H_total - H_aleatoric, 0.0)
+        return mean_prob, H_total, H_aleatoric, MI
 
 
 def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, run_id=0, use_weights=False,
@@ -1632,13 +1669,13 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, 
 
     else:
         mc_wrapper = MCDropoutClassifierWrapper(dc_model, n_samples=n_samples)
-        mean_probs, entropy = mc_wrapper.predict_uncertainty(test_dc)
+        mean_probs, H_total, _, _ = mc_wrapper.predict_uncertainty(test_dc)
 
         # Binary AUC path (keeps your previous behavior)
         n_tasks = test_dc.y.shape[1]
         if n_tasks == 1 and mean_probs.shape[1] == 2:
             probs_positive = mean_probs[:, 1].reshape(-1, 1)  # Force (N, 1)
-            entropy = entropy.reshape(-1, 1)
+            H_total = H_total.reshape(-1, 1)
         else:
             probs_positive = mean_probs  # Already (N, T)
 
@@ -1650,7 +1687,7 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, 
             y_true=test_dc.y,
             probs=probs_positive,
             auc=test_auc,  # Pass the pre-calculated AUC
-            uncertainty=entropy,  # Pass the entropy (N, T)
+            uncertainty=H_total,  # Pass total entropy (N, T)
             weights=test_dc.w,
             use_weights=use_weights,
             n_bins=20

@@ -10,6 +10,7 @@ import deepchem as dc
 from typing import List, Optional, Tuple, Dict
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from sklearn.cluster import KMeans
 from scipy.stats import norm
 
 # Import functions from nn_baseline.py to maintain uniformity
@@ -260,9 +261,9 @@ def extract_uncertainty(
             return std
         else:
             ensemble = DeepEnsembleClassifier(model)
-            _, H_total, _, _ = ensemble.predict_uncertainty(dataset)
-            # H_total is (N, T) for multitask
-            return H_total
+            _, _, _, MI = ensemble.predict_uncertainty(dataset)
+            # Epistemic (MI) for classification AL
+            return MI
     
     elif method_name == "nn_mc_dropout":
         if mode == "regression":
@@ -274,11 +275,11 @@ def extract_uncertainty(
             return std
         else:
             mc_wrapper = MCDropoutClassifierWrapper(model, n_samples=50)
-            _, entropy = mc_wrapper.predict_uncertainty(dataset)
-            # entropy is (N, 1) or (N, T)
-            if entropy.ndim == 2 and entropy.shape[1] == 1:
-                entropy = entropy.squeeze(1)
-            return entropy
+            _, _, _, MI = mc_wrapper.predict_uncertainty(dataset)
+            # Epistemic (MI) for classification AL
+            if MI.ndim == 2 and MI.shape[1] == 1:
+                MI = MI.squeeze(1)
+            return MI
     
     elif method_name == "nn_evd":
         device = next(model.model.parameters()).device
@@ -345,7 +346,7 @@ def select_instances_by_uncertainty(
     # Ensure 1D
     uncertainty_scores = uncertainty_scores.flatten()
     
-    # Calculate number to query
+    # Number to query: same as pool-based fraction every time
     n_pool = len(pool_dc)
     n_query = max(1, int(n_pool * query_ratio))
     
@@ -353,6 +354,94 @@ def select_instances_by_uncertainty(
     top_indices = np.argsort(uncertainty_scores)[::-1][:n_query]
     
     return top_indices
+
+
+def extract_latent_vectors(
+    model_or_models,
+    pool_dc: dc.data.NumpyDataset,
+    method_name: str,
+    encoder_type: str = "identity"
+) -> np.ndarray:
+    """
+    Extract latent vectors for pool samples using UnifiedModel.latent (no gradients).
+    For ensemble (nn_deep_ensemble), uses the first model's latent.
+    
+    Returns:
+        latent_vectors: (N, D) numpy array
+    """
+    if method_name == "nn_deep_ensemble":
+        model = model_or_models[0]
+    else:
+        model = model_or_models
+    unified = model.model  # UnifiedModel
+    device = next(unified.parameters()).device
+
+    if encoder_type == "dmpnn":
+        from nn import graphdata_to_batchmolgraph
+        if isinstance(pool_dc.X, np.ndarray) and pool_dc.X.dtype == np.object_:
+            X_list = pool_dc.X.tolist()
+        else:
+            X_list = pool_dc.X
+        X_tensor = graphdata_to_batchmolgraph(X_list)
+        X_tensor = X_tensor.to(device)
+    else:
+        X_tensor = torch.from_numpy(pool_dc.X).float().to(device)
+
+    latent = unified.latent(X_tensor)
+    return latent.cpu().numpy()
+
+
+def select_instances_by_uncertainty_clustered(
+    uncertainty_scores: np.ndarray,
+    latent_vectors: Optional[np.ndarray],
+    n_query: int,
+    method_name: str = "nn_baseline"
+) -> np.ndarray:
+    """
+    Cluster candidates into n_query clusters by latent; in each cluster select one sample.
+    Used when use_cluster is set. n_query is the same as for non-clustered selection (from query_ratio).
+    
+    For nn_baseline we do not cluster: return n_query random indices (latent_vectors can be None).
+    For other methods we cluster by latent and pick the most uncertain sample in each cluster.
+    
+    Args:
+        uncertainty_scores: (N,) or (N, T) - used for pool size when nn_baseline; else for uncertainty
+        latent_vectors: (N, D) from UnifiedModel.latent, or None for nn_baseline
+        n_query: number of samples to select (from query_ratio)
+        method_name: "nn_baseline" -> random sample without clustering; else -> cluster + argmax uncertainty per cluster
+        
+    Returns:
+        Indices of selected instances
+    """
+    if method_name == "nn_baseline":
+        n_pool = np.asarray(uncertainty_scores).shape[0]
+        n_select = min(n_query, n_pool)
+        if n_select <= 0:
+            return np.array([], dtype=np.int64)
+        return np.random.choice(n_pool, size=n_select, replace=False).astype(np.int64)
+
+    if uncertainty_scores.ndim > 1:
+        uncertainty_scores = aggregate_multitask_uncertainty(uncertainty_scores, strategy="mean")
+    uncertainty_scores = np.asarray(uncertainty_scores).flatten()
+    n_pool = len(uncertainty_scores)
+    n_clusters = min(n_query, n_pool)
+
+    if n_clusters <= 0:
+        return np.array([], dtype=np.int64)
+    if n_clusters == 1:
+        return np.array([np.argmax(uncertainty_scores)], dtype=np.int64)
+
+    kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init=1, max_iter=50)
+    labels = kmeans.fit_predict(latent_vectors)
+    selected = []
+    for c in range(n_clusters):
+        mask = labels == c
+        if not np.any(mask):
+            continue
+        indices_in_c = np.where(mask)[0]
+        best_idx = indices_in_c[np.argmax(uncertainty_scores[indices_in_c])]
+        selected.append(best_idx)
+    return np.array(selected, dtype=np.int64)
 
 
 def query_instances(
@@ -496,12 +585,12 @@ def evaluate_model_on_test(
             return uq_metrics
         else:
             mc_wrapper = MCDropoutClassifierWrapper(model, n_samples=50)
-            mean_probs, entropy = mc_wrapper.predict_uncertainty(test_dc)
+            mean_probs, H_total, _, _ = mc_wrapper.predict_uncertainty(test_dc)
             
             n_tasks = test_dc.y.shape[1]
             if n_tasks == 1 and mean_probs.shape[1] == 2:
                 probs_positive = mean_probs[:, 1].reshape(-1, 1)
-                entropy = entropy.reshape(-1, 1)
+                H_total = H_total.reshape(-1, 1)
             else:
                 probs_positive = mean_probs
             
@@ -511,7 +600,7 @@ def evaluate_model_on_test(
                 y_true=test_dc.y,
                 probs=probs_positive,
                 auc=test_auc,
-                uncertainty=entropy,
+                uncertainty=H_total,
                 weights=test_dc.w,
                 use_weights=use_weights,
                 n_bins=20
@@ -602,6 +691,7 @@ def train_nn_baseline_active_learning(
     test_dc: dc.data.NumpyDataset,
     n_steps: int = 10,
     query_ratio: float = 0.05,
+    use_cluster: bool = False,
     run_id: int = 0,
     use_weights: bool = False,
     mode: str = "regression",
@@ -670,8 +760,12 @@ def train_nn_baseline_active_learning(
         # Extract uncertainty (baseline has minimal uncertainty, but we'll still query)
         uncertainty = extract_uncertainty(dc_model, pool_dc, "nn_baseline", mode, encoder_type)
         
-        # Select instances
-        selected_indices = select_instances_by_uncertainty(pool_dc, uncertainty, query_ratio)
+        # Select instances: when use_cluster, nn_baseline returns random indices (no cluster); else by uncertainty only
+        if use_cluster:
+            n_query = max(1, int(len(pool_dc) * query_ratio))
+            selected_indices = select_instances_by_uncertainty_clustered(uncertainty, None, n_query, method_name="nn_baseline")
+        else:
+            selected_indices = select_instances_by_uncertainty(pool_dc, uncertainty, query_ratio)
         
         # Query instances
         queried_dc, pool_dc = query_instances(pool_dc, selected_indices)
@@ -698,6 +792,7 @@ def train_nn_deep_ensemble_active_learning(
     test_dc: dc.data.NumpyDataset,
     n_steps: int = 10,
     query_ratio: float = 0.05,
+    use_cluster: bool = False,
     M: int = 5,
     run_id: int = 0,
     use_weights: bool = False,
@@ -771,8 +866,13 @@ def train_nn_deep_ensemble_active_learning(
         # Extract uncertainty
         uncertainty = extract_uncertainty(models, pool_dc, "nn_deep_ensemble", mode, encoder_type)
         
-        # Select instances
-        selected_indices = select_instances_by_uncertainty(pool_dc, uncertainty, query_ratio)
+        # Select instances: clustered by latent when use_cluster, else by uncertainty only
+        if use_cluster:
+            n_query = max(1, int(len(pool_dc) * query_ratio))
+            latent_vectors = extract_latent_vectors(models, pool_dc, "nn_deep_ensemble", encoder_type)
+            selected_indices = select_instances_by_uncertainty_clustered(uncertainty, latent_vectors, n_query, method_name="nn_deep_ensemble")
+        else:
+            selected_indices = select_instances_by_uncertainty(pool_dc, uncertainty, query_ratio)
         
         # Query instances
         queried_dc, pool_dc = query_instances(pool_dc, selected_indices)
@@ -800,6 +900,7 @@ def train_nn_mc_dropout_active_learning(
     test_dc: dc.data.NumpyDataset,
     n_steps: int = 10,
     query_ratio: float = 0.05,
+    use_cluster: bool = False,
     run_id: int = 0,
     use_weights: bool = False,
     mode: str = "regression",
@@ -890,8 +991,13 @@ def train_nn_mc_dropout_active_learning(
         # Extract uncertainty
         uncertainty = extract_uncertainty(dc_model, pool_dc, "nn_mc_dropout", mode, encoder_type)
         
-        # Select instances
-        selected_indices = select_instances_by_uncertainty(pool_dc, uncertainty, query_ratio)
+        # Select instances: clustered by latent when use_cluster, else by uncertainty only
+        if use_cluster:
+            n_query = max(1, int(len(pool_dc) * query_ratio))
+            latent_vectors = extract_latent_vectors(dc_model, pool_dc, "nn_mc_dropout", encoder_type)
+            selected_indices = select_instances_by_uncertainty_clustered(uncertainty, latent_vectors, n_query, method_name="nn_mc_dropout")
+        else:
+            selected_indices = select_instances_by_uncertainty(pool_dc, uncertainty, query_ratio)
         
         # Query instances
         queried_dc, pool_dc = query_instances(pool_dc, selected_indices)
@@ -918,6 +1024,7 @@ def train_evd_baseline_active_learning(
     test_dc: dc.data.NumpyDataset,
     n_steps: int = 10,
     query_ratio: float = 0.05,
+    use_cluster: bool = False,
     reg_coeff: float = 1.0,
     run_id: int = 0,
     use_weights: bool = False,
@@ -976,8 +1083,13 @@ def train_evd_baseline_active_learning(
         # Extract uncertainty
         uncertainty = extract_uncertainty(dc_model, pool_dc, "nn_evd", mode, encoder_type)
         
-        # Select instances
-        selected_indices = select_instances_by_uncertainty(pool_dc, uncertainty, query_ratio)
+        # Select instances: clustered by latent when use_cluster, else by uncertainty only
+        if use_cluster:
+            n_query = max(1, int(len(pool_dc) * query_ratio))
+            latent_vectors = extract_latent_vectors(dc_model, pool_dc, "nn_evd", encoder_type)
+            selected_indices = select_instances_by_uncertainty_clustered(uncertainty, latent_vectors, n_query, method_name="nn_evd")
+        else:
+            selected_indices = select_instances_by_uncertainty(pool_dc, uncertainty, query_ratio)
         
         # Query instances
         queried_dc, pool_dc = query_instances(pool_dc, selected_indices)
@@ -1014,6 +1126,7 @@ def run_active_learning_nn(
     use_graph: bool = False,
     initial_ratio: Optional[float] = None,
     query_ratio: float = 0.05,
+    use_cluster: bool = False,
     n_steps: int = 10
 ) -> Dict[str, List[Dict]]:
     """
@@ -1073,37 +1186,39 @@ def run_active_learning_nn(
             if method == "nn_baseline":
                 step_results = train_nn_baseline_active_learning(
                     initial_train_dc, copy_numpy_dataset(pool_dc), test_dc,
-                    n_steps=n_steps, query_ratio=query_ratio,
+                    n_steps=n_steps, query_ratio=query_ratio, use_cluster=use_cluster,
                     run_id=run_id, use_weights=use_weights,
                     mode=mode, encoder_type=encoder_type
                 )
             elif method == "nn_deep_ensemble":
                 step_results = train_nn_deep_ensemble_active_learning(
                     initial_train_dc, copy_numpy_dataset(pool_dc), test_dc,
-                    n_steps=n_steps, query_ratio=query_ratio,
+                    n_steps=n_steps, query_ratio=query_ratio, use_cluster=use_cluster,
                     M=5, run_id=run_id, use_weights=use_weights,
                     mode=mode, encoder_type=encoder_type
                 )
             elif method == "nn_mc_dropout":
                 step_results = train_nn_mc_dropout_active_learning(
                     initial_train_dc, copy_numpy_dataset(pool_dc), test_dc,
-                    n_steps=n_steps, query_ratio=query_ratio,
+                    n_steps=n_steps, query_ratio=query_ratio, use_cluster=use_cluster,
                     run_id=run_id, use_weights=use_weights,
                     mode=mode, encoder_type=encoder_type
                 )
             elif method == "nn_evd":
                 step_results = train_evd_baseline_active_learning(
                     initial_train_dc, copy_numpy_dataset(pool_dc), test_dc,
-                    n_steps=n_steps, query_ratio=query_ratio,
+                    n_steps=n_steps, query_ratio=query_ratio, use_cluster=use_cluster,
                     reg_coeff=1.0, run_id=run_id, use_weights=use_weights,
                     mode=mode, encoder_type=encoder_type
                 )
             
-            all_results[method] = step_results
+            # When use_cluster (al_batch), store under method_batch
+            storage_name = f"{method}_batch" if use_cluster else method
+            all_results[storage_name] = step_results
             
             # Save results to CSV (with task splitting)
             save_active_learning_results(
-                method, step_results, dataset_name, mode, run_id, split, 
+                storage_name, step_results, dataset_name, mode, run_id, split,
                 task_indices, encoder_type, use_graph
             )
             

@@ -1299,7 +1299,8 @@ def main_nn(dataset_name: str = "delaney",
             task_indices: Optional[List[int]] = None,
             encoder_type: str = "identity",
             use_graph: bool = False,
-            active_learning: bool = False): 
+            active_learning: bool = False,
+            use_cluster: bool = False): 
 
     if task_indices is None:
         global_task_suffix = ""
@@ -1325,6 +1326,7 @@ def main_nn(dataset_name: str = "delaney",
                 use_graph=use_graph,
                 initial_ratio=None,  # Will be set conditionally in active_learning.py
                 query_ratio=0.05,
+                use_cluster=use_cluster,
                 n_steps=10
             )
         return
@@ -1667,6 +1669,8 @@ if __name__ == "__main__":
                         help="Use DMPNN graph featurizer instead of vector featurizer (sets encoder_type='dmpnn')")
     parser.add_argument("--al", action="store_true",
                         help="Enable active learning mode")
+    parser.add_argument("--batch", action="store_true",
+                        help="Active learning: use cluster-based selection (latent + uncertainty; nn_baseline uses random per cluster)")
     args = parser.parse_args()
     
     # If --use_graph is specified, override encoder_type
@@ -1690,4 +1694,5 @@ if __name__ == "__main__":
             task_indices=args.tasks,
             encoder_type=args.encoder_type,
             use_graph=args.use_graph,
-            active_learning=args.al)
+            active_learning=args.al,
+            use_cluster=args.batch)
