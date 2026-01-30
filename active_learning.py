@@ -431,7 +431,7 @@ def select_instances_by_uncertainty_clustered(
     if n_clusters == 1:
         return np.array([np.argmax(uncertainty_scores)], dtype=np.int64)
 
-    kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init=1, max_iter=50)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init=5, max_iter=50)
     labels = kmeans.fit_predict(latent_vectors)
     selected = []
     for c in range(n_clusters):

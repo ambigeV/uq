@@ -1676,7 +1676,6 @@ if __name__ == "__main__":
     # If --use_graph is specified, override encoder_type
     if args.use_graph:
         args.encoder_type = "dmpnn"
-
     # main_gp_all(dataset_name=args.dataset,
     #             n_runs=args.n_runs,
     #             split=args.split,
