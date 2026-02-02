@@ -221,13 +221,18 @@ def plot_active_learning_curves(
     if task_id is not None and 'task_id' in df_agg.columns:
         df_agg = df_agg[df_agg['task_id'] == task_id].copy()
     
-    # Method mapping (same as plot_utils.py)
-    METHOD_MAP = {
+    # Method mapping (same as plot_utils.py). Base names only; _batch suffix is stripped for lookup.
+    _BASE_METHOD_MAP = {
         'nn_baseline': 'NN',
         'nn_mc_dropout': 'MC',
         'nn_deep_ensemble': 'Deep-Ens',
         'nn_evd': 'EVD',
+        'nn_conformal': 'Conformal',
     }
+
+    def _method_label(m: str) -> str:
+        base = m.replace('_batch', '', 1) if m.endswith('_batch') else m
+        return _BASE_METHOD_MAP.get(base, m)
     
     # Define metrics to plot based on mode
     if mode == "classification":
@@ -272,7 +277,7 @@ def plot_active_learning_curves(
     
     # Get unique methods and create color map
     methods = df_agg['method'].unique()
-    method_labels = [METHOD_MAP.get(m, m) for m in methods]
+    method_labels = [_method_label(m) for m in methods]
     n_methods = len(methods)
     palette = sns.color_palette("tab10", n_methods)
     color_map = {method: palette[i] for i, method in enumerate(methods)}
@@ -306,7 +311,7 @@ def plot_active_learning_curves(
             if len(steps) == 0:
                 continue
             
-            method_label = METHOD_MAP.get(method, method)
+            method_label = _method_label(method)
             ax.plot(steps, means, label=method_label, color=color_map[method], linewidth=2, marker='o')
             ax.fill_between(steps, means - stds, means + stds, alpha=0.2, color=color_map[method])
         
@@ -360,13 +365,18 @@ def print_active_learning_table(
     if task_id is not None and 'task_id' in df_agg.columns:
         df_agg = df_agg[df_agg['task_id'] == task_id].copy()
     
-    # Method mapping
-    METHOD_MAP = {
+    # Method mapping (base names; _batch suffix stripped for lookup)
+    _BASE_METHOD_MAP = {
         'nn_baseline': 'NN',
         'nn_mc_dropout': 'MC',
         'nn_deep_ensemble': 'Deep-Ens',
         'nn_evd': 'EVD',
+        'nn_conformal': 'Conformal',
     }
+
+    def _method_label(m: str) -> str:
+        base = m.replace('_batch', '', 1) if m.endswith('_batch') else m
+        return _BASE_METHOD_MAP.get(base, m)
     
     # Focus on AUC for classification
     metric = 'AUC'
@@ -390,7 +400,7 @@ def print_active_learning_table(
     # Print header
     header = f"{'Step':<8} {'Train Size':<12}"
     for method in methods:
-        method_label = METHOD_MAP.get(method, method)
+        method_label = _method_label(method)
         header += f" {method_label:<15}"
     print(header)
     print("-" * 80)
