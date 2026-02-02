@@ -320,6 +320,205 @@ def extract_uncertainty(
 
 
 # ============================================================
+
+# ============================================================
+# Conformal Prediction (nn_conformal) — binary classification only
+# ============================================================
+
+def _get_probs_from_model(model, dataset: dc.data.NumpyDataset, encoder_type: str = "identity") -> np.ndarray:
+    """Get predicted class-1 probabilities (N, T) from a baseline-style classifier."""
+    out = model.predict(dataset)
+    out = np.asarray(out)
+    if out.ndim == 1:
+        out = out.reshape(-1, 1)
+    return out
+
+
+def _standard_cp_quantile(scores: np.ndarray, q: float) -> float:
+    """Standard finite-sample conformal quantile: Q_hat = S_(k) with k = ceil((n+1)*q)."""
+    scores = np.asarray(scores).flatten()
+    n = len(scores)
+    if n == 0:
+        return np.nan
+    k = min(int(np.ceil((n + 1) * q)), n)
+    idx = max(0, k - 1)
+    return float(np.sort(scores)[idx])
+
+
+def get_conformal_thresholds(
+    model,
+    valid_data: dc.data.NumpyDataset,
+    alpha: float = 0.05,
+    encoder_type: str = "identity"
+) -> np.ndarray:
+    """Class-conditional conformal thresholds per task from validation set. Non-conformity = 1 - p_y (true class)."""
+    probs = _get_probs_from_model(model, valid_data, encoder_type)
+    y = np.asarray(valid_data.y)
+    if y.ndim == 1:
+        y = y.reshape(-1, 1)
+    n_tasks = probs.shape[1]
+    thresholds = np.zeros((n_tasks, 2))
+    q_level = 1.0 - alpha
+    for t in range(n_tasks):
+        y_t = y[:, t]
+        p1_t = probs[:, t]
+        scores_y0 = p1_t[y_t == 0]
+        scores_y1 = 1.0 - p1_t[y_t == 1]
+        thresholds[t, 0] = _standard_cp_quantile(scores_y0, q_level)
+        thresholds[t, 1] = _standard_cp_quantile(scores_y1, q_level)
+    return thresholds
+
+
+# Set-type codes for conformal prediction sets (per sample, per task)
+SET_EMPTY = 0      # prediction set = {}
+SET_SINGLETON_0 = 1   # prediction set = {0}
+SET_SINGLETON_1 = 2   # prediction set = {1}
+SET_BOTH = 3       # prediction set = {0, 1}
+
+
+def get_prediction_sets(
+    model,
+    dataset: dc.data.NumpyDataset,
+    thresholds: np.ndarray,
+    encoder_type: str = "identity"
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Conformal prediction sets per (sample, task). Returns exactly four set types per (n, t).
+
+    Set membership: include 0 if (1-p0) <= q_t0, include 1 if (1-p1) <= q_t1.
+
+    Returns:
+        n_uncertain: (N,) int — count of tasks where set is not a singleton (empty or {0,1}).
+        mean_nc: (N,) float — mean over tasks of min(p1, 1-p1); higher = more uncertain.
+        is_uncertain_nt: (N, T) bool — True where set is empty or {0,1}.
+        set_types: (N, T) int — for each (sample, task) one of:
+            SET_EMPTY = 0       -> {}
+            SET_SINGLETON_0 = 1 -> {0}
+            SET_SINGLETON_1 = 2 -> {1}
+            SET_BOTH = 3        -> {0, 1}
+    """
+    probs = _get_probs_from_model(model, dataset, encoder_type)
+    N, T = probs.shape
+    p1 = probs
+    q0 = thresholds[:, 0]
+    q1 = thresholds[:, 1]
+    in0 = (p1 <= q0[np.newaxis, :])   # include label 0
+    in1 = ((1.0 - p1) <= q1[np.newaxis, :])   # include label 1
+    # Encode exactly four types: 0=empty, 1={0}, 2={1}, 3={0,1}  ->  set_type = in0 + 2*in1
+    set_types = (in0.astype(np.int32) + 2 * in1.astype(np.int32))
+    is_uncertain_nt = (set_types == SET_EMPTY) | (set_types == SET_BOTH)
+    n_uncertain = np.sum(is_uncertain_nt, axis=1).astype(np.int64)
+    nc_per_task = np.minimum(p1, 1.0 - p1)
+    mean_nc = np.mean(nc_per_task, axis=1)
+    return n_uncertain, mean_nc, is_uncertain_nt, set_types
+
+
+def _pareto_front_indices(objectives: np.ndarray, maximize: bool = True) -> np.ndarray:
+    N, D = objectives.shape
+    if N == 0:
+        return np.array([], dtype=bool)
+    front = np.ones(N, dtype=bool)
+    for i in range(N):
+        if not front[i]:
+            continue
+        for j in range(N):
+            if i == j or not front[j]:
+                continue
+            if maximize:
+                dom = np.all(objectives[j] >= objectives[i]) and np.any(objectives[j] > objectives[i])
+            else:
+                dom = np.all(objectives[j] <= objectives[i]) and np.any(objectives[j] < objectives[i])
+            if dom:
+                front[i] = False
+                break
+    return front
+
+
+def _non_dominated_sort(objectives: np.ndarray, maximize: bool = True) -> List[np.ndarray]:
+    N = objectives.shape[0]
+    remaining = np.arange(N)
+    fronts = []
+    while len(remaining) > 0:
+        obj_rem = objectives[remaining]
+        front_mask = _pareto_front_indices(obj_rem, maximize=maximize)
+        front_indices = remaining[front_mask]
+        fronts.append(front_indices)
+        remaining = remaining[~front_mask]
+    return fronts
+
+
+def select_conformal_acquisition(
+    n_uncertain: np.ndarray,
+    mean_nc: np.ndarray,
+    is_uncertain_nt: np.ndarray,
+    n_query: int,
+    tie_break: str = "mean_nc",
+    random_state: Optional[int] = None
+) -> np.ndarray:
+    N = len(n_uncertain)
+    n_select = min(n_query, N)
+    if n_select <= 0:
+        return np.array([], dtype=np.int64)
+    rng = np.random.default_rng(random_state)
+    if tie_break == "mean_nc":
+        order = np.lexsort((-mean_nc, -n_uncertain))
+        return order[:n_select].astype(np.int64)
+    fronts = _non_dominated_sort(is_uncertain_nt.astype(np.float64), maximize=True)
+    selected = []
+    for front in fronts:
+        if len(selected) >= n_select:
+            break
+        need = n_select - len(selected)
+        if len(front) <= need:
+            selected.extend(front.tolist())
+        else:
+            chosen = rng.choice(front, size=need, replace=False)
+            selected.extend(chosen.tolist())
+    return np.array(selected[:n_select], dtype=np.int64)
+
+
+def select_instances_conformal(
+    model,
+    pool_dc: dc.data.NumpyDataset,
+    valid_dc: dc.data.NumpyDataset,
+    thresholds: Optional[np.ndarray],
+    n_query: int,
+    encoder_type: str = "identity",
+    tie_break: str = "mean_nc",
+    use_cluster: bool = False,
+    latent_vectors: Optional[np.ndarray] = None,
+    random_state: Optional[int] = None
+) -> np.ndarray:
+    if thresholds is None:
+        thresholds = get_conformal_thresholds(model, valid_dc, alpha=0.05, encoder_type=encoder_type)
+    n_uncertain, mean_nc, is_uncertain_nt, set_types = get_prediction_sets(model, pool_dc, thresholds, encoder_type)
+    if use_cluster and latent_vectors is not None:
+        n_pool = len(pool_dc)
+        n_clusters = min(n_query, n_pool)
+        if n_clusters <= 0:
+            return np.array([], dtype=np.int64)
+        if n_clusters == 1:
+            idx = select_conformal_acquisition(n_uncertain, mean_nc, is_uncertain_nt, 1, tie_break, random_state)
+            return idx
+        kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init=5, max_iter=50)
+        labels = kmeans.fit_predict(latent_vectors)
+        selected = []
+        for c in range(n_clusters):
+            mask = labels == c
+            if not np.any(mask):
+                continue
+            indices_in_c = np.where(mask)[0]
+            n_unc_c = n_uncertain[indices_in_c]
+            mean_nc_c = mean_nc[indices_in_c]
+            is_unc_c = is_uncertain_nt[indices_in_c]
+            best_local = select_conformal_acquisition(n_unc_c, mean_nc_c, is_unc_c, 1, tie_break, random_state)
+            global_idx = indices_in_c[best_local[0]]
+            selected.append(global_idx)
+        return np.array(selected, dtype=np.int64)
+    return select_conformal_acquisition(n_uncertain, mean_nc, is_uncertain_nt, n_query, tie_break, random_state)
+
+
+# ============================================================
 # Query Selection
 # ============================================================
 
@@ -676,6 +875,21 @@ def evaluate_model_on_test(
                 n_bins=20
             )
             return uq_metrics
+    
+    elif method_name == "nn_conformal":
+        if mode != "classification":
+            raise ValueError("nn_conformal is only supported for classification")
+        probs = _get_probs_from_model(model, test_dc, encoder_type)
+        probs_positive = probs.reshape(-1, 1) if probs.ndim == 1 else probs
+        test_auc = auc_from_probs(test_dc.y, probs_positive, test_dc.w, use_weights=use_weights)
+        return {
+            "AUC": test_auc,
+            "NLL": None,
+            "Brier": None,
+            "ECE": None,
+            "Avg_Entropy": None,
+            "Spearman_Err_Unc": None,
+        }
     
     else:
         raise ValueError(f"Unknown method: {method_name}")
@@ -1110,6 +1324,69 @@ def train_evd_baseline_active_learning(
     return step_results
 
 
+def train_conformal_active_learning(
+    initial_train_dc: dc.data.NumpyDataset,
+    pool_dc: dc.data.NumpyDataset,
+    valid_dc: dc.data.NumpyDataset,
+    test_dc: dc.data.NumpyDataset,
+    n_steps: int = 10,
+    query_ratio: float = 0.05,
+    use_cluster: bool = False,
+    tie_break: str = "mean_nc",
+    run_id: int = 0,
+    use_weights: bool = False,
+    encoder_type: str = "identity"
+) -> List[Dict]:
+    """Active learning for nn_conformal (binary classification only). Uses valid_dc for conformal calibration each step."""
+    n_tasks = initial_train_dc.y.shape[1] if initial_train_dc.y.ndim > 1 else 1
+    n_features = get_n_features(initial_train_dc, encoder_type=encoder_type)
+    if encoder_type == "dmpnn":
+        initial_epochs = 50
+        fine_tune_epochs = 30
+    else:
+        initial_epochs = 100
+        fine_tune_epochs = 50
+    model = build_model("baseline", n_features, n_tasks, mode="classification", encoder_type=encoder_type)
+    loss = dc.models.losses.SigmoidCrossEntropy()
+    dc_model = UnifiedTorchModel(
+        model=model,
+        loss=loss,
+        output_types=['prediction', 'loss'],
+        batch_size=64,
+        learning_rate=1e-3,
+        mode='classification',
+        encoder_type=encoder_type,
+    )
+    print(f"[AL nn_conformal] Initial training with {len(initial_train_dc)} samples ({initial_epochs} epochs)")
+    dc_model.fit(initial_train_dc, nb_epoch=initial_epochs)
+    current_train_dc = initial_train_dc
+    step_results = []
+    thresholds = None
+    step_0_metrics = evaluate_model_on_test(dc_model, test_dc, "nn_conformal", "classification", use_weights, encoder_type)
+    step_0_metrics["step"] = 0
+    step_0_metrics["train_size"] = len(current_train_dc)
+    step_results.append(step_0_metrics)
+    for step in range(1, n_steps + 1):
+        print(f"[AL nn_conformal] Step {step}/{n_steps}, Pool size: {len(pool_dc)}")
+        thresholds = get_conformal_thresholds(dc_model, valid_dc, alpha=0.05, encoder_type=encoder_type)
+        n_query = max(1, int(len(pool_dc) * query_ratio))
+        latent_vectors = extract_latent_vectors(dc_model, pool_dc, "nn_conformal", encoder_type) if use_cluster else None
+        selected_indices = select_instances_conformal(
+            dc_model, pool_dc, valid_dc, thresholds=thresholds, n_query=n_query,
+            encoder_type=encoder_type, tie_break=tie_break, use_cluster=use_cluster,
+            latent_vectors=latent_vectors, random_state=run_id + step,
+        )
+        queried_dc, pool_dc = query_instances(pool_dc, selected_indices)
+        current_train_dc = combine_datasets(current_train_dc, queried_dc)
+        print(f"[AL nn_conformal] Fine-tuning with {len(current_train_dc)} samples ({fine_tune_epochs} epochs)")
+        dc_model.fit(current_train_dc, nb_epoch=fine_tune_epochs)
+        step_metrics = evaluate_model_on_test(dc_model, test_dc, "nn_conformal", "classification", use_weights, encoder_type)
+        step_metrics["step"] = step
+        step_metrics["train_size"] = len(current_train_dc)
+        step_results.append(step_metrics)
+    return step_results
+
+
 # ============================================================
 # Main Active Learning Orchestrator
 # ============================================================
@@ -1127,7 +1404,8 @@ def run_active_learning_nn(
     initial_ratio: Optional[float] = None,
     query_ratio: float = 0.05,
     use_cluster: bool = False,
-    n_steps: int = 10
+    n_steps: int = 10,
+    conformal_tie_break: str = "mean_nc",
 ) -> Dict[str, List[Dict]]:
     """
     Main active learning orchestrator.
@@ -1175,9 +1453,11 @@ def run_active_learning_nn(
     if dataset_name in ["tox21", "toxcast", "sider", "clintox"]:
         use_weights = True
     
-    # Run active learning for each method
+    # Run active learning for each method (nn_conformal only when classification)
     all_results = {}
     methods = ["nn_baseline", "nn_deep_ensemble", "nn_mc_dropout", "nn_evd"]
+    if mode == "classification":
+        methods = methods + ["nn_conformal"]
     
     for method in methods:
         print(f"\n--- Running Active Learning for {method} ---")
@@ -1211,6 +1491,15 @@ def run_active_learning_nn(
                     reg_coeff=1.0, run_id=run_id, use_weights=use_weights,
                     mode=mode, encoder_type=encoder_type
                 )
+            elif method == "nn_conformal":
+                step_results = train_conformal_active_learning(
+                    initial_train_dc, copy_numpy_dataset(pool_dc), valid_dc, test_dc,
+                    n_steps=n_steps, query_ratio=query_ratio, use_cluster=use_cluster,
+                    tie_break=conformal_tie_break, run_id=run_id, use_weights=use_weights,
+                    encoder_type=encoder_type
+                )
+            else:
+                continue
             
             # When use_cluster (al_batch), store under method_batch
             storage_name = f"{method}_batch" if use_cluster else method
