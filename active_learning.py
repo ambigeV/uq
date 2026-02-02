@@ -1455,10 +1455,12 @@ def run_active_learning_nn(
     
     # Run active learning for each method (nn_conformal only when classification)
     all_results = {}
-    methods = ["nn_baseline", "nn_deep_ensemble", "nn_mc_dropout", "nn_evd"]
-    if mode == "classification":
-        methods = methods + ["nn_conformal"]
+    # methods = ["nn_baseline", "nn_deep_ensemble", "nn_mc_dropout", "nn_evd"]
+    # if mode == "classification":
+    #     methods = methods + ["nn_conformal"]
     
+    methods = ["nn_conformal"]
+
     for method in methods:
         print(f"\n--- Running Active Learning for {method} ---")
         

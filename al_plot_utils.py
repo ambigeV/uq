@@ -15,12 +15,13 @@ from typing import List, Optional
 
 # --- Configuration ---
 # Default values (can be overridden via command-line arguments)
-DATASETS = ['tox21']
-SPLITS = ['scaffold']
+DATASETS = ['clintox']
+SPLITS = ['random']
 MODE = 'classification'
 TASK_INDICES = [0, 1]  # None for single task, or list like [0, 1] for multitask
-ENCODER_TYPE = 'identity'
-USE_GRAPH = False
+ENCODER_TYPE = 'dmpnn'
+USE_GRAPH = True
+BATCH = True
 N_RUNS = 5
 
 
@@ -62,7 +63,7 @@ def load_active_learning_results(
         global_task_suffix = "_tasks_" + "_".join(map(str, task_indices))
     
     # Method names to look for
-    methods = ["nn_baseline", "nn_deep_ensemble", "nn_mc_dropout", "nn_evd"]
+    methods = ["nn_baseline", "nn_deep_ensemble", "nn_mc_dropout", "nn_evd", "nn_conformal"]
     
     all_data = []
     
@@ -87,19 +88,24 @@ def load_active_learning_results(
         filename_suffixes = [(f"{global_task_suffix}_id_{tid}", tid) for tid in task_indices]
     
     for method in methods:
+        if BATCH:
+            c_method = f"{method}_batch"
+        else:
+            c_method = method
+
         for final_suffix, actual_task_id in filename_suffixes:
             
             # Load all runs for this method and task
             method_data = []
             for run_id in range(n_runs):
                 # Directly format filename: AL_{method}_{split}_{dataset}_tasks_{task_ids}_id_{task_id}_run_{run_id}.csv
-                fname = f"AL_{method}_{split_name}_{dataset_name}{final_suffix}_run_{run_id}.csv"
+                fname = f"AL_{c_method}_{split_name}_{dataset_name}{final_suffix}_run_{run_id}.csv"
                 fpath = os.path.join(output_dir, fname)
                 
                 if os.path.exists(fpath):
                     try:
                         df = pd.read_csv(fpath)
-                        df['method'] = method
+                        df['method'] = c_method
                         df['task_id'] = actual_task_id  # Use actual task_id from task_indices, not filename
                         df['run_id'] = run_id
                         method_data.append(df)
@@ -317,18 +323,20 @@ def plot_active_learning_curves(
     # Save figure
     plt.tight_layout(rect=[0, 0, 1.0, 0.98])
     
+    task_name = "task_batch" if BATCH else "task"
+
     # Construct filename: {task_indices_str}_task_{task_id}.png
     # Example: 0_3_task_0.png, 0_3_task_3.png, or just task_0.png for single task
     if task_indices is not None and len(task_indices) > 1:
         # Multitask: use task indices in filename (e.g., 0_3_task_0.png)
         task_indices_str = "_".join(map(str, task_indices))
-        filename = f"{task_indices_str}_task_{task_id}.png"
+        filename = f"{task_indices_str}_{task_name}_{split}_{task_id}.png"
     elif task_indices is not None and len(task_indices) == 1:
         # Single specified task: use task index (e.g., 2_task_2.png)
-        filename = f"{task_indices[0]}_task_{task_id}.png"
+        filename = f"{task_indices[0]}_{task_name}_{split}_{task_id}.png"
     else:
         # Single task (no task specified): just use task_0.png
-        filename = f"task_{task_id}.png" if task_id is not None else "task_0.png"
+        filename = f"{task_name}_{split}_{task_id}.png" if task_id is not None else f"{task_name}_{split}_0.png"
     
     output_file = os.path.join(output_dir, filename)
     plt.savefig(output_file, bbox_inches='tight', dpi=300)
