@@ -6,7 +6,7 @@ import numpy as np
 
 # --- Configuration (Unchanged) ---
 # DATASETS = ["delaney", "lipo", 'qm7', 'qm8', 'tox21']
-DATASETS = ['tox21']
+DATASETS = ['toxcast', 'sider', 'tox21', 'clintox']
 DATA_DIR = "./cdata_classification"
 SPLIT = "scaffold"
 
@@ -18,7 +18,7 @@ import re
 # --- Configuration ---
 os.makedirs(DATA_DIR, exist_ok=True)
 
-DATASETS = ['tox21']
+DATASETS = ['toxcast', 'sider', 'tox21', 'clintox']
 SPLITS = [SPLIT]
 MODEL_TYPES = ['NN', 'GP']
 TARGET_IDS = [0, 3]  # K = 2
@@ -335,7 +335,8 @@ def process_average_task_plots():
 
                     avg_df = temp_combined.groupby(method_col, as_index=False).mean(numeric_only=True)
                     avg_df['Method_Name_Cleaned'] = avg_df[method_col].astype(str).apply(lambda x: METHOD_MAP.get(x, x))
-                    avg_df['Dataset'] = f"{dataset}_AVERAGE"
+                    task_indices_str = "_".join(map(str, TARGET_IDS))
+                    avg_df['Dataset'] = f"{dataset}_AVERAGE_tasks_{task_indices_str}"
                     all_models_avg.append(avg_df)
 
             if all_models_avg:
