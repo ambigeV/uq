@@ -25,7 +25,7 @@ import nn_baseline
 from data_utils import (
     evaluate_uq_metrics_from_interval, evaluate_uq_metrics_classification,
     calculate_cutoff_error_data, calculate_cutoff_classification_data,
-    auc_from_probs
+    auc_from_probs, compute_confusion_matrix_binary
 )
 import deepchem as dc
 import torch
@@ -702,7 +702,11 @@ def evaluate_model_on_test(
             test_results = model.evaluate(test_dc, [metric], use_sample_weights=use_weights, per_task_metrics=True)
             _, test_detailed = test_results
             test_auc = test_detailed[metric.name]
-            
+            probs = _get_probs_from_model(model, test_dc, encoder_type)
+            probs_positive = probs.reshape(-1, 1) if probs.ndim == 1 else probs
+            cm = compute_confusion_matrix_binary(
+                test_dc.y, probs_positive, weights=test_dc.w, use_weights=use_weights
+            )
             return {
                 "AUC": test_auc,
                 "NLL": None,
@@ -710,6 +714,7 @@ def evaluate_model_on_test(
                 "ECE": None,
                 "Avg_Entropy": None,
                 "Spearman_Err_Unc": None,
+                **cm,
             }
     
     elif method_name == "nn_deep_ensemble":
@@ -751,6 +756,10 @@ def evaluate_model_on_test(
                 use_weights=use_weights,
                 n_bins=20
             )
+            cm = compute_confusion_matrix_binary(
+                test_dc.y, probs_positive, weights=test_dc.w, use_weights=use_weights
+            )
+            uq_metrics.update(cm)
             return uq_metrics
     
     elif method_name == "nn_mc_dropout":
@@ -804,6 +813,10 @@ def evaluate_model_on_test(
                 use_weights=use_weights,
                 n_bins=20
             )
+            cm = compute_confusion_matrix_binary(
+                test_dc.y, probs_positive, weights=test_dc.w, use_weights=use_weights
+            )
+            uq_metrics.update(cm)
             return uq_metrics
     
     elif method_name == "nn_evd":
@@ -874,6 +887,10 @@ def evaluate_model_on_test(
                 use_weights=use_weights,
                 n_bins=20
             )
+            cm = compute_confusion_matrix_binary(
+                test_dc.y, mu_test, weights=test_dc.w, use_weights=use_weights
+            )
+            uq_metrics.update(cm)
             return uq_metrics
     
     elif method_name == "nn_conformal":
@@ -882,6 +899,9 @@ def evaluate_model_on_test(
         probs = _get_probs_from_model(model, test_dc, encoder_type)
         probs_positive = probs.reshape(-1, 1) if probs.ndim == 1 else probs
         test_auc = auc_from_probs(test_dc.y, probs_positive, test_dc.w, use_weights=use_weights)
+        cm = compute_confusion_matrix_binary(
+            test_dc.y, probs_positive, weights=test_dc.w, use_weights=use_weights
+        )
         return {
             "AUC": test_auc,
             "NLL": None,
@@ -889,6 +909,7 @@ def evaluate_model_on_test(
             "ECE": None,
             "Avg_Entropy": None,
             "Spearman_Err_Unc": None,
+            **cm,
         }
     
     else:

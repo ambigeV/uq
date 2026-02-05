@@ -8,7 +8,8 @@ from scipy.stats import norm
 import math
 from typing import Optional
 from data_utils import evaluate_uq_metrics_from_interval, evaluate_uq_metrics_classification, \
-    calculate_cutoff_error_data, calculate_cutoff_classification_data, roc_auc_score, auc_from_probs
+    calculate_cutoff_error_data, calculate_cutoff_classification_data, roc_auc_score, auc_from_probs, \
+    compute_confusion_matrix_binary
 from deepchem.models.losses import Loss, _make_pytorch_shapes_consistent
 from model_utils import save_neural_network_model
 # Import graph encoder components from nn.py
@@ -1256,6 +1257,10 @@ def train_nn_deep_ensemble(train_dc, valid_dc, test_dc, M=5, run_id=0, use_weigh
             use_weights=use_weights,
             n_bins=20
         )
+        cm = compute_confusion_matrix_binary(
+            test_dc.y, probs_positive, weights=test_dc.w, use_weights=use_weights
+        )
+        uq_metrics.update(cm)
 
         cutoff_error_df = calculate_cutoff_classification_data(
             probs_positive,
@@ -1692,6 +1697,10 @@ def train_nn_mc_dropout(train_dc, valid_dc, test_dc, n_samples=100, alpha=0.05, 
             use_weights=use_weights,
             n_bins=20
         )
+        cm = compute_confusion_matrix_binary(
+            test_dc.y, probs_positive, weights=test_dc.w, use_weights=use_weights
+        )
+        uq_metrics.update(cm)
 
         # 6. Calculate Cutoff Data (Internal loop handles DataFrame concatenation)
         cutoff_error_df = calculate_cutoff_classification_data(
@@ -1956,6 +1965,10 @@ def train_evd_baseline(train_dc, valid_dc, test_dc, reg_coeff=1, alpha=0.05, run
             use_weights=use_weights,
             n_bins=20
         )
+        cm = compute_confusion_matrix_binary(
+            test_dc.y, mu_test, weights=test_dc.w, use_weights=use_weights
+        )
+        uq_metrics.update(cm)
 
         print(f"\n[EVIDENTIAL CLASSIFIACTION] Test MSE: {test_auc}")
         print(f"[EVIDENTIAL CLASSIFIACTION] UQ Metrics: {uq_metrics}")
@@ -2122,16 +2135,26 @@ def train_nn_baseline(train_dc, valid_dc, test_dc, run_id=0, use_weights=False, 
             # Single-task: It is just a float
             print(f"[NN Baseline] Test {metric_name} (Task 0):   {task_scores_test:.4f}")
 
-        # 8. Return Dictionary
+        # 8. Confusion matrix from predicted probabilities
+        pred = dc_model.predict(test_dc)
+        pred = np.asarray(pred)
+        if pred.ndim == 1:
+            probs_positive = pred.reshape(-1, 1)
+        elif pred.shape[1] == 2:
+            probs_positive = pred[:, 1].reshape(-1, 1)
+        else:
+            probs_positive = pred
+        cm = compute_confusion_matrix_binary(
+            test_dc.y, probs_positive, weights=test_dc.w, use_weights=use_weights
+        )
+
+        # 9. Return Dictionary
         return {
-            # INVARIANT: Always returns a single float (mean over tasks).
-            # This keeps your main results table clean and crash-free.
-            # NEW: Stores the detailed scores (list or float) for deeper analysis.
             "AUC": task_scores_test,
-            # Placeholders for other metrics
             "NLL": None,
             "Brier": None,
             "ECE": None,
             "Avg_Entropy": None,
             "Spearman_Err_Unc": None,
+            **cm,
         }

@@ -47,6 +47,68 @@ def acc_from_probs(y_true, probs, weights=None, use_weights=False):
         return acc_list
 
 
+def compute_confusion_matrix_binary(
+    y_true,
+    probs,
+    weights=None,
+    use_weights=False,
+    threshold=0.5,
+):
+    """
+    Compute binary confusion matrix counts from true labels and predicted probabilities.
+
+    Uses threshold (default 0.5) to binarize probs. Returns counts as (tn, fp, fn, tp)
+    per task. With use_weights, counts are weighted sums.
+
+    - Single-task: returns dict with confusion_tn, confusion_fp, confusion_fn, confusion_tp (scalars).
+    - Multi-task: returns same keys with list of length n_tasks.
+    """
+    if y_true.ndim == 1:
+        y_true = y_true.reshape(-1, 1)
+    if probs.ndim == 1:
+        probs = probs.reshape(-1, 1)
+
+    n_tasks = y_true.shape[1]
+    if use_weights and weights is not None:
+        if weights.ndim == 1:
+            weights = weights.reshape(-1, 1)
+        if weights.shape != y_true.shape:
+            weights = np.ones_like(y_true)
+    else:
+        weights = np.ones_like(y_true)
+
+    tn_list, fp_list, fn_list, tp_list = [], [], [], []
+    for t in range(n_tasks):
+        y_t = np.asarray(y_true[:, t], dtype=float)
+        p_t = np.asarray(probs[:, t], dtype=float)
+        w_t = np.asarray(weights[:, t], dtype=float)
+        pred_t = (p_t >= threshold).astype(int)
+
+        tn = float(np.sum(w_t[(pred_t == 0) & (y_t == 0)]))
+        fp = float(np.sum(w_t[(pred_t == 1) & (y_t == 0)]))
+        fn = float(np.sum(w_t[(pred_t == 0) & (y_t == 1)]))
+        tp = float(np.sum(w_t[(pred_t == 1) & (y_t == 1)]))
+
+        tn_list.append(tn)
+        fp_list.append(fp)
+        fn_list.append(fn)
+        tp_list.append(tp)
+
+    if n_tasks == 1:
+        return {
+            "confusion_tn": tn_list[0],
+            "confusion_fp": fp_list[0],
+            "confusion_fn": fn_list[0],
+            "confusion_tp": tp_list[0],
+        }
+    return {
+        "confusion_tn": tn_list,
+        "confusion_fp": fp_list,
+        "confusion_fn": fn_list,
+        "confusion_tp": tp_list,
+    }
+
+
 def auc_from_probs(y_true, probs, weights=None, use_weights=False):
     """
     Calculates AUC.
