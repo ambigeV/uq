@@ -372,7 +372,7 @@ def _infer_from_features(
         output = model(batch_molgraph)
     else:
         x_t = torch.from_numpy(x).float().to(device)
-    output = model(x_t)
+        output = model(x_t)
     if not isinstance(output, tuple) or len(output) < 4:
         raise RuntimeError("Unexpected model output format for evidential classification.")
 
