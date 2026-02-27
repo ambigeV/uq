@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import inspect
 import os
 import pickle
 from pathlib import Path
@@ -231,6 +232,7 @@ def train_evidential_binary(
     lr: float = 1e-4,
     batch_size: int = 128,
     grad_clip: float = 5.0,
+    use_balancing_transformer: bool = False,
 ) -> UnifiedTorchModel:
     n_tasks = train_y.shape[1]
 
@@ -256,6 +258,30 @@ def train_evidential_binary(
     )
 
     train_ds = _to_dc_dataset(train_x, train_y, encoder_type=encoder_type)
+    if use_balancing_transformer:
+        balancer_cls = dc.trans.BalancingTransformer
+        balancer = None
+        sig = inspect.signature(balancer_cls.__init__)
+        has_dataset_kw = "dataset" in sig.parameters
+        has_transform_w_kw = "transform_w" in sig.parameters
+
+        # Try constructor variants across DeepChem versions.
+        try:
+            if has_dataset_kw and has_transform_w_kw:
+                balancer = balancer_cls(dataset=train_ds, transform_w=True)
+            elif has_dataset_kw:
+                balancer = balancer_cls(dataset=train_ds)
+            elif has_transform_w_kw:
+                balancer = balancer_cls(train_ds, transform_w=True)
+            else:
+                balancer = balancer_cls(train_ds)
+        except TypeError:
+            # Last-resort compatibility fallback.
+            balancer = balancer_cls(train_ds)
+
+        train_ds = balancer.transform(train_ds)
+        print("Applied BalancingTransformer to training dataset.")
+
     print(f"Training nn_baseline evidential classifier for {epochs} epochs...")
     dc_model.fit(train_ds, nb_epoch=epochs, callbacks=[clip_callback])
 
@@ -550,6 +576,11 @@ def main() -> None:
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--grad_clip", type=float, default=5.0)
+    parser.add_argument(
+        "--use_balancing_transformer",
+        action="store_true",
+        help="Apply DeepChem BalancingTransformer(transform_w=True) on training data only",
+    )
 
     parser.add_argument("--save_dir", type=str, default="saved_models")
     parser.add_argument("--model_name", type=str, default="bii_evidential_binary")
@@ -599,6 +630,7 @@ def main() -> None:
             lr=args.learning_rate,
             batch_size=args.batch_size,
             grad_clip=args.grad_clip,
+            use_balancing_transformer=args.use_balancing_transformer,
         )
 
         test_metrics = evaluate_classification_dc(
