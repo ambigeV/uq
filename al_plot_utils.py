@@ -184,6 +184,28 @@ def aggregate_active_learning_results(
                 else:
                     row[f"{metric}_mean"] = np.nan
                     row[f"{metric}_std"] = np.nan
+
+        # Derive classification metrics from confusion counts when available.
+        # This keeps plotting independent from whether F1/FPR were written directly to CSV.
+        conf_cols = ["confusion_tp", "confusion_fp", "confusion_fn", "confusion_tn"]
+        if all(c in group.columns for c in conf_cols):
+            tp = group["confusion_tp"].astype(float)
+            fp = group["confusion_fp"].astype(float)
+            fn = group["confusion_fn"].astype(float)
+            tn = group["confusion_tn"].astype(float)
+
+            # Per-run F1 = 2TP / (2TP + FP + FN)
+            f1_denom = (2.0 * tp + fp + fn).replace(0, np.nan)
+            f1_vals = (2.0 * tp) / f1_denom
+
+            # Per-run FPR = FP / (FP + TN)
+            fpr_denom = (fp + tn).replace(0, np.nan)
+            fpr_vals = fp / fpr_denom
+
+            row["F1_mean"] = f1_vals.mean(skipna=True)
+            row["F1_std"] = f1_vals.std(ddof=0, skipna=True)
+            row["FPR_mean"] = fpr_vals.mean(skipna=True)
+            row["FPR_std"] = fpr_vals.std(ddof=0, skipna=True)
         
         aggregated.append(row)
     
@@ -241,7 +263,8 @@ def plot_active_learning_curves(
             'Brier': 'Brier (Lower is Better)',
             'ECE': 'ECE (Lower is Better)',
             'NLL': 'NLL (Lower is Better)',
-            'Spearman_Err_Unc': 'Spearman Cor (Larger is Better)',
+            'F1': 'F1 Score (Larger is Better)',
+            'FPR': 'False Positive Rate (Lower is Better)',
         }
     else:
         METRICS_TO_PLOT = {
