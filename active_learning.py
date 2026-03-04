@@ -163,9 +163,64 @@ def create_stratified_initial_split(
             final_indices = set()
             for idx_set in selected_indices_list:
                 final_indices.update(idx_set)
-            final_indices = np.array(list(final_indices))
+            final_indices = np.array(sorted(list(final_indices)), dtype=np.int64)
         else:
-            final_indices = np.array(list(selected_indices_list[0]))
+            final_indices = np.array(sorted(list(selected_indices_list[0])), dtype=np.int64)
+
+        # If we have too many samples after union, trim while preserving per-task/per-class coverage
+        if len(final_indices) > n_initial and n_tasks > 1:
+            # Build per-(task, class) memberships
+            pair_to_indices = {}
+            for task_idx in range(n_tasks):
+                y_task = y[:, task_idx]
+                for cls in np.unique(y_task):
+                    pair_to_indices[(task_idx, cls)] = set(np.where(y_task == cls)[0].tolist())
+
+            selected_set = set(final_indices.tolist())
+            min_required = len(pair_to_indices)
+            if n_initial < min_required:
+                print(
+                    f"[WARN] n_initial={n_initial} is smaller than required "
+                    f"task-class coverage count={min_required}. Exact full coverage is impossible."
+                )
+
+            # Track which (task, class) each selected sample contributes to
+            idx_to_pairs = {}
+            for idx in selected_set:
+                memberships = []
+                for pair, indices in pair_to_indices.items():
+                    if idx in indices:
+                        memberships.append(pair)
+                idx_to_pairs[idx] = memberships
+
+            # Count selected samples for each (task, class)
+            pair_counts = {pair: 0 for pair in pair_to_indices.keys()}
+            for pairs in idx_to_pairs.values():
+                for pair in pairs:
+                    pair_counts[pair] += 1
+
+            # Remove only samples that are not the last representative in any (task, class)
+            while len(selected_set) > n_initial:
+                removable = []
+                for idx in sorted(selected_set, reverse=True):
+                    pairs = idx_to_pairs[idx]
+                    can_remove = True
+                    for pair in pairs:
+                        if pair_counts[pair] <= 1:
+                            can_remove = False
+                            break
+                    if can_remove:
+                        removable.append(idx)
+
+                if not removable:
+                    break
+
+                idx_to_remove = removable[0]  # deterministic: largest index first
+                selected_set.remove(idx_to_remove)
+                for pair in idx_to_pairs[idx_to_remove]:
+                    pair_counts[pair] -= 1
+
+            final_indices = np.array(sorted(selected_set), dtype=np.int64)
         
         # If we need more samples, add deterministically (sorted remaining indices)
         if len(final_indices) < n_initial:
@@ -175,8 +230,14 @@ def create_stratified_initial_split(
             additional = np.sort(remaining)[:min(n_needed, len(remaining))]
             final_indices = np.concatenate([final_indices, additional])
         
-        # Limit to n_initial deterministically (take first n_initial from sorted)
+        # Final size cap. For multitask this only triggers when full-coverage constraints
+        # and n_initial conflict, or for single-task deterministic truncation.
         if len(final_indices) > n_initial:
+            if n_tasks > 1:
+                print(
+                    f"[WARN] Truncating from {len(final_indices)} to {n_initial}; "
+                    f"this may relax full per-task class coverage when constraints are infeasible."
+                )
             final_indices = np.sort(final_indices)[:n_initial]
         
         selected_indices = np.sort(final_indices)  # Ensure sorted for determinism
@@ -525,7 +586,8 @@ def select_instances_conformal(
 def select_instances_by_uncertainty(
     pool_dc: dc.data.NumpyDataset,
     uncertainty_scores: np.ndarray,
-    query_ratio: float = 0.05
+    query_ratio: float = 0.05,
+    n_query: Optional[int] = None
 ) -> np.ndarray:
     """
     Select instances from pool based on uncertainty scores.
@@ -533,7 +595,8 @@ def select_instances_by_uncertainty(
     Args:
         pool_dc: Pool dataset
         uncertainty_scores: Uncertainty scores, shape (N,) or (N, T)
-        query_ratio: Fraction of pool to query (0.05 = 5%)
+        query_ratio: Fraction of pool to query when n_query is not provided
+        n_query: Fixed number of pool samples to query (overrides query_ratio)
         
     Returns:
         Indices of selected instances
@@ -545,9 +608,15 @@ def select_instances_by_uncertainty(
     # Ensure 1D
     uncertainty_scores = uncertainty_scores.flatten()
     
-    # Number to query: same as pool-based fraction every time
+    # Number to query: fixed n_query when provided, else pool-based fraction
     n_pool = len(pool_dc)
-    n_query = max(1, int(n_pool * query_ratio))
+    if n_query is None:
+        n_query = max(1, int(n_pool * query_ratio))
+    else:
+        n_query = max(0, int(n_query))
+    n_query = min(n_query, n_pool)
+    if n_query <= 0:
+        return np.array([], dtype=np.int64)
     
     # Select top-k most uncertain
     top_indices = np.argsort(uncertainty_scores)[::-1][:n_query]
@@ -987,6 +1056,7 @@ def train_nn_baseline_active_learning(
     step_0_metrics["step"] = 0
     step_0_metrics["train_size"] = len(current_train_dc)
     step_results.append(step_0_metrics)
+    fixed_query_size = max(1, int((len(initial_train_dc) + len(pool_dc)) * query_ratio))
     
     # Active learning loop
     for step in range(1, n_steps + 1):
@@ -996,11 +1066,11 @@ def train_nn_baseline_active_learning(
         uncertainty = extract_uncertainty(dc_model, pool_dc, "nn_baseline", mode, encoder_type)
         
         # Select instances: when use_cluster, nn_baseline returns random indices (no cluster); else by uncertainty only
+        n_query = min(fixed_query_size, len(pool_dc))
         if use_cluster:
-            n_query = max(1, int(len(pool_dc) * query_ratio))
             selected_indices = select_instances_by_uncertainty_clustered(uncertainty, None, n_query, method_name="nn_baseline")
         else:
-            selected_indices = select_instances_by_uncertainty(pool_dc, uncertainty, query_ratio)
+            selected_indices = select_instances_by_uncertainty(pool_dc, uncertainty, n_query=n_query)
         
         # Query instances
         queried_dc, pool_dc = query_instances(pool_dc, selected_indices)
@@ -1093,6 +1163,7 @@ def train_nn_deep_ensemble_active_learning(
     step_0_metrics["step"] = 0
     step_0_metrics["train_size"] = len(current_train_dc)
     step_results.append(step_0_metrics)
+    fixed_query_size = max(1, int((len(initial_train_dc) + len(pool_dc)) * query_ratio))
     
     # Active learning loop
     for step in range(1, n_steps + 1):
@@ -1102,12 +1173,12 @@ def train_nn_deep_ensemble_active_learning(
         uncertainty = extract_uncertainty(models, pool_dc, "nn_deep_ensemble", mode, encoder_type)
         
         # Select instances: clustered by latent when use_cluster, else by uncertainty only
+        n_query = min(fixed_query_size, len(pool_dc))
         if use_cluster:
-            n_query = max(1, int(len(pool_dc) * query_ratio))
             latent_vectors = extract_latent_vectors(models, pool_dc, "nn_deep_ensemble", encoder_type)
             selected_indices = select_instances_by_uncertainty_clustered(uncertainty, latent_vectors, n_query, method_name="nn_deep_ensemble")
         else:
-            selected_indices = select_instances_by_uncertainty(pool_dc, uncertainty, query_ratio)
+            selected_indices = select_instances_by_uncertainty(pool_dc, uncertainty, n_query=n_query)
         
         # Query instances
         queried_dc, pool_dc = query_instances(pool_dc, selected_indices)
@@ -1218,6 +1289,7 @@ def train_nn_mc_dropout_active_learning(
     step_0_metrics["step"] = 0
     step_0_metrics["train_size"] = len(current_train_dc)
     step_results.append(step_0_metrics)
+    fixed_query_size = max(1, int((len(initial_train_dc) + len(pool_dc)) * query_ratio))
     
     # Active learning loop
     for step in range(1, n_steps + 1):
@@ -1227,12 +1299,12 @@ def train_nn_mc_dropout_active_learning(
         uncertainty = extract_uncertainty(dc_model, pool_dc, "nn_mc_dropout", mode, encoder_type)
         
         # Select instances: clustered by latent when use_cluster, else by uncertainty only
+        n_query = min(fixed_query_size, len(pool_dc))
         if use_cluster:
-            n_query = max(1, int(len(pool_dc) * query_ratio))
             latent_vectors = extract_latent_vectors(dc_model, pool_dc, "nn_mc_dropout", encoder_type)
             selected_indices = select_instances_by_uncertainty_clustered(uncertainty, latent_vectors, n_query, method_name="nn_mc_dropout")
         else:
-            selected_indices = select_instances_by_uncertainty(pool_dc, uncertainty, query_ratio)
+            selected_indices = select_instances_by_uncertainty(pool_dc, uncertainty, n_query=n_query)
         
         # Query instances
         queried_dc, pool_dc = query_instances(pool_dc, selected_indices)
@@ -1310,6 +1382,7 @@ def train_evd_baseline_active_learning(
     step_0_metrics["step"] = 0
     step_0_metrics["train_size"] = len(current_train_dc)
     step_results.append(step_0_metrics)
+    fixed_query_size = max(1, int((len(initial_train_dc) + len(pool_dc)) * query_ratio))
     
     # Active learning loop
     for step in range(1, n_steps + 1):
@@ -1319,12 +1392,12 @@ def train_evd_baseline_active_learning(
         uncertainty = extract_uncertainty(dc_model, pool_dc, "nn_evd", mode, encoder_type)
         
         # Select instances: clustered by latent when use_cluster, else by uncertainty only
+        n_query = min(fixed_query_size, len(pool_dc))
         if use_cluster:
-            n_query = max(1, int(len(pool_dc) * query_ratio))
             latent_vectors = extract_latent_vectors(dc_model, pool_dc, "nn_evd", encoder_type)
             selected_indices = select_instances_by_uncertainty_clustered(uncertainty, latent_vectors, n_query, method_name="nn_evd")
         else:
-            selected_indices = select_instances_by_uncertainty(pool_dc, uncertainty, query_ratio)
+            selected_indices = select_instances_by_uncertainty(pool_dc, uncertainty, n_query=n_query)
         
         # Query instances
         queried_dc, pool_dc = query_instances(pool_dc, selected_indices)
@@ -1387,10 +1460,11 @@ def train_conformal_active_learning(
     step_0_metrics["step"] = 0
     step_0_metrics["train_size"] = len(current_train_dc)
     step_results.append(step_0_metrics)
+    fixed_query_size = max(1, int((len(initial_train_dc) + len(pool_dc)) * query_ratio))
     for step in range(1, n_steps + 1):
         print(f"[AL nn_conformal] Step {step}/{n_steps}, Pool size: {len(pool_dc)}")
         thresholds = get_conformal_thresholds(dc_model, valid_dc, alpha=0.05, encoder_type=encoder_type)
-        n_query = max(1, int(len(pool_dc) * query_ratio))
+        n_query = min(fixed_query_size, len(pool_dc))
         latent_vectors = extract_latent_vectors(dc_model, pool_dc, "nn_conformal", encoder_type) if use_cluster else None
         selected_indices = select_instances_conformal(
             dc_model, pool_dc, valid_dc, thresholds=thresholds, n_query=n_query,
@@ -1560,8 +1634,8 @@ def save_active_learning_results(
     """
     import os
     
-    # Create output directory
-    output_dir = f"./cdata_{mode}"
+    # Create output directory with fixed-sampling method subdirectory
+    output_dir = f"./cdata_{mode}/fixed_{method_name}"
     os.makedirs(output_dir, exist_ok=True)
     
     # Create split name
