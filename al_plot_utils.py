@@ -189,7 +189,7 @@ def aggregate_active_learning_results(
                     row[f"{metric}_std"] = np.nan
 
         # Derive classification metrics from confusion counts when available.
-        # This keeps plotting independent from whether F1/FPR were written directly to CSV.
+        # This keeps plotting independent from whether F1/FPR/FNR were written directly to CSV.
         conf_cols = ["confusion_tp", "confusion_fp", "confusion_fn", "confusion_tn"]
         if all(c in group.columns for c in conf_cols):
             tp = group["confusion_tp"].astype(float)
@@ -205,10 +205,16 @@ def aggregate_active_learning_results(
             fpr_denom = (fp + tn).replace(0, np.nan)
             fpr_vals = fp / fpr_denom
 
+            # Per-run FNR = FN / (FN + TP)
+            fnr_denom = (fn + tp).replace(0, np.nan)
+            fnr_vals = fn / fnr_denom
+
             row["F1_mean"] = f1_vals.mean(skipna=True)
             row["F1_std"] = f1_vals.std(ddof=0, skipna=True)
             row["FPR_mean"] = fpr_vals.mean(skipna=True)
             row["FPR_std"] = fpr_vals.std(ddof=0, skipna=True)
+            row["FNR_mean"] = fnr_vals.mean(skipna=True)
+            row["FNR_std"] = fnr_vals.std(ddof=0, skipna=True)
         
         aggregated.append(row)
     
@@ -268,6 +274,7 @@ def plot_active_learning_curves(
             'NLL': 'NLL (Lower is Better)',
             'F1': 'F1 Score (Larger is Better)',
             'FPR': 'False Positive Rate (Lower is Better)',
+            'FNR': 'False Negative Rate (Lower is Better)',
         }
     else:
         METRICS_TO_PLOT = {
