@@ -92,6 +92,9 @@ def load_active_learning_results(
             c_method = f"{method}_batch"
         else:
             c_method = method
+        # active_learning.py stores each method under:
+        # ./cdata_{mode}/fixed_{method_name}/AL_{method_name}_...
+        method_dir = os.path.join(output_dir, f"fixed_{c_method}")
 
         for final_suffix, actual_task_id in filename_suffixes:
             
@@ -100,7 +103,7 @@ def load_active_learning_results(
             for run_id in range(n_runs):
                 # Directly format filename: AL_{method}_{split}_{dataset}_tasks_{task_ids}_id_{task_id}_run_{run_id}.csv
                 fname = f"AL_{c_method}_{split_name}_{dataset_name}{final_suffix}_run_{run_id}.csv"
-                fpath = os.path.join(output_dir, fname)
+                fpath = os.path.join(method_dir, fname)
                 
                 if os.path.exists(fpath):
                     try:
