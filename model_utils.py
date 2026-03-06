@@ -4,7 +4,7 @@ Supports both Neural Network models (DeepChem TorchModel) and GPyTorch models.
 """
 import torch
 import os
-from typing import Optional, Union
+from typing import Optional, Union, Tuple
 import deepchem as dc
 
 
@@ -118,8 +118,8 @@ def load_neural_network_ensemble(
     for member_path in member_paths:
         # Create a new model instance
         model_instance = model_class(n_features, n_tasks)
-        model = load_neural_network_model(model_instance, member_path, dc_model_kwargs)
-        models.append(model)
+        dc_model, _ = load_neural_network_model(model_instance, member_path, dc_model_kwargs)
+        models.append(dc_model)
     
     print(f"Loaded ensemble with {len(models)} members from: {ensemble_metadata_path}")
     return models
@@ -203,7 +203,7 @@ def load_neural_network_model(
     model_instance: torch.nn.Module,
     load_path: str,
     dc_model_kwargs: Optional[dict] = None
-) -> dc.models.TorchModel:
+) -> Tuple[dc.models.TorchModel, torch.nn.Module]:
     """
     Load a saved DeepChem TorchModel from disk.
     
@@ -215,11 +215,12 @@ def load_neural_network_model(
                         If None, will try to reconstruct from saved metadata
         
     Returns:
-        dc.models.TorchModel: The loaded DeepChem model
+        Tuple[dc.models.TorchModel, torch.nn.Module]:
+            (loaded DeepChem model, loaded raw PyTorch model instance)
         
     Example:
         >>> model = MyTorchRegressor(n_features=1024, n_tasks=1)
-        >>> dc_model = load_neural_network_model(
+        >>> dc_model, model = load_neural_network_model(
         ...     model, "./saved_models/nn_baseline_run_0.pt",
         ...     dc_model_kwargs={'loss': dc.models.losses.L2Loss(), ...}
         ... )
@@ -261,7 +262,7 @@ def load_neural_network_model(
     
     print(f"Neural network model loaded from: {load_path}")
     
-    return dc_model
+    return dc_model, model_instance
 
 
 def save_gpytorch_model(

@@ -306,7 +306,8 @@ class EvidentialClassificationLoss(Loss):
 
                 kl = annealing * kl_divergence_dirichlet(kl_alpha, self.num_classes)
 
-                return torch.mean(base_loss + kl)
+                # Keep per-sample loss so DeepChem can apply dataset.w element-wise.
+                return base_loss + kl
 
         return loss
 

@@ -40,6 +40,7 @@ _ensure_deepchem_torchmodel_alias()
 from nn_baseline import (  # noqa: E402
     EvidentialClassificationLoss,
     GradientClippingCallback,
+    HeteroscedasticClassificationLoss,
     UnifiedTorchModel,
     build_model,
     get_n_features,
@@ -221,35 +222,46 @@ def evaluate_classification_dc(
     return {"acc": acc, "brier": brier}
 
 
-def train_evidential_binary(
+def train_binary_classifier(
     train_x: np.ndarray,
     train_y: np.ndarray,
     val_x: np.ndarray,
     val_y: np.ndarray,
     n_features: int,
+    model_type: str = "evidential",
     encoder_type: str = "identity",
     epochs: int = 50,
     lr: float = 1e-4,
     batch_size: int = 128,
     grad_clip: float = 5.0,
     use_balancing_transformer: bool = False,
+    mc_dropout_train_samples: int = 20,
+    mc_dropout_rate: float = 0.2,
 ) -> UnifiedTorchModel:
     n_tasks = train_y.shape[1]
+    if model_type not in {"evidential", "mc_dropout"}:
+        raise ValueError(f"Unsupported model_type: {model_type}")
 
     model = build_model(
-        model_type="evidential",
+        model_type=model_type,
         n_features=n_features,
         n_tasks=n_tasks,
         mode="classification",
         encoder_type=encoder_type,
+        dropout_rate=mc_dropout_rate,
     )
-    loss = EvidentialClassificationLoss()
+    if model_type == "mc_dropout":
+        loss = HeteroscedasticClassificationLoss(n_samples=mc_dropout_train_samples)
+        output_types = ["prediction"]
+    else:
+        loss = EvidentialClassificationLoss()
+        output_types = ["prediction", "loss", "var1", "var2"]
     clip_callback = GradientClippingCallback(max_norm=grad_clip)
 
     dc_model = UnifiedTorchModel(
         model=model,
         loss=loss,
-        output_types=["prediction", "loss", "var1", "var2"],
+        output_types=output_types,
         batch_size=batch_size,
         learning_rate=lr,
         log_frequency=40,
@@ -282,7 +294,7 @@ def train_evidential_binary(
         train_ds = balancer.transform(train_ds)
         print("Applied BalancingTransformer to training dataset.")
 
-    print(f"Training nn_baseline evidential classifier for {epochs} epochs...")
+    print(f"Training nn_baseline {model_type} classifier for {epochs} epochs...")
     dc_model.fit(train_ds, nb_epoch=epochs, callbacks=[clip_callback])
 
     val_metrics = evaluate_classification_dc(dc_model, val_x, val_y, encoder_type=encoder_type)
@@ -298,17 +310,20 @@ def save_checkpoint(
     checkpoint_path: str,
     n_features: int,
     ecfp_size: int,
+    model_type: str = "evidential",
     radius: int = 2,
     encoder_type: str = "identity",
     smiles_column: str = "SMILES",
     label_column: str = "Outcome",
     batch_size: int = 128,
     learning_rate: float = 1e-4,
+    mc_dropout_samples: int = 50,
+    mc_dropout_rate: float = 0.2,
 ) -> None:
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
     ckpt = {
         "model_state_dict": dc_model.model.state_dict(),
-        "model_type": "nn_baseline_evidential_classification",
+        "model_type": model_type,
         "n_features": int(n_features),
         "n_tasks": 1,
         "ecfp_size": int(ecfp_size),
@@ -318,6 +333,8 @@ def save_checkpoint(
         "label_column": label_column,
         "batch_size": int(batch_size),
         "learning_rate": float(learning_rate),
+        "mc_dropout_samples": int(mc_dropout_samples),
+        "mc_dropout_rate": float(mc_dropout_rate),
     }
     torch.save(ckpt, checkpoint_path)
     print(f"Saved checkpoint: {checkpoint_path}")
@@ -336,11 +353,22 @@ def inspect_checkpoint_hparams(checkpoint_path: str) -> Dict[str, object]:
         "label_column": ckpt.get("label_column"),
         "batch_size": ckpt.get("batch_size"),
         "learning_rate": ckpt.get("learning_rate"),
+        "mc_dropout_samples": ckpt.get("mc_dropout_samples", 50),
+        "mc_dropout_rate": ckpt.get("mc_dropout_rate", 0.2),
     }
     print(f"Checkpoint metadata from: {checkpoint_path}")
     for k, v in meta.items():
         print(f"  - {k}: {v}")
     return meta
+
+
+def _normalize_model_type(model_type_meta: Optional[object]) -> str:
+    raw = "" if model_type_meta is None else str(model_type_meta).lower()
+    if raw in {"evidential", "mc_dropout"}:
+        return raw
+    if "mc_dropout" in raw:
+        return "mc_dropout"
+    return "evidential"
 
 
 def load_checkpoint(checkpoint_path: str) -> Tuple[torch.nn.Module, Dict[str, object]]:
@@ -351,12 +379,15 @@ def load_checkpoint(checkpoint_path: str) -> Tuple[torch.nn.Module, Dict[str, ob
         raise ValueError("Checkpoint missing n_features.")
 
     encoder_type = str(meta.get("encoder_type", "identity"))
+    model_type = _normalize_model_type(meta.get("model_type"))
+    mc_dropout_rate = float(meta.get("mc_dropout_rate", 0.2))
     model = build_model(
-        model_type="evidential",
+        model_type=model_type,
         n_features=int(n_features),
         n_tasks=int(n_tasks),
         mode="classification",
         encoder_type=encoder_type,
+        dropout_rate=mc_dropout_rate,
     )
     ckpt = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(ckpt["model_state_dict"])
@@ -381,7 +412,15 @@ def _featurize_smiles_for_inference(
 
 
 @torch.no_grad()
-def _infer_from_features(
+def _enable_dropout_only(model: torch.nn.Module) -> None:
+    model.eval()
+    for module in model.modules():
+        if module.__class__.__name__.startswith("Dropout"):
+            module.train()
+
+
+@torch.no_grad()
+def _infer_evidential_from_features(
     model: torch.nn.Module,
     x: np.ndarray,
     smiles_out: List[str],
@@ -432,12 +471,118 @@ def _infer_from_features(
 
 
 @torch.no_grad()
+def _infer_mc_dropout_from_features(
+    model: torch.nn.Module,
+    x: np.ndarray,
+    encoder_type: str = "identity",
+    mc_dropout_samples: int = 50,
+) -> pd.DataFrame:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+
+    if encoder_type == "dmpnn":
+        from nn import graphdata_to_batchmolgraph
+
+        model_input = graphdata_to_batchmolgraph(list(x))
+        model_input = model_input.to(device)
+    else:
+        model_input = torch.from_numpy(x).float().to(device)
+
+    _enable_dropout_only(model)
+
+    probs_list = []
+    for _ in range(int(mc_dropout_samples)):
+        raw_out = model(model_input)
+        if isinstance(raw_out, tuple):
+            raw_out = raw_out[0]
+        raw_out = raw_out if isinstance(raw_out, torch.Tensor) else torch.as_tensor(raw_out)
+        if raw_out.shape[-1] < 2:
+            raise RuntimeError(
+                f"MC-dropout output should contain [mu|log_var], got shape {tuple(raw_out.shape)}"
+            )
+        c = raw_out.shape[-1] // 2
+        mu = raw_out[..., :c]
+        log_var = raw_out[..., c:]
+        log_var = torch.clamp(log_var, min=-10.0, max=10.0)
+        std = torch.exp(0.5 * log_var)
+        logits = mu + std * torch.randn_like(std)
+        if c == 2:
+            probs = torch.softmax(logits, dim=-1)
+        else:
+            probs = torch.sigmoid(logits)
+        probs_list.append(probs.detach().cpu().numpy())
+
+    mc_probs = np.stack(probs_list, axis=0)  # (S, N, C)
+    mean_prob = mc_probs.mean(axis=0)
+    eps = 1e-10
+
+    if mean_prob.shape[1] == 2:
+        p_negative = mean_prob[:, 0]
+        p_positive = mean_prob[:, 1]
+        h_total = -np.sum(mean_prob * np.log(mean_prob + eps), axis=1)  # (N,)
+        h_member = -np.sum(mc_probs * np.log(mc_probs + eps), axis=2)  # (S, N)
+        h_ale = h_member.mean(axis=0)  # (N,)
+    else:
+        p_positive = mean_prob[:, 0]
+        p_negative = 1.0 - p_positive
+        h_total = -(
+            p_positive * np.log(p_positive + eps)
+            + p_negative * np.log(p_negative + eps)
+        )
+        mc_pos = mc_probs[:, :, 0]
+        h_member = -(
+            mc_pos * np.log(mc_pos + eps)
+            + (1.0 - mc_pos) * np.log(1.0 - mc_pos + eps)
+        )
+        h_ale = h_member.mean(axis=0)
+
+    mi = np.maximum(h_total - h_ale, 0.0)
+    return pd.DataFrame(
+        {
+            "prob_class1_positive": p_positive,
+            "prob_class2_negative": p_negative,
+            "epistemic_uncertainty": mi,
+            "aleatoric_uncertainty": h_ale,
+        }
+    )
+
+
+@torch.no_grad()
+def _infer_from_features(
+    model: torch.nn.Module,
+    x: np.ndarray,
+    smiles_out: List[str],
+    input_indices: List[int],
+    encoder_type: str = "identity",
+    model_type: str = "evidential",
+    mc_dropout_samples: int = 50,
+) -> pd.DataFrame:
+    normalized_type = _normalize_model_type(model_type)
+    if normalized_type == "mc_dropout":
+        return _infer_mc_dropout_from_features(
+            model=model,
+            x=x,
+            encoder_type=encoder_type,
+            mc_dropout_samples=mc_dropout_samples,
+        )
+    return _infer_evidential_from_features(
+        model=model,
+        x=x,
+        smiles_out=smiles_out,
+        input_indices=input_indices,
+        encoder_type=encoder_type,
+    )
+
+
+@torch.no_grad()
 def infer_from_smiles(
     model: torch.nn.Module,
     smiles: List[str],
     ecfp_size: int,
     radius: int,
     encoder_type: str = "identity",
+    model_type: str = "evidential",
+    mc_dropout_samples: int = 50,
 ) -> pd.DataFrame:
     x, clean_smiles, valid_inds = _featurize_smiles_for_inference(
         smiles=smiles, ecfp_size=ecfp_size, radius=radius, encoder_type=encoder_type
@@ -448,6 +593,8 @@ def infer_from_smiles(
         smiles_out=clean_smiles,
         input_indices=valid_inds,
         encoder_type=encoder_type,
+        model_type=model_type,
+        mc_dropout_samples=mc_dropout_samples,
     )
 
 
@@ -458,6 +605,8 @@ def infer_from_file(
     ecfp_size: int,
     radius: int,
     encoder_type: str = "identity",
+    model_type: str = "evidential",
+    mc_dropout_samples: int = 50,
     cache_dir: str = "save_ecfp_pkl",
     reload: bool = True,
 ) -> pd.DataFrame:
@@ -483,6 +632,8 @@ def infer_from_file(
             smiles_out=clean_smiles,
             input_indices=valid_inds,
             encoder_type=encoder_type,
+            model_type=model_type,
+            mc_dropout_samples=mc_dropout_samples,
         )
         print(f"Loaded cached inference features: {cache_file}")
         return pred_df
@@ -522,6 +673,8 @@ def infer_from_file(
         smiles_out=clean_smiles,
         input_indices=valid_inds,
         encoder_type=encoder_type,
+        model_type=model_type,
+        mc_dropout_samples=mc_dropout_samples,
     )
 
 
@@ -539,7 +692,7 @@ def build_default_inference_output_path(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="PKL + (ECFP or DMPNN graph) + Deep Evidential Binary model script."
+        description="PKL + (ECFP or DMPNN graph) + binary UQ model script."
     )
     parser.add_argument("--mode", choices=["train", "infer"], default="train")
     parser.add_argument("--data_dir", type=str, default="cytotoxicity_data")
@@ -576,6 +729,30 @@ def main() -> None:
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--grad_clip", type=float, default=5.0)
+    parser.add_argument(
+        "--model_type",
+        choices=["evidential", "mc_dropout"],
+        default="evidential",
+        help="Choose uncertainty model type for training/inference.",
+    )
+    parser.add_argument(
+        "--mc_dropout_samples",
+        type=int,
+        default=50,
+        help="Number of MC-dropout stochastic forward passes during inference.",
+    )
+    parser.add_argument(
+        "--mc_dropout_train_samples",
+        type=int,
+        default=20,
+        help="Number of MC samples used inside heteroscedastic classification loss.",
+    )
+    parser.add_argument(
+        "--mc_dropout_rate",
+        type=float,
+        default=0.2,
+        help="Dropout rate for mc_dropout model.",
+    )
     parser.add_argument(
         "--use_balancing_transformer",
         action="store_true",
@@ -619,18 +796,21 @@ def main() -> None:
         train_ds_for_shape = _to_dc_dataset(train_x, train_y, encoder_type=args.encoder_type)
         n_features = get_n_features(train_ds_for_shape, encoder_type=args.encoder_type)
 
-        dc_model = train_evidential_binary(
+        dc_model = train_binary_classifier(
             train_x=train_x,
             train_y=train_y,
             val_x=val_x,
             val_y=val_y,
             n_features=n_features,
+            model_type=args.model_type,
             encoder_type=args.encoder_type,
             epochs=args.epochs,
             lr=args.learning_rate,
             batch_size=args.batch_size,
             grad_clip=args.grad_clip,
             use_balancing_transformer=args.use_balancing_transformer,
+            mc_dropout_train_samples=args.mc_dropout_train_samples,
+            mc_dropout_rate=args.mc_dropout_rate,
         )
 
         test_metrics = evaluate_classification_dc(
@@ -650,12 +830,15 @@ def main() -> None:
             checkpoint_path=str(ckpt_path),
             n_features=n_features,
             ecfp_size=args.ecfp_size,
+            model_type=args.model_type,
             radius=args.radius,
             encoder_type=args.encoder_type,
             smiles_column=args.smiles_column,
             label_column=args.label_column,
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
+            mc_dropout_samples=args.mc_dropout_samples,
+            mc_dropout_rate=args.mc_dropout_rate,
         )
         return
 
@@ -674,6 +857,8 @@ def main() -> None:
     radius = int(meta.get("radius", args.radius))
     encoder_type = str(meta.get("encoder_type", args.encoder_type))
     smiles_column = str(meta.get("smiles_column", args.smiles_column))
+    model_type = _normalize_model_type(meta.get("model_type", args.model_type))
+    mc_dropout_samples = int(meta.get("mc_dropout_samples", args.mc_dropout_samples))
     if args.inference_all_splits:
         split_files = {
             "train": data_dir / "HEK293_train_BM.pkl",
@@ -688,6 +873,8 @@ def main() -> None:
                 ecfp_size=ecfp_size,
                 radius=radius,
                 encoder_type=encoder_type,
+                model_type=model_type,
+                mc_dropout_samples=mc_dropout_samples,
                 cache_dir=args.featurized_save_dir,
                 reload=args.reload,
             )
@@ -714,6 +901,8 @@ def main() -> None:
             ecfp_size=ecfp_size,
             radius=radius,
             encoder_type=encoder_type,
+            model_type=model_type,
+            mc_dropout_samples=mc_dropout_samples,
             cache_dir=args.featurized_save_dir,
             reload=args.reload,
         )
