@@ -207,14 +207,41 @@ def _extract_positive_probs(raw_probs: np.ndarray) -> np.ndarray:
     return probs
 
 
+def _predict_positive_probs(
+    model: torch.nn.Module,
+    x: np.ndarray,
+    encoder_type: str,
+    model_type: str,
+    mc_dropout_samples: int = 100,
+) -> np.ndarray:
+    pred_df = _infer_from_features(
+        model=model,
+        x=x,
+        smiles_out=[],
+        input_indices=[],
+        encoder_type=encoder_type,
+        model_type=model_type,
+        mc_dropout_samples=mc_dropout_samples,
+    )
+    probs = pred_df["prob_class1_positive"].to_numpy(dtype=np.float32).reshape(-1, 1)
+    return probs
+
+
 def evaluate_classification_dc(
     dc_model: UnifiedTorchModel,
     x: np.ndarray,
     y: np.ndarray,
     encoder_type: str = "identity",
+    model_type: str = "evidential",
+    mc_dropout_samples: int = 100,
 ) -> Dict[str, float]:
-    ds = _to_dc_dataset(x, y, encoder_type=encoder_type)
-    probs = _extract_positive_probs(dc_model.predict(ds))
+    probs = _predict_positive_probs(
+        model=dc_model.model,
+        x=x,
+        encoder_type=encoder_type,
+        model_type=model_type,
+        mc_dropout_samples=mc_dropout_samples,
+    )
     y_true = y.reshape(-1, 1).astype(np.float32)
     pred = (probs >= 0.5).astype(np.float32)
     acc = float((pred == y_true).mean())
@@ -237,6 +264,7 @@ def train_binary_classifier(
     use_balancing_transformer: bool = False,
     mc_dropout_train_samples: int = 20,
     mc_dropout_rate: float = 0.2,
+    mc_dropout_samples: int = 100,
 ) -> UnifiedTorchModel:
     n_tasks = train_y.shape[1]
     if model_type not in {"evidential", "mc_dropout"}:
@@ -297,7 +325,14 @@ def train_binary_classifier(
     print(f"Training nn_baseline {model_type} classifier for {epochs} epochs...")
     dc_model.fit(train_ds, nb_epoch=epochs, callbacks=[clip_callback])
 
-    val_metrics = evaluate_classification_dc(dc_model, val_x, val_y, encoder_type=encoder_type)
+    val_metrics = evaluate_classification_dc(
+        dc_model,
+        val_x,
+        val_y,
+        encoder_type=encoder_type,
+        model_type=model_type,
+        mc_dropout_samples=mc_dropout_samples,
+    )
     print(
         f"Post-train val metrics | acc={val_metrics['acc']:.4f} "
         f"| brier={val_metrics['brier']:.4f}"
@@ -317,7 +352,7 @@ def save_checkpoint(
     label_column: str = "Outcome",
     batch_size: int = 128,
     learning_rate: float = 1e-4,
-    mc_dropout_samples: int = 50,
+    mc_dropout_samples: int = 100,
     mc_dropout_rate: float = 0.2,
 ) -> None:
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
@@ -353,7 +388,7 @@ def inspect_checkpoint_hparams(checkpoint_path: str) -> Dict[str, object]:
         "label_column": ckpt.get("label_column"),
         "batch_size": ckpt.get("batch_size"),
         "learning_rate": ckpt.get("learning_rate"),
-        "mc_dropout_samples": ckpt.get("mc_dropout_samples", 50),
+        "mc_dropout_samples": ckpt.get("mc_dropout_samples", 100),
         "mc_dropout_rate": ckpt.get("mc_dropout_rate", 0.2),
     }
     print(f"Checkpoint metadata from: {checkpoint_path}")
@@ -475,7 +510,7 @@ def _infer_mc_dropout_from_features(
     model: torch.nn.Module,
     x: np.ndarray,
     encoder_type: str = "identity",
-    mc_dropout_samples: int = 50,
+    mc_dropout_samples: int = 100,
 ) -> pd.DataFrame:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -555,7 +590,7 @@ def _infer_from_features(
     input_indices: List[int],
     encoder_type: str = "identity",
     model_type: str = "evidential",
-    mc_dropout_samples: int = 50,
+    mc_dropout_samples: int = 100,
 ) -> pd.DataFrame:
     normalized_type = _normalize_model_type(model_type)
     if normalized_type == "mc_dropout":
@@ -582,7 +617,7 @@ def infer_from_smiles(
     radius: int,
     encoder_type: str = "identity",
     model_type: str = "evidential",
-    mc_dropout_samples: int = 50,
+    mc_dropout_samples: int = 100,
 ) -> pd.DataFrame:
     x, clean_smiles, valid_inds = _featurize_smiles_for_inference(
         smiles=smiles, ecfp_size=ecfp_size, radius=radius, encoder_type=encoder_type
@@ -606,7 +641,7 @@ def infer_from_file(
     radius: int,
     encoder_type: str = "identity",
     model_type: str = "evidential",
-    mc_dropout_samples: int = 50,
+    mc_dropout_samples: int = 100,
     cache_dir: str = "save_ecfp_pkl",
     reload: bool = True,
 ) -> pd.DataFrame:
@@ -738,7 +773,7 @@ def main() -> None:
     parser.add_argument(
         "--mc_dropout_samples",
         type=int,
-        default=50,
+        default=100,
         help="Number of MC-dropout stochastic forward passes during inference.",
     )
     parser.add_argument(
@@ -811,10 +846,16 @@ def main() -> None:
             use_balancing_transformer=args.use_balancing_transformer,
             mc_dropout_train_samples=args.mc_dropout_train_samples,
             mc_dropout_rate=args.mc_dropout_rate,
+            mc_dropout_samples=args.mc_dropout_samples,
         )
 
         test_metrics = evaluate_classification_dc(
-            dc_model, test_x, test_y, encoder_type=args.encoder_type
+            dc_model,
+            test_x,
+            test_y,
+            encoder_type=args.encoder_type,
+            model_type=args.model_type,
+            mc_dropout_samples=args.mc_dropout_samples,
         )
         print(
             f"Test metrics | acc={test_metrics['acc']:.4f} "
