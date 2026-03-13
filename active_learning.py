@@ -101,6 +101,56 @@ def copy_numpy_dataset(ds: dc.data.NumpyDataset) -> dc.data.NumpyDataset:
     )
 
 
+def _choose_safe_batch_size(train_size: int, preferred_batch_size: int) -> int:
+    """
+    Choose a batch size that avoids a last batch of size 1 while using all samples.
+
+    BatchNorm fails in train mode when a mini-batch has size 1. In active learning,
+    train_size changes every step, so we adapt batch size per fit call.
+    """
+    if train_size <= 1:
+        raise ValueError(
+            "Training set size must be > 1 for BatchNorm-based training; got train_size <= 1."
+        )
+
+    max_bs = max(2, min(int(preferred_batch_size), int(train_size)))
+
+    # Prefer staying at or below preferred_batch_size.
+    for bs in range(max_bs, 1, -1):
+        if train_size % bs != 1:
+            return bs
+
+    # Rare fallback (e.g., train_size=3, preferred_batch_size=2): allow slight increase.
+    for bs in range(max_bs + 1, train_size + 1):
+        if train_size % bs != 1:
+            return bs
+
+    # Should be unreachable for train_size > 1.
+    return train_size
+
+
+def _fit_with_dynamic_batch_size(
+    model,
+    train_dc: dc.data.NumpyDataset,
+    nb_epoch: int,
+    preferred_batch_size: int = 64,
+    callbacks: Optional[List] = None,
+    log_prefix: str = "AL"
+):
+    """
+    Fit model after adapting batch_size so no 1-sample batch is produced.
+    """
+    train_size = len(train_dc)
+    safe_bs = _choose_safe_batch_size(train_size, preferred_batch_size)
+    model.batch_size = safe_bs
+    print(f"[{log_prefix}] Using dynamic batch_size={safe_bs} for train_size={train_size}")
+
+    if callbacks is None:
+        model.fit(train_dc, nb_epoch=nb_epoch)
+    else:
+        model.fit(train_dc, nb_epoch=nb_epoch, callbacks=callbacks)
+
+
 def create_stratified_initial_split(
     train_dc: dc.data.NumpyDataset,
     initial_ratio: float = 0.1,
@@ -1046,7 +1096,10 @@ def train_nn_baseline_active_learning(
     
     # Initial training
     print(f"[AL nn_baseline] Initial training with {len(initial_train_dc)} samples ({initial_epochs} epochs)")
-    dc_model.fit(initial_train_dc, nb_epoch=initial_epochs)
+    _fit_with_dynamic_batch_size(
+        dc_model, initial_train_dc, nb_epoch=initial_epochs,
+        preferred_batch_size=64, log_prefix="AL nn_baseline"
+    )
     
     # Evaluate step 0
     current_train_dc = initial_train_dc
@@ -1080,7 +1133,10 @@ def train_nn_baseline_active_learning(
         
         # Fine-tune model
         print(f"[AL nn_baseline] Fine-tuning with {len(current_train_dc)} samples ({fine_tune_epochs} epochs)")
-        dc_model.fit(current_train_dc, nb_epoch=fine_tune_epochs)
+        _fit_with_dynamic_batch_size(
+            dc_model, current_train_dc, nb_epoch=fine_tune_epochs,
+            preferred_batch_size=64, log_prefix="AL nn_baseline"
+        )
         
         # Evaluate
         step_metrics = evaluate_model_on_test(dc_model, test_dc, "nn_baseline", mode, use_weights, encoder_type)
@@ -1150,7 +1206,10 @@ def train_nn_deep_ensemble_active_learning(
                 encoder_type=encoder_type,
             )
         
-        dc_model.fit(initial_train_dc, nb_epoch=initial_epochs)
+        _fit_with_dynamic_batch_size(
+            dc_model, initial_train_dc, nb_epoch=initial_epochs,
+            preferred_batch_size=64, log_prefix="AL nn_deep_ensemble"
+        )
         models.append(dc_model)
     
     print(f"[AL nn_deep_ensemble] Initial training with {len(initial_train_dc)} samples ({initial_epochs} epochs)")
@@ -1189,7 +1248,10 @@ def train_nn_deep_ensemble_active_learning(
         # Fine-tune all ensemble members
         print(f"[AL nn_deep_ensemble] Fine-tuning with {len(current_train_dc)} samples ({fine_tune_epochs} epochs each)")
         for model in models:
-            model.fit(current_train_dc, nb_epoch=fine_tune_epochs)
+            _fit_with_dynamic_batch_size(
+                model, current_train_dc, nb_epoch=fine_tune_epochs,
+                preferred_batch_size=64, log_prefix="AL nn_deep_ensemble"
+            )
         
         # Evaluate
         step_metrics = evaluate_model_on_test(models, test_dc, "nn_deep_ensemble", mode, use_weights, encoder_type)
@@ -1279,7 +1341,10 @@ def train_nn_mc_dropout_active_learning(
             )
     
     print(f"[AL nn_mc_dropout] Initial training with {len(initial_train_dc)} samples ({initial_epochs} epochs)")
-    dc_model.fit(initial_train_dc, nb_epoch=initial_epochs)
+    _fit_with_dynamic_batch_size(
+        dc_model, initial_train_dc, nb_epoch=initial_epochs,
+        preferred_batch_size=64, log_prefix="AL nn_mc_dropout"
+    )
     
     # Evaluate step 0
     current_train_dc = initial_train_dc
@@ -1314,7 +1379,10 @@ def train_nn_mc_dropout_active_learning(
         
         # Fine-tune model
         print(f"[AL nn_mc_dropout] Fine-tuning with {len(current_train_dc)} samples ({fine_tune_epochs} epochs)")
-        dc_model.fit(current_train_dc, nb_epoch=fine_tune_epochs)
+        _fit_with_dynamic_batch_size(
+            dc_model, current_train_dc, nb_epoch=fine_tune_epochs,
+            preferred_batch_size=64, log_prefix="AL nn_mc_dropout"
+        )
         
         # Evaluate
         step_metrics = evaluate_model_on_test(dc_model, test_dc, "nn_mc_dropout", mode, use_weights, encoder_type)
@@ -1372,7 +1440,10 @@ def train_evd_baseline_active_learning(
     )
     
     print(f"[AL nn_evd] Initial training with {len(initial_train_dc)} samples ({initial_epochs} epochs)")
-    dc_model.fit(initial_train_dc, nb_epoch=initial_epochs, callbacks=[gradientClip])
+    _fit_with_dynamic_batch_size(
+        dc_model, initial_train_dc, nb_epoch=initial_epochs,
+        preferred_batch_size=128, callbacks=[gradientClip], log_prefix="AL nn_evd"
+    )
     
     # Evaluate step 0
     current_train_dc = initial_train_dc
@@ -1407,7 +1478,10 @@ def train_evd_baseline_active_learning(
         
         # Fine-tune model
         print(f"[AL nn_evd] Fine-tuning with {len(current_train_dc)} samples ({fine_tune_epochs} epochs)")
-        dc_model.fit(current_train_dc, nb_epoch=fine_tune_epochs, callbacks=[gradientClip])
+        _fit_with_dynamic_batch_size(
+            dc_model, current_train_dc, nb_epoch=fine_tune_epochs,
+            preferred_batch_size=128, callbacks=[gradientClip], log_prefix="AL nn_evd"
+        )
         
         # Evaluate
         step_metrics = evaluate_model_on_test(dc_model, test_dc, "nn_evd", mode, use_weights, encoder_type)
@@ -1452,7 +1526,10 @@ def train_conformal_active_learning(
         encoder_type=encoder_type,
     )
     print(f"[AL nn_conformal] Initial training with {len(initial_train_dc)} samples ({initial_epochs} epochs)")
-    dc_model.fit(initial_train_dc, nb_epoch=initial_epochs)
+    _fit_with_dynamic_batch_size(
+        dc_model, initial_train_dc, nb_epoch=initial_epochs,
+        preferred_batch_size=64, log_prefix="AL nn_conformal"
+    )
     current_train_dc = initial_train_dc
     step_results = []
     thresholds = None
@@ -1474,7 +1551,10 @@ def train_conformal_active_learning(
         queried_dc, pool_dc = query_instances(pool_dc, selected_indices)
         current_train_dc = combine_datasets(current_train_dc, queried_dc)
         print(f"[AL nn_conformal] Fine-tuning with {len(current_train_dc)} samples ({fine_tune_epochs} epochs)")
-        dc_model.fit(current_train_dc, nb_epoch=fine_tune_epochs)
+        _fit_with_dynamic_batch_size(
+            dc_model, current_train_dc, nb_epoch=fine_tune_epochs,
+            preferred_batch_size=64, log_prefix="AL nn_conformal"
+        )
         step_metrics = evaluate_model_on_test(dc_model, test_dc, "nn_conformal", "classification", use_weights, encoder_type)
         step_metrics["step"] = step
         step_metrics["train_size"] = len(current_train_dc)
