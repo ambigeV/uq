@@ -473,9 +473,11 @@ def _display_model_name(model_key: str) -> str:
         if lname == "ensemble":
             return "base_gbm"
         if "mc" in lname:
-            return "base_mc"
+            # Distinguish balanced vs unbalanced MC variants.
+            return "base_mc2" if "unb" in lname else "base_mc1"
         if "evd" in lname or "new" in lname:
-            return "base_evd"
+            # Distinguish balanced vs unbalanced EVD/new variants.
+            return "base_evd2" if "unb" in lname else "base_evd1"
         return f"base_{name}"
     if family == "stack":
         mapped = {
@@ -715,7 +717,7 @@ def _export_brier_by_uncertainty_cutoff(
             continue
         for metric_key, (metric_title, direction) in metric_cfg.items():
             rows: List[Dict[str, Any]] = []
-            fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=False)
+            fig, axes = plt.subplots(1, 2, figsize=(16.5, 6.2), sharey=False)
             plotted_any = False
             for split, ax in zip(["val", "test"], axes):
                 for model_key in sorted(unc_store.keys()):
@@ -761,20 +763,30 @@ def _export_brier_by_uncertainty_cutoff(
                             }
                         )
                     label = _display_model_name(f"{payload['model_family']}::{payload['model_name']}")
-                    ax.plot(x_vals, y_vals, marker="o", linewidth=1.2, label=label)
+                    ax.plot(x_vals, y_vals, marker="o", linewidth=1.8, label=label)
                     plotted_any = True
-                ax.set_title(f"{split} {metric_title} vs low-epistemic-unc coverage")
-                ax.set_xlabel("Lowest epistemic uncertainty coverage (%)")
+                ax.set_title(f"{split} {metric_title} vs low-epistemic-unc coverage", fontsize=15)
+                ax.set_xlabel("Lowest epistemic uncertainty coverage (%)", fontsize=14)
                 ax.grid(alpha=0.25)
                 ax.set_xticks(cutoff_percents)
-            axes[0].set_ylabel(f"{metric_title} ({direction} is better)")
+                ax.tick_params(axis="both", labelsize=12)
+            axes[0].set_ylabel(f"{metric_title} ({direction} is better)", fontsize=14)
             if plotted_any:
-                axes[1].legend(fontsize=8, frameon=False, loc="best")
-            fig.suptitle(f"{scenario} | {uncertainty_type} uncertainty cutoff {metric_title}", fontsize=12)
-            fig.tight_layout(rect=[0, 0, 1, 0.95])
+                handles, labels = axes[1].get_legend_handles_labels()
+                if handles:
+                    fig.legend(
+                        handles,
+                        labels,
+                        fontsize=12,
+                        frameon=False,
+                        loc="lower center",
+                        bbox_to_anchor=(0.5, 0.02),
+                        ncol=min(4, max(2, len(labels))),
+                    )
+            fig.tight_layout(rect=[0, 0.12, 1, 1])
 
             stem = f"{scenario}_{uncertainty_type}_{metric_key}_by_uncertainty_cutoff"
-            fig.savefig(out_dir / f"{stem}.png", dpi=200)
+            fig.savefig(out_dir / f"{stem}.png", dpi=200, bbox_inches="tight")
             plt.close(fig)
             if rows:
                 pd.DataFrame(rows).to_csv(out_dir / f"{stem}.csv", index=False)
@@ -792,7 +804,7 @@ def _export_confusion_matrix_grid(
 
     n_models = len(entries)
     fig, axes = plt.subplots(
-        2, n_models, figsize=(max(14, 3.2 * n_models), 7.2), squeeze=False
+        2, n_models, figsize=(max(21, 4.8 * n_models), 11.5), squeeze=False
     )
     vmax = 100.0
 
@@ -815,18 +827,18 @@ def _export_confusion_matrix_grid(
                         f"{val:.1f}%",
                         ha="center",
                         va="center",
-                        fontsize=9,
+                        fontsize=18,
                         color="black",
                     )
             ax.set_xticks([0, 1])
-            ax.set_xticklabels(["Pred 0", "Pred 1"], fontsize=8)
+            ax.set_xticklabels(["Pred 0", "Pred 1"], fontsize=16)
             ax.set_yticks([0, 1])
-            ax.set_yticklabels(["True 0", "True 1"], fontsize=8)
+            ax.set_yticklabels(["True 0", "True 1"], fontsize=16)
             if row == 0:
-                ax.set_title(display_name, fontsize=9)
+                ax.set_title(display_name, fontsize=18)
             if col == 0:
-                ax.set_ylabel(f"{split}\nlabel", fontsize=9)
-            ax.set_xlabel("prediction", fontsize=8)
+                ax.set_ylabel(f"{split}\nlabel", fontsize=17)
+            ax.set_xlabel("prediction", fontsize=16)
 
             csv_rows.append(
                 {
@@ -842,7 +854,7 @@ def _export_confusion_matrix_grid(
                 }
             )
 
-    fig.suptitle("Confusion matrices by method (row-normalized by true label)", fontsize=12)
+    fig.suptitle("Confusion matrices by method (row-normalized by true label)", fontsize=22)
     # Avoid tight_layout warning with colorbar + multi-axes grids.
     fig.subplots_adjust(left=0.06, right=0.93, bottom=0.10, top=0.88, wspace=0.30, hspace=0.28)
     fig.savefig(out_png, dpi=220)
@@ -855,6 +867,8 @@ def _export_radar_grid(
     scenario: str,
     out_png: Path,
     out_csv: Path,
+    focus_base_model: str | None = None,
+    include_baselines: bool = False,
 ) -> None:
     out_png.parent.mkdir(parents=True, exist_ok=True)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -872,9 +886,9 @@ def _export_radar_grid(
     metric_dirs = {m: hb for m, hb in metric_spec}
     splits = ["val", "test"]
     # Keep polygons away from the origin to improve readability.
-    radar_floor = 0.40
+    radar_floor = 0.20
 
-    fig, axes = plt.subplots(1, 2, figsize=(15, 7), subplot_kw={"polar": True})
+    fig, axes = plt.subplots(1, 2, figsize=(20.0, 9.6), subplot_kw={"polar": True})
     angles = np.linspace(0, 2 * np.pi, len(metric_names), endpoint=False)
     angles_closed = np.concatenate([angles, angles[:1]])
     csv_rows: List[Dict[str, Any]] = []
@@ -903,16 +917,27 @@ def _export_radar_grid(
 
         if not mean_by_model:
             ax.set_xticks(angles)
-            ax.set_xticklabels(metric_names, fontsize=9)
+            ax.set_xticklabels(metric_names, fontsize=15)
             ax.set_yticks([0.0, 0.25, 0.5, 0.75, 1.0])
             ax.set_yticklabels(
-                ["0.00", "0.25", "0.50", "0.75", "1.00"], fontsize=8
+                ["0.00", "0.25", "0.50", "0.75", "1.00"], fontsize=14
             )
             ax.set_ylim(0.0, 1.0)
             ax.grid(alpha=0.25)
             continue
 
-        model_names = sorted(mean_by_model.keys())
+        # Focus per selected base model + all ensemble methods.
+        candidate_model_names = sorted(mean_by_model.keys())
+        model_names = [m for m in candidate_model_names if m.startswith("stack::")]
+        if focus_base_model is not None and focus_base_model in candidate_model_names:
+            model_names.append(focus_base_model)
+        elif "base::ensemble" in candidate_model_names:
+            model_names.append("base::ensemble")
+        if include_baselines:
+            model_names.extend([m for m in candidate_model_names if m.startswith("baseline::")])
+        model_names = list(dict.fromkeys(model_names))
+        if not model_names:
+            model_names = candidate_model_names
         raw = np.full((len(model_names), len(metric_names)), np.nan, dtype=float)
         for i, model_name in enumerate(model_names):
             vals = mean_by_model[model_name]
@@ -941,8 +966,40 @@ def _export_radar_grid(
         for i, model_name in enumerate(model_names):
             values = np.concatenate([norm_shifted[i], norm_shifted[i, :1]])
             display_name = _display_model_name(model_name)
-            line, = ax.plot(angles_closed, values, linewidth=1.2, label=display_name)
-            ax.fill(angles_closed, values, alpha=0.06)
+            if model_name == "baseline::always_pos":
+                line, = ax.plot(
+                    angles_closed,
+                    values,
+                    linewidth=2.2,
+                    linestyle=":",
+                    marker="s",
+                    markersize=4.5,
+                    color="#E45756",
+                    label=display_name,
+                )
+            elif model_name == "baseline::always_neg":
+                line, = ax.plot(
+                    angles_closed,
+                    values,
+                    linewidth=2.2,
+                    linestyle="-.",
+                    marker="^",
+                    markersize=4.5,
+                    color="#72B7B2",
+                    label=display_name,
+                )
+            elif model_name.startswith("base::"):
+                line, = ax.plot(
+                    angles_closed,
+                    values,
+                    linewidth=2.0,
+                    linestyle="--",
+                    color="#666666",
+                    label=display_name,
+                )
+            else:
+                line, = ax.plot(angles_closed, values, linewidth=1.8, linestyle="-", label=display_name)
+                ax.fill(angles_closed, values, alpha=0.06)
             if display_name not in legend_items:
                 legend_items[display_name] = line
             row: Dict[str, Any] = {
@@ -958,13 +1015,14 @@ def _export_radar_grid(
             csv_rows.append(row)
 
         ax.set_xticks(angles)
-        ax.set_xticklabels(metric_names, fontsize=9)
+        ax.set_xticklabels(metric_names, fontsize=16)
         ax.set_yticks([0.0, 0.25, 0.5, 0.75, 1.0])
         ax.set_yticklabels(
-            ["0.00", "0.25", "0.50", "0.75", "1.00"], fontsize=8
+            ["0.00", "0.25", "0.50", "0.75", "1.00"], fontsize=15
         )
         ax.set_ylim(0.0, 1.0)
         ax.grid(alpha=0.25)
+        ax.set_title(split.upper(), fontsize=18, pad=18)
 
     if legend_items:
         fig.legend(
@@ -974,7 +1032,7 @@ def _export_radar_grid(
             bbox_to_anchor=(0.5, 1.05),
             ncol=min(4, max(1, len(legend_items))),
             frameon=False,
-            fontsize=11,
+            fontsize=16,
         )
     fig.tight_layout(rect=[0, 0, 1, 0.92])
     fig.savefig(out_png, dpi=220, bbox_inches="tight")
@@ -1126,7 +1184,8 @@ def _compute_weighted_cp_weights_from_domain_model(
         ecfp_size=ecfp_size,
         ecfp_radius=ecfp_radius,
     )
-    p_eps = float(max(prob_clip, 1e-12))
+    # Enforce robust clipping for weighted CP ratio stability.
+    p_eps = float(max(prob_clip, 1e-2))
     p_val = np.clip(
         _predict_domain_positive_prob(model, x_val, device=device, encoder_type=encoder_type),
         p_eps,
@@ -1423,8 +1482,15 @@ def _conformal_single_label_accept_mask(
     idx_neg = np.searchsorted(sorted_scores_neg, s_neg, side="left")
     suffix_pos = np.cumsum(w_pos[::-1], dtype=np.float64)[::-1]
     suffix_neg = np.cumsum(w_neg[::-1], dtype=np.float64)[::-1]
-    tail_w_pos = np.where(idx_pos < len(sorted_scores_pos), suffix_pos[idx_pos], 0.0)
-    tail_w_neg = np.where(idx_neg < len(sorted_scores_neg), suffix_neg[idx_neg], 0.0)
+    # Avoid out-of-bounds when searchsorted returns len(sorted_scores_*).
+    tail_w_pos = np.zeros_like(s_pos, dtype=np.float64)
+    tail_w_neg = np.zeros_like(s_neg, dtype=np.float64)
+    valid_pos = idx_pos < len(sorted_scores_pos)
+    valid_neg = idx_neg < len(sorted_scores_neg)
+    if np.any(valid_pos):
+        tail_w_pos[valid_pos] = suffix_pos[idx_pos[valid_pos]]
+    if np.any(valid_neg):
+        tail_w_neg[valid_neg] = suffix_neg[idx_neg[valid_neg]]
     total_w_pos = float(np.sum(w_pos))
     total_w_neg = float(np.sum(w_neg))
     # Weighted generalization: with unit weights this is the usual smoothed split-CP p-value.
@@ -1558,8 +1624,8 @@ def main() -> None:
     parser.add_argument(
         "--weighted_cp_prob_clip",
         type=float,
-        default=1e-4,
-        help="Clip domain p(x) into [eps, 1-eps] before computing weighted CP ratio.",
+        default=1e-2,
+        help="Clip domain p(x) into [eps, 1-eps] before computing weighted CP ratio (minimum enforced eps=0.01).",
     )
     parser.add_argument(
         "--weighted_cp_ratio_offset",
@@ -2640,19 +2706,27 @@ def main() -> None:
             out_csv=summary_csv.parent / f"confusion_matrices_val_test_all_methods_{scenario}.csv",
         )
 
-    # Export radar figures separately for all-data and conformal scenarios.
-    _export_radar_grid(
-        radar_metrics_store=radar_metrics_store,
-        scenario="all",
-        out_png=summary_csv.parent / "radar_all.png",
-        out_csv=summary_csv.parent / "radar_all.csv",
-    )
-    _export_radar_grid(
-        radar_metrics_store=radar_metrics_store,
-        scenario="conformal",
-        out_png=summary_csv.parent / "radar_conformal.png",
-        out_csv=summary_csv.parent / "radar_conformal.csv",
-    )
+    # Export 2 * len(methods) radar figures:
+    # one base-focused radar for each CLI-provided base method, for both all and conformal scenarios.
+    for base_method in methods:
+        focus_key = f"base::{base_method}"
+        focus_stem = _display_model_name(focus_key)
+        _export_radar_grid(
+            radar_metrics_store=radar_metrics_store,
+            scenario="all",
+            out_png=summary_csv.parent / f"radar_all_focus_{focus_stem}.png",
+            out_csv=summary_csv.parent / f"radar_all_focus_{focus_stem}.csv",
+            focus_base_model=focus_key,
+            include_baselines=True,  # include all_pos/all_neg on all-data radar
+        )
+        _export_radar_grid(
+            radar_metrics_store=radar_metrics_store,
+            scenario="conformal",
+            out_png=summary_csv.parent / f"radar_conformal_focus_{focus_stem}.png",
+            out_csv=summary_csv.parent / f"radar_conformal_focus_{focus_stem}.csv",
+            focus_base_model=focus_key,
+            include_baselines=False,
+        )
 
     if conformal_aggregate:
         for name, rows in conformal_aggregate.items():

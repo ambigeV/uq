@@ -23,12 +23,12 @@ python train_weighted_cp_domain_classifier.py \
   --label_dir cytotoxicity_data \
   --val_split HEK293_test_BM \
   --test_split tox21_all \
-  --encoder_type dmpnn \
+  --encoder_type identity \
   --label_column Outcome \
   --smiles_column SMILES \
-  --epochs 100 \
+  --epochs 30 \
   --batch_size 256 \
-  --lr 1e-3 \
+  --lr 3e-3 \
   --seed 0 \
   --out_model saved_models/weighted_cp_domain_classifier.pt
 ```
@@ -43,6 +43,9 @@ This run records:
 - plain conformal metrics (`scenario=conformal`, without domain-ratio weighting)
 
 ```bash
+TS=$(date +"%Y%m%d_%H%M%S")
+OUT_DIR_PLAIN="inference_outputs/stacking/plain_cp_${TS}"
+
 python bii_super_learner.py \
   --pred_root inference_outputs \
   --label_dir cytotoxicity_data \
@@ -51,9 +54,9 @@ python bii_super_learner.py \
   --label_column Outcome \
   --methods "dmpnn_bii_mc_dmpnn_balanced,dmpnn_bii_mc_unb_dmpnn_balanced,dmpnn_bii_new_dmpnn_balanced,dmpnn_bii_new_unb_dmpnn_balanced,ensemble" \
   --run_ids "0,1,2,3,4" \
-  --summary_csv inference_outputs/stacking/plain_cp/stacking_summary_all_metrics.csv \
-  --conformal_summary_csv inference_outputs/stacking/plain_cp/stacking_summary_conformal_accepted.csv \
-  --uncertainty_dist_dir inference_outputs/stacking/plain_cp/artifacts
+  --summary_csv "${OUT_DIR_PLAIN}/stacking_summary_all_metrics.csv" \
+  --conformal_summary_csv "${OUT_DIR_PLAIN}/stacking_summary_conformal_accepted.csv" \
+  --uncertainty_dist_dir "${OUT_DIR_PLAIN}/artifacts"
 ```
 
 ---
@@ -66,6 +69,9 @@ This run records:
 - weighted conformal metrics (`scenario=conformal`, with domain-ratio weights)
 
 ```bash
+TS=$(date +"%Y%m%d_%H%M%S")
+OUT_DIR_WEIGHTED="inference_outputs/stacking/weighted_cp_${TS}"
+
 python bii_super_learner.py \
   --pred_root inference_outputs \
   --label_dir cytotoxicity_data \
@@ -75,12 +81,12 @@ python bii_super_learner.py \
   --methods "dmpnn_bii_mc_dmpnn_balanced,dmpnn_bii_mc_unb_dmpnn_balanced,dmpnn_bii_new_dmpnn_balanced,dmpnn_bii_new_unb_dmpnn_balanced,ensemble" \
   --run_ids "0,1,2,3,4" \
   --weighted_cp_domain_model saved_models/weighted_cp_domain_classifier.pt \
-  --weighted_cp_prob_clip 1e-4 \
+  --weighted_cp_prob_clip 1e-2 \
   --weighted_cp_ratio_offset 1e-3 \
   --weighted_cp_weight_clip_max 1000 \
-  --summary_csv inference_outputs/stacking/weighted_cp/stacking_summary_all_metrics.csv \
-  --conformal_summary_csv inference_outputs/stacking/weighted_cp/stacking_summary_conformal_accepted.csv \
-  --uncertainty_dist_dir inference_outputs/stacking/weighted_cp/artifacts
+  --summary_csv "${OUT_DIR_WEIGHTED}/stacking_summary_all_metrics.csv" \
+  --conformal_summary_csv "${OUT_DIR_WEIGHTED}/stacking_summary_conformal_accepted.csv" \
+  --uncertainty_dist_dir "${OUT_DIR_WEIGHTED}/artifacts"
 ```
 
 ---
@@ -88,9 +94,9 @@ python bii_super_learner.py \
 ## Result Files To Compare
 
 - Plain CP run:
-  - `inference_outputs/stacking/plain_cp/stacking_summary_all_metrics.csv`
-  - `inference_outputs/stacking/plain_cp/stacking_summary_conformal_accepted.csv`
+  - `${OUT_DIR_PLAIN}/stacking_summary_all_metrics.csv`
+  - `${OUT_DIR_PLAIN}/stacking_summary_conformal_accepted.csv`
 - Weighted CP run:
-  - `inference_outputs/stacking/weighted_cp/stacking_summary_all_metrics.csv`
-  - `inference_outputs/stacking/weighted_cp/stacking_summary_conformal_accepted.csv`
+  - `${OUT_DIR_WEIGHTED}/stacking_summary_all_metrics.csv`
+  - `${OUT_DIR_WEIGHTED}/stacking_summary_conformal_accepted.csv`
 
