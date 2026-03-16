@@ -5,10 +5,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
 import matplotlib.pyplot as plt
+import deepchem as dc
 import numpy as np
 import pandas as pd
 from sklearn.isotonic import IsotonicRegression
 import torch
+from nn import graphdata_to_batchmolgraph
+from nn_baseline import build_model
 
 
 PROB_COL = "prob_class1_positive"
@@ -979,15 +982,203 @@ def _export_radar_grid(
     if csv_rows:
         pd.DataFrame(csv_rows).to_csv(out_csv, index=False)
 
-def _build_label_conditional_conformal_scores(
-    y_val: np.ndarray, prob_pos_val: np.ndarray
+
+def _get_weighted_cp_sample_weights(
+    *,
+    split_name: str,
+    n_samples: int,
+) -> np.ndarray:
+    """
+    Placeholder hook for weighted conformal prediction importance weights w(x).
+
+    Expected semantics under covariate shift:
+      w(x) ~ p_test(x) / p_calibration(x)
+
+    Replace this body with your project-specific weighting function once available.
+    Until then we return all-ones, which recovers standard (unweighted) conformal.
+    """
+    _ = split_name
+    return np.ones(int(n_samples), dtype=np.float64)
+
+
+def _build_domain_ecfp_features_from_smiles(
+    smiles: np.ndarray,
+    ecfp_size: int,
+    ecfp_radius: int,
+) -> np.ndarray:
+    featurizer = dc.feat.CircularFingerprint(size=int(ecfp_size), radius=int(ecfp_radius))
+    raw = featurizer.featurize([str(s) for s in smiles.tolist()])
+    feats = np.zeros((len(raw), int(ecfp_size)), dtype=np.float32)
+    for i, f in enumerate(raw):
+        if f is None:
+            continue
+        arr = np.asarray(f, dtype=np.float32).reshape(-1)
+        if arr.size == int(ecfp_size):
+            feats[i] = arr
+    return feats
+
+
+def _build_domain_graph_features_from_smiles(smiles: np.ndarray) -> np.ndarray:
+    featurizer = dc.feat.DMPNNFeaturizer()
+    raw = featurizer.featurize([str(s) for s in smiles.tolist()])
+    clean = [f for f in raw if f is not None]
+    if not clean:
+        raise ValueError("No valid graph features produced by DMPNN featurizer.")
+    return np.array(clean, dtype=object)
+
+
+def _build_domain_split_features(
+    *,
+    label_dir: Path,
+    split_name: str,
+    encoder_type: str,
+    smiles_column: str,
+    ecfp_size: int,
+    ecfp_radius: int,
+) -> np.ndarray:
+    pkl_path = label_dir / f"{split_name}.pkl"
+    df = _safe_read_pickle(pkl_path)
+    if smiles_column not in df.columns:
+        raise ValueError(f"Missing '{smiles_column}' in {pkl_path}")
+    smiles = df[smiles_column].astype(str).to_numpy()
+    if encoder_type == "dmpnn":
+        return _build_domain_graph_features_from_smiles(smiles)
+    return _build_domain_ecfp_features_from_smiles(
+        smiles,
+        ecfp_size=ecfp_size,
+        ecfp_radius=ecfp_radius,
+    )
+
+
+def _load_domain_classifier_checkpoint(ckpt_path: Path) -> Tuple[torch.nn.Module, Dict[str, Any], torch.device]:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    payload = torch.load(ckpt_path, map_location=device)
+    metadata = dict(payload.get("metadata", {}))
+    n_features = int(metadata.get("n_features", 0))
+    n_tasks = int(metadata.get("n_tasks", 1))
+    encoder_type = str(metadata.get("encoder_type", "identity"))
+    if n_features <= 0:
+        raise ValueError(f"Invalid n_features in domain model checkpoint: {ckpt_path}")
+    model = build_model(
+        model_type="baseline",
+        n_features=n_features,
+        n_tasks=n_tasks,
+        mode="classification",
+        encoder_type=encoder_type,
+    ).to(device)
+    model.load_state_dict(payload["state_dict"])
+    model.eval()
+    return model, metadata, device
+
+
+@torch.no_grad()
+def _predict_domain_positive_prob(
+    model: torch.nn.Module,
+    features: np.ndarray,
+    device: torch.device,
+    encoder_type: str,
+    batch_size: int = 1024,
+) -> np.ndarray:
+    out = np.zeros((len(features),), dtype=np.float64)
+    for i in range(0, len(features), int(batch_size)):
+        xb_raw = features[i:i + int(batch_size)]
+        if encoder_type == "dmpnn":
+            xb = graphdata_to_batchmolgraph(list(xb_raw)).to(device)
+        else:
+            xb = torch.from_numpy(np.asarray(xb_raw, dtype=np.float32)).to(device)
+        _, logits = model(xb)
+        p = torch.sigmoid(logits).detach().cpu().numpy().reshape(-1)
+        out[i:i + int(batch_size)] = p.astype(np.float64)
+    return out
+
+
+def _compute_weighted_cp_weights_from_domain_model(
+    *,
+    label_dir: Path,
+    val_split: str,
+    test_split: str,
+    domain_model_path: Path,
+    default_label_column: str,
+    weight_clip_max: float,
+    prob_clip: float,
+    ratio_offset: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    model, metadata, device = _load_domain_classifier_checkpoint(domain_model_path)
+    encoder_type = str(metadata.get("encoder_type", "identity"))
+    label_column = str(metadata.get("label_column", default_label_column))
+    smiles_column = str(metadata.get("smiles_column", "SMILES"))
+    ecfp_size = int(metadata.get("ecfp_size", 1024))
+    ecfp_radius = int(metadata.get("ecfp_radius", 2))
+
+    x_val = _build_domain_split_features(
+        label_dir=label_dir,
+        split_name=val_split,
+        encoder_type=encoder_type,
+        smiles_column=smiles_column,
+        ecfp_size=ecfp_size,
+        ecfp_radius=ecfp_radius,
+    )
+    x_test = _build_domain_split_features(
+        label_dir=label_dir,
+        split_name=test_split,
+        encoder_type=encoder_type,
+        smiles_column=smiles_column,
+        ecfp_size=ecfp_size,
+        ecfp_radius=ecfp_radius,
+    )
+    p_eps = float(max(prob_clip, 1e-12))
+    p_val = np.clip(
+        _predict_domain_positive_prob(model, x_val, device=device, encoder_type=encoder_type),
+        p_eps,
+        1.0 - p_eps,
+    )
+    p_test = np.clip(
+        _predict_domain_positive_prob(model, x_test, device=device, encoder_type=encoder_type),
+        p_eps,
+        1.0 - p_eps,
+    )
+    off = float(max(ratio_offset, 0.0))
+    # Stable weighted CP instantiation:
+    # w(x) = (p(x) + off) / (1 - p(x) + off), where p(x)=P(test domain|x).
+    # off>0 softens extreme ratios when p(x) is near 1.
+    w_val = (p_val + off) / np.clip(1.0 - p_val + off, 1e-12, None)
+    w_test = (p_test + off) / np.clip(1.0 - p_test + off, 1e-12, None)
+    w_max = float(max(weight_clip_max, 1.0))
+    w_val = np.clip(w_val, 1e-8, w_max).astype(np.float64)
+    w_test = np.clip(w_test, 1e-8, w_max).astype(np.float64)
+    return w_val, w_test
+
+
+def _build_label_conditional_conformal_scores(
+    y_val: np.ndarray,
+    prob_pos_val: np.ndarray,
+    sample_weights_val: np.ndarray | None = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     y = np.asarray(y_val, dtype=int).reshape(-1)
     p = np.clip(np.asarray(prob_pos_val, dtype=float).reshape(-1), 1e-8, 1.0 - 1e-8)
+    if sample_weights_val is None:
+        w = np.ones_like(p, dtype=np.float64)
+    else:
+        w = np.asarray(sample_weights_val, dtype=np.float64).reshape(-1)
+        if len(w) != len(p):
+            raise ValueError(
+                f"sample_weights_val length mismatch: {len(w)} vs {len(p)}."
+            )
+        w = np.clip(w, 1e-12, None)
     # Nonconformity for positive label uses p(y=1|x); for negative label uses p(y=0|x)=1-p.
     scores_pos = 1.0 - p[y == 1]
+    weights_pos = w[y == 1]
     scores_neg = 1.0 - (1.0 - p[y == 0])  # equals p for y==0 samples
-    return np.sort(scores_pos), np.sort(scores_neg)
+    weights_neg = w[y == 0]
+
+    order_pos = np.argsort(scores_pos, kind="mergesort")
+    order_neg = np.argsort(scores_neg, kind="mergesort")
+    return (
+        scores_pos[order_pos],
+        scores_neg[order_neg],
+        weights_pos[order_pos],
+        weights_neg[order_neg],
+    )
 
 
 def _derived_csv_path(base_path: Path, suffix: str) -> Path:
@@ -1190,21 +1381,55 @@ def _conformal_single_label_accept_mask(
     sorted_scores_pos: np.ndarray,
     sorted_scores_neg: np.ndarray,
     alpha: float,
+    sorted_weights_pos: np.ndarray | None = None,
+    sorted_weights_neg: np.ndarray | None = None,
+    test_sample_weights: np.ndarray | None = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     p = np.clip(np.asarray(prob_pos_test, dtype=float).reshape(-1), 1e-8, 1.0 - 1e-8)
     n = len(p)
     if len(sorted_scores_pos) == 0 or len(sorted_scores_neg) == 0:
         return np.zeros(n, dtype=bool), np.zeros(n, dtype=int)
+    if test_sample_weights is None:
+        w_test = np.ones(n, dtype=np.float64)
+    else:
+        w_test = np.asarray(test_sample_weights, dtype=np.float64).reshape(-1)
+        if len(w_test) != n:
+            raise ValueError(f"test_sample_weights length mismatch: {len(w_test)} vs {n}.")
+        w_test = np.clip(w_test, 1e-12, None)
+
+    w_pos = (
+        np.ones(len(sorted_scores_pos), dtype=np.float64)
+        if sorted_weights_pos is None
+        else np.clip(np.asarray(sorted_weights_pos, dtype=np.float64).reshape(-1), 1e-12, None)
+    )
+    w_neg = (
+        np.ones(len(sorted_scores_neg), dtype=np.float64)
+        if sorted_weights_neg is None
+        else np.clip(np.asarray(sorted_weights_neg, dtype=np.float64).reshape(-1), 1e-12, None)
+    )
+    if len(w_pos) != len(sorted_scores_pos):
+        raise ValueError(
+            f"sorted_weights_pos length mismatch: {len(w_pos)} vs {len(sorted_scores_pos)}."
+        )
+    if len(w_neg) != len(sorted_scores_neg):
+        raise ValueError(
+            f"sorted_weights_neg length mismatch: {len(w_neg)} vs {len(sorted_scores_neg)}."
+        )
 
     s_pos = 1.0 - p
     s_neg = p
 
     idx_pos = np.searchsorted(sorted_scores_pos, s_pos, side="left")
     idx_neg = np.searchsorted(sorted_scores_neg, s_neg, side="left")
-    count_ge_pos = len(sorted_scores_pos) - idx_pos
-    count_ge_neg = len(sorted_scores_neg) - idx_neg
-    pval_pos = (count_ge_pos + 1.0) / (len(sorted_scores_pos) + 1.0)
-    pval_neg = (count_ge_neg + 1.0) / (len(sorted_scores_neg) + 1.0)
+    suffix_pos = np.cumsum(w_pos[::-1], dtype=np.float64)[::-1]
+    suffix_neg = np.cumsum(w_neg[::-1], dtype=np.float64)[::-1]
+    tail_w_pos = np.where(idx_pos < len(sorted_scores_pos), suffix_pos[idx_pos], 0.0)
+    tail_w_neg = np.where(idx_neg < len(sorted_scores_neg), suffix_neg[idx_neg], 0.0)
+    total_w_pos = float(np.sum(w_pos))
+    total_w_neg = float(np.sum(w_neg))
+    # Weighted generalization: with unit weights this is the usual smoothed split-CP p-value.
+    pval_pos = (tail_w_pos + w_test) / (total_w_pos + w_test)
+    pval_neg = (tail_w_neg + w_test) / (total_w_neg + w_test)
 
     in_pos = pval_pos > float(alpha)
     in_neg = pval_neg > float(alpha)
@@ -1318,6 +1543,30 @@ def main() -> None:
         default=60,
         help="Histogram bins used for uncertainty distribution exports.",
     )
+    parser.add_argument(
+        "--weighted_cp_domain_model",
+        type=str,
+        default="",
+        help="Optional checkpoint path for val-vs-test domain classifier used in weighted CP.",
+    )
+    parser.add_argument(
+        "--weighted_cp_weight_clip_max",
+        type=float,
+        default=1000.0,
+        help="Upper clip for weighted CP ratio w(x)=p/(1-p).",
+    )
+    parser.add_argument(
+        "--weighted_cp_prob_clip",
+        type=float,
+        default=1e-4,
+        help="Clip domain p(x) into [eps, 1-eps] before computing weighted CP ratio.",
+    )
+    parser.add_argument(
+        "--weighted_cp_ratio_offset",
+        type=float,
+        default=1e-3,
+        help="Offset in stable ratio w(x)=(p+offset)/(1-p+offset).",
+    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent
@@ -1353,6 +1602,34 @@ def main() -> None:
 
     y_val = _load_labels(label_dir=label_dir, split_name=args.val_split, label_column=args.label_column)
     y_test = _load_labels(label_dir=label_dir, split_name=args.test_split, label_column=args.label_column)
+    cp_w_val = _get_weighted_cp_sample_weights(
+        split_name=args.val_split, n_samples=len(y_val)
+    )
+    cp_w_test = _get_weighted_cp_sample_weights(
+        split_name=args.test_split, n_samples=len(y_test)
+    )
+    if args.weighted_cp_domain_model.strip():
+        domain_model_path = Path(args.weighted_cp_domain_model)
+        if not domain_model_path.is_absolute():
+            domain_model_path = repo_root / domain_model_path
+        cp_w_val, cp_w_test = _compute_weighted_cp_weights_from_domain_model(
+            label_dir=label_dir,
+            val_split=args.val_split,
+            test_split=args.test_split,
+            domain_model_path=domain_model_path,
+            default_label_column=args.label_column,
+            weight_clip_max=args.weighted_cp_weight_clip_max,
+            prob_clip=args.weighted_cp_prob_clip,
+            ratio_offset=args.weighted_cp_ratio_offset,
+        )
+    print(
+        f"[Weighted CP] val_w mean={cp_w_val.mean():.4f} "
+        f"p05={np.quantile(cp_w_val, 0.05):.4f} p95={np.quantile(cp_w_val, 0.95):.4f}"
+    )
+    print(
+        f"[Weighted CP] test_w mean={cp_w_test.mean():.4f} "
+        f"p05={np.quantile(cp_w_test, 0.05):.4f} p95={np.quantile(cp_w_test, 0.95):.4f}"
+    )
 
     all_test_probs: Dict[str, List[np.ndarray]] = {
         "uniform": [],
@@ -1395,7 +1672,6 @@ def main() -> None:
 
         _ensure_same_length(y_val, p_val, f"val run {run_id}")
         _ensure_same_length(y_test, p_test, f"test run {run_id}")
-
         print(f"\n=== Run {run_id} ===")
         print("[Base methods]")
         for idx, method in enumerate(methods):
@@ -1567,20 +1843,26 @@ def main() -> None:
                 metrics=test_m,
             )
 
-            scores_pos, scores_neg = _build_label_conditional_conformal_scores(
-                y_val=y_val, prob_pos_val=p_val[idx]
+            scores_pos, scores_neg, scores_pos_w, scores_neg_w = _build_label_conditional_conformal_scores(
+                y_val=y_val, prob_pos_val=p_val[idx], sample_weights_val=cp_w_val
             )
             accepted_mask_val, pred_label_val = _conformal_single_label_accept_mask(
                 prob_pos_test=p_val[idx],
                 sorted_scores_pos=scores_pos,
                 sorted_scores_neg=scores_neg,
                 alpha=args.conformal_alpha,
+                sorted_weights_pos=scores_pos_w,
+                sorted_weights_neg=scores_neg_w,
+                test_sample_weights=cp_w_val,
             )
             accepted_mask, pred_label_test = _conformal_single_label_accept_mask(
                 prob_pos_test=p_test[idx],
                 sorted_scores_pos=scores_pos,
                 sorted_scores_neg=scores_neg,
                 alpha=args.conformal_alpha,
+                sorted_weights_pos=scores_pos_w,
+                sorted_weights_neg=scores_neg_w,
+                test_sample_weights=cp_w_test,
             )
             _accumulate_conformal_hist_values(
                 conformal_hist_store,
@@ -1998,20 +2280,26 @@ def main() -> None:
                 ),
             )
 
-            scores_pos, scores_neg = _build_label_conditional_conformal_scores(
-                y_val=y_val, prob_pos_val=val_prob
+            scores_pos, scores_neg, scores_pos_w, scores_neg_w = _build_label_conditional_conformal_scores(
+                y_val=y_val, prob_pos_val=val_prob, sample_weights_val=cp_w_val
             )
             accepted_mask_val, pred_label_val = _conformal_single_label_accept_mask(
                 prob_pos_test=val_prob,
                 sorted_scores_pos=scores_pos,
                 sorted_scores_neg=scores_neg,
                 alpha=args.conformal_alpha,
+                sorted_weights_pos=scores_pos_w,
+                sorted_weights_neg=scores_neg_w,
+                test_sample_weights=cp_w_val,
             )
             accepted_mask, pred_label_test = _conformal_single_label_accept_mask(
                 prob_pos_test=test_prob,
                 sorted_scores_pos=scores_pos,
                 sorted_scores_neg=scores_neg,
                 alpha=args.conformal_alpha,
+                sorted_weights_pos=scores_pos_w,
+                sorted_weights_neg=scores_neg_w,
+                test_sample_weights=cp_w_test,
             )
             _accumulate_conformal_hist_values(
                 conformal_hist_store,
