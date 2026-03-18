@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import deepchem as dc
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.isotonic import IsotonicRegression
 import torch
 from nn import graphdata_to_batchmolgraph
@@ -862,6 +863,95 @@ def _export_confusion_matrix_grid(
     pd.DataFrame(csv_rows).to_csv(out_csv, index=False)
 
 
+def _export_ensemble_weight_bars(
+    all_weights: Dict[str, List[np.ndarray]],
+    base_methods: Sequence[str],
+    out_png: Path,
+    out_csv: Path,
+) -> None:
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    stack_names = [k for k in sorted(all_weights.keys()) if len(all_weights.get(k, [])) > 0]
+    if not stack_names or len(base_methods) == 0:
+        return
+
+    means = np.zeros((len(stack_names), len(base_methods)), dtype=float)
+    stds = np.zeros((len(stack_names), len(base_methods)), dtype=float)
+    csv_rows: List[Dict[str, Any]] = []
+    for i, stack_name in enumerate(stack_names):
+        arr = np.asarray(all_weights[stack_name], dtype=float)  # (runs, K)
+        if arr.ndim != 2 or arr.shape[1] != len(base_methods):
+            continue
+        means[i] = arr.mean(axis=0)
+        stds[i] = arr.std(axis=0, ddof=0)
+        for j, method in enumerate(base_methods):
+            csv_rows.append(
+                {
+                    "ensemble_method": stack_name,
+                    "base_method": method,
+                    "weight_mean": float(means[i, j]),
+                    "weight_std": float(stds[i, j]),
+                    "runs": int(arr.shape[0]),
+                }
+            )
+
+    K = len(base_methods)
+    n_cols = len(stack_names)
+    fig, axes = plt.subplots(
+        1,
+        n_cols,
+        figsize=(max(12, 3.2 * n_cols), 4.6),
+        squeeze=False,
+        sharey=True,
+    )
+    cmap = plt.cm.get_cmap("tab10", K)
+    x_local = np.arange(K, dtype=float)
+    y_max = max(1.0, float(np.max(means + stds) * 1.15))
+
+    for i, stack_name in enumerate(stack_names):
+        ax = axes[0, i]
+        ax.bar(
+            x_local,
+            means[i],
+            yerr=stds[i],
+            capsize=3,
+            color=[cmap(j) for j in range(K)],
+            alpha=0.9,
+            edgecolor="white",
+            linewidth=0.6,
+        )
+        ax.set_title(_display_model_name(f"stack::{stack_name}"), fontsize=11)
+        ax.set_xticks(x_local)
+        ax.set_xticklabels([_display_model_name(f"base::{m}") for m in base_methods], rotation=45, ha="right", fontsize=9)
+        ax.grid(axis="y", alpha=0.25)
+        ax.set_ylim(0.0, y_max)
+        # Make each panel visually square-ish like confusion-matrix blocks.
+        try:
+            ax.set_box_aspect(1.0)
+        except Exception:
+            pass
+        if i != 0:
+            ax.set_yticklabels([])
+
+    handles = [
+        plt.Line2D([0], [0], color=cmap(j), lw=8, label=_display_model_name(f"base::{m}"))
+        for j, m in enumerate(base_methods)
+    ]
+    fig.legend(
+        handles=handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.04),
+        ncol=min(4, max(1, K)),
+        frameon=False,
+        fontsize=10,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    fig.savefig(out_png, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    pd.DataFrame(csv_rows).to_csv(out_csv, index=False)
+
+
 def _export_radar_grid(
     radar_metrics_store: Dict[str, Dict[str, Dict[str, List[Dict[str, Any]]]]],
     scenario: str,
@@ -1041,6 +1131,143 @@ def _export_radar_grid(
         pd.DataFrame(csv_rows).to_csv(out_csv, index=False)
 
 
+def _export_radar_base_vs_baselines(
+    radar_metrics_store: Dict[str, Dict[str, Dict[str, List[Dict[str, Any]]]]],
+    out_png: Path,
+    out_csv: Path,
+) -> None:
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    scenario = "all"
+    metric_spec = [
+        ("AUC", True),
+        ("F1", True),
+        ("MCC", True),
+        ("Accuracy", True),
+        ("NLL", False),
+        ("Brier", False),
+        ("ECE", False),
+    ]
+    metric_names = [m for m, _ in metric_spec]
+    metric_dirs = {m: hb for m, hb in metric_spec}
+    splits = ["val", "test"]
+    radar_floor = 0.20
+
+    fig, axes = plt.subplots(1, 2, figsize=(20.0, 9.6), subplot_kw={"polar": True})
+    angles = np.linspace(0, 2 * np.pi, len(metric_names), endpoint=False)
+    angles_closed = np.concatenate([angles, angles[:1]])
+    csv_rows: List[Dict[str, Any]] = []
+    legend_items: Dict[str, Any] = {}
+
+    for c, split in enumerate(splits):
+        ax = axes[c]
+        per_model_runs = radar_metrics_store.get(scenario, {}).get(split, {})
+        mean_by_model: Dict[str, Dict[str, float]] = {}
+        for model_name, rows in per_model_runs.items():
+            if not rows:
+                continue
+            metric_keys = sorted(set().union(*[rr.keys() for rr in rows]))
+            mm: Dict[str, float] = {}
+            for metric_name in metric_keys:
+                sample = rows[0].get(metric_name, np.nan)
+                if not isinstance(sample, (int, float, np.number)):
+                    continue
+                vals = np.asarray([rr.get(metric_name, np.nan) for rr in rows], dtype=float)
+                finite = np.isfinite(vals)
+                mm[metric_name] = float(np.mean(vals[finite])) if np.any(finite) else float("nan")
+            mean_by_model[model_name] = mm
+
+        selected_models = sorted(
+            [m for m in mean_by_model.keys() if m.startswith("base::")]
+        ) + ["baseline::always_pos", "baseline::always_neg"]
+        selected_models = [m for m in selected_models if m in mean_by_model]
+        if not selected_models:
+            continue
+
+        raw = np.full((len(selected_models), len(metric_names)), np.nan, dtype=float)
+        for i, model_name in enumerate(selected_models):
+            vals = mean_by_model[model_name]
+            for j, metric_name in enumerate(metric_names):
+                raw[i, j] = float(vals.get(metric_name, np.nan))
+
+        norm = np.zeros_like(raw, dtype=float)
+        for j, metric_name in enumerate(metric_names):
+            col = raw[:, j]
+            finite = np.isfinite(col)
+            if not np.any(finite):
+                continue
+            cvals = col[finite]
+            c_min = float(np.min(cvals))
+            c_max = float(np.max(cvals))
+            if abs(c_max - c_min) < 1e-12:
+                norm[finite, j] = 0.5
+            else:
+                if metric_dirs[metric_name]:
+                    norm[finite, j] = (cvals - c_min) / (c_max - c_min)
+                else:
+                    norm[finite, j] = (c_max - cvals) / (c_max - c_min)
+            norm[~finite, j] = 0.0
+        norm_shifted = radar_floor + (1.0 - radar_floor) * norm
+
+        for i, model_name in enumerate(selected_models):
+            values = np.concatenate([norm_shifted[i], norm_shifted[i, :1]])
+            display_name = _display_model_name(model_name)
+            if model_name.startswith("baseline::"):
+                line, = ax.plot(
+                    angles_closed,
+                    values,
+                    linewidth=2.4,
+                    linestyle="--",
+                    label=display_name,
+                )
+            else:
+                line, = ax.plot(
+                    angles_closed,
+                    values,
+                    linewidth=2.2,
+                    linestyle="-",
+                    label=display_name,
+                )
+            if display_name not in legend_items:
+                legend_items[display_name] = line
+            row: Dict[str, Any] = {
+                "scenario": scenario,
+                "split": split,
+                "model_name": model_name,
+                "model_display_name": display_name,
+            }
+            for j, metric_name in enumerate(metric_names):
+                row[f"{metric_name}_mean_raw"] = float(raw[i, j]) if np.isfinite(raw[i, j]) else float("nan")
+                row[f"{metric_name}_radar_norm"] = float(norm[i, j])
+                row[f"{metric_name}_radar_plot_radius"] = float(norm_shifted[i, j])
+            csv_rows.append(row)
+
+        ax.set_xticks(angles)
+        ax.set_xticklabels(metric_names, fontsize=16)
+        ax.set_yticks([0.0, 0.25, 0.5, 0.75, 1.0])
+        ax.set_yticklabels(["0.00", "0.25", "0.50", "0.75", "1.00"], fontsize=15)
+        ax.set_ylim(0.0, 1.0)
+        ax.grid(alpha=0.25)
+        ax.set_title(split.upper(), fontsize=18, pad=18)
+
+    if legend_items:
+        fig.legend(
+            handles=list(legend_items.values()),
+            labels=list(legend_items.keys()),
+            loc="upper center",
+            bbox_to_anchor=(0.5, 1.05),
+            ncol=min(5, max(1, len(legend_items))),
+            frameon=False,
+            fontsize=16,
+        )
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    fig.savefig(out_png, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    if csv_rows:
+        pd.DataFrame(csv_rows).to_csv(out_csv, index=False)
+
+
 def _get_weighted_cp_sample_weights(
     *,
     split_name: str,
@@ -1200,6 +1427,67 @@ def _compute_weighted_cp_weights_from_domain_model(
     # Stable weighted CP instantiation:
     # w(x) = (p(x) + off) / (1 - p(x) + off), where p(x)=P(test domain|x).
     # off>0 softens extreme ratios when p(x) is near 1.
+    w_val = (p_val + off) / np.clip(1.0 - p_val + off, 1e-12, None)
+    w_test = (p_test + off) / np.clip(1.0 - p_test + off, 1e-12, None)
+    w_max = float(max(weight_clip_max, 1.0))
+    w_val = np.clip(w_val, 1e-8, w_max).astype(np.float64)
+    w_test = np.clip(w_test, 1e-8, w_max).astype(np.float64)
+    return w_val, w_test
+
+
+def _compute_weighted_cp_weights_online_rf(
+    *,
+    label_dir: Path,
+    val_split: str,
+    test_split: str,
+    smiles_column: str,
+    ecfp_size: int,
+    ecfp_radius: int,
+    weight_clip_max: float,
+    prob_clip: float,
+    ratio_offset: float,
+    n_estimators: int,
+    max_depth: int,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    # Online lightweight domain classifier: val=0, test=1.
+    x_val = _build_domain_split_features(
+        label_dir=label_dir,
+        split_name=val_split,
+        encoder_type="identity",
+        smiles_column=smiles_column,
+        ecfp_size=ecfp_size,
+        ecfp_radius=ecfp_radius,
+    )
+    x_test = _build_domain_split_features(
+        label_dir=label_dir,
+        split_name=test_split,
+        encoder_type="identity",
+        smiles_column=smiles_column,
+        ecfp_size=ecfp_size,
+        ecfp_radius=ecfp_radius,
+    )
+    x_val = np.asarray(x_val, dtype=np.float32)
+    x_test = np.asarray(x_test, dtype=np.float32)
+    y_val_domain = np.zeros(len(x_val), dtype=int)
+    y_test_domain = np.ones(len(x_test), dtype=int)
+    x_domain = np.concatenate([x_val, x_test], axis=0)
+    y_domain = np.concatenate([y_val_domain, y_test_domain], axis=0)
+
+    rf = RandomForestClassifier(
+        n_estimators=int(max(n_estimators, 1)),
+        max_depth=None if int(max_depth) <= 0 else int(max_depth),
+        random_state=int(seed),
+        n_jobs=-1,
+    )
+    rf.fit(x_domain, y_domain)
+    p_val = rf.predict_proba(x_val)[:, 1].astype(np.float64)
+    p_test = rf.predict_proba(x_test)[:, 1].astype(np.float64)
+
+    p_eps = float(max(prob_clip, 1e-2))
+    p_val = np.clip(p_val, p_eps, 1.0 - p_eps)
+    p_test = np.clip(p_test, p_eps, 1.0 - p_eps)
+    off = float(max(ratio_offset, 0.0))
     w_val = (p_val + off) / np.clip(1.0 - p_val + off, 1e-12, None)
     w_test = (p_test + off) / np.clip(1.0 - p_test + off, 1e-12, None)
     w_max = float(max(weight_clip_max, 1.0))
@@ -1616,6 +1904,13 @@ def main() -> None:
         help="Optional checkpoint path for val-vs-test domain classifier used in weighted CP.",
     )
     parser.add_argument(
+        "--weighted_cp_source",
+        type=str,
+        default="none",
+        choices=["none", "checkpoint", "online_rf"],
+        help="Source of weighted CP domain weights: none, checkpoint, or online_rf.",
+    )
+    parser.add_argument(
         "--weighted_cp_weight_clip_max",
         type=float,
         default=1000.0,
@@ -1632,6 +1927,42 @@ def main() -> None:
         type=float,
         default=1e-3,
         help="Offset in stable ratio w(x)=(p+offset)/(1-p+offset).",
+    )
+    parser.add_argument(
+        "--weighted_cp_smiles_column",
+        type=str,
+        default="SMILES",
+        help="SMILES column name for online_rf weighted CP source.",
+    )
+    parser.add_argument(
+        "--weighted_cp_ecfp_size",
+        type=int,
+        default=1024,
+        help="ECFP size for online_rf weighted CP source.",
+    )
+    parser.add_argument(
+        "--weighted_cp_ecfp_radius",
+        type=int,
+        default=2,
+        help="ECFP radius for online_rf weighted CP source.",
+    )
+    parser.add_argument(
+        "--weighted_cp_rf_n_estimators",
+        type=int,
+        default=25,
+        help="Number of trees for online_rf weighted CP source.",
+    )
+    parser.add_argument(
+        "--weighted_cp_rf_max_depth",
+        type=int,
+        default=6,
+        help="Tree max depth for online_rf weighted CP source. <=0 means unlimited.",
+    )
+    parser.add_argument(
+        "--weighted_cp_rf_seed",
+        type=int,
+        default=0,
+        help="Random seed for online_rf weighted CP source.",
     )
     args = parser.parse_args()
 
@@ -1674,7 +2005,28 @@ def main() -> None:
     cp_w_test = _get_weighted_cp_sample_weights(
         split_name=args.test_split, n_samples=len(y_test)
     )
-    if args.weighted_cp_domain_model.strip():
+    if args.weighted_cp_source == "online_rf":
+        cp_w_val, cp_w_test = _compute_weighted_cp_weights_online_rf(
+            label_dir=label_dir,
+            val_split=args.val_split,
+            test_split=args.test_split,
+            smiles_column=args.weighted_cp_smiles_column,
+            ecfp_size=args.weighted_cp_ecfp_size,
+            ecfp_radius=args.weighted_cp_ecfp_radius,
+            weight_clip_max=args.weighted_cp_weight_clip_max,
+            prob_clip=args.weighted_cp_prob_clip,
+            ratio_offset=args.weighted_cp_ratio_offset,
+            n_estimators=args.weighted_cp_rf_n_estimators,
+            max_depth=args.weighted_cp_rf_max_depth,
+            seed=args.weighted_cp_rf_seed,
+        )
+    elif args.weighted_cp_source == "checkpoint" or (
+        args.weighted_cp_source == "none" and args.weighted_cp_domain_model.strip()
+    ):
+        if not args.weighted_cp_domain_model.strip():
+            raise ValueError(
+                "--weighted_cp_source checkpoint requires --weighted_cp_domain_model path."
+            )
         domain_model_path = Path(args.weighted_cp_domain_model)
         if not domain_model_path.is_absolute():
             domain_model_path = repo_root / domain_model_path
@@ -2668,6 +3020,12 @@ def main() -> None:
         store=auc_cutoff_store,
         out_dir=uncertainty_dist_dir,
     )
+    _export_ensemble_weight_bars(
+        all_weights=all_weights,
+        base_methods=methods,
+        out_png=summary_csv.parent / "ensemble_weight_bars.png",
+        out_csv=summary_csv.parent / "ensemble_weight_bars.csv",
+    )
     _export_reliability_diagrams(
         store=auc_cutoff_store,
         out_dir=uncertainty_dist_dir,
@@ -2727,6 +3085,11 @@ def main() -> None:
             focus_base_model=focus_key,
             include_baselines=False,
         )
+    _export_radar_base_vs_baselines(
+        radar_metrics_store=radar_metrics_store,
+        out_png=summary_csv.parent / "radar_all_base_vs_allpos_allneg.png",
+        out_csv=summary_csv.parent / "radar_all_base_vs_allpos_allneg.csv",
+    )
 
     if conformal_aggregate:
         for name, rows in conformal_aggregate.items():

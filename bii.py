@@ -4,12 +4,20 @@ import inspect
 import os
 import pickle
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import deepchem as dc
 import numpy as np
 import pandas as pd
 import torch
+
+try:
+    from tabpfn import TabPFNClassifier
+
+    _TABPFN_AVAILABLE = True
+except Exception:
+    TabPFNClassifier = None  # type: ignore[assignment]
+    _TABPFN_AVAILABLE = False
 
 
 def _ensure_deepchem_torchmodel_alias() -> None:
@@ -208,7 +216,7 @@ def _extract_positive_probs(raw_probs: np.ndarray) -> np.ndarray:
 
 
 def _predict_positive_probs(
-    model: torch.nn.Module,
+    model: Any,
     x: np.ndarray,
     encoder_type: str,
     model_type: str,
@@ -227,21 +235,30 @@ def _predict_positive_probs(
     return probs
 
 
-def evaluate_classification_dc(
-    dc_model: UnifiedTorchModel,
+def evaluate_classification(
+    model_obj: Any,
     x: np.ndarray,
     y: np.ndarray,
     encoder_type: str = "identity",
     model_type: str = "evidential",
     mc_dropout_samples: int = 100,
 ) -> Dict[str, float]:
-    probs = _predict_positive_probs(
-        model=dc_model.model,
-        x=x,
-        encoder_type=encoder_type,
-        model_type=model_type,
-        mc_dropout_samples=mc_dropout_samples,
-    )
+    if model_type == "tabpfn":
+        probs = _predict_positive_probs(
+            model=model_obj,
+            x=x,
+            encoder_type=encoder_type,
+            model_type=model_type,
+            mc_dropout_samples=mc_dropout_samples,
+        )
+    else:
+        probs = _predict_positive_probs(
+            model=model_obj.model,
+            x=x,
+            encoder_type=encoder_type,
+            model_type=model_type,
+            mc_dropout_samples=mc_dropout_samples,
+        )
     y_true = y.reshape(-1, 1).astype(np.float32)
     pred = (probs >= 0.5).astype(np.float32)
     acc = float((pred == y_true).mean())
@@ -265,10 +282,35 @@ def train_binary_classifier(
     mc_dropout_train_samples: int = 20,
     mc_dropout_rate: float = 0.2,
     mc_dropout_samples: int = 100,
-) -> UnifiedTorchModel:
+    tabpfn_device: str = "auto",
+    random_state: int = 0,
+) -> Any:
     n_tasks = train_y.shape[1]
-    if model_type not in {"evidential", "mc_dropout"}:
+    if model_type not in {"evidential", "mc_dropout", "tabpfn"}:
         raise ValueError(f"Unsupported model_type: {model_type}")
+    if model_type == "tabpfn":
+        if not _TABPFN_AVAILABLE:
+            raise ImportError(
+                "TabPFN is not installed. Install it with: pip install tabpfn"
+            )
+        if encoder_type == "dmpnn":
+            raise ValueError("TabPFN currently supports ECFP/identity features only.")
+        model = TabPFNClassifier(device=tabpfn_device, random_state=random_state)
+        print("Training TabPFN classifier...")
+        model.fit(train_x.astype(np.float32), train_y.reshape(-1).astype(int))
+        val_metrics = evaluate_classification(
+            model_obj=model,
+            x=val_x,
+            y=val_y,
+            encoder_type=encoder_type,
+            model_type=model_type,
+            mc_dropout_samples=mc_dropout_samples,
+        )
+        print(
+            f"Post-train val metrics | acc={val_metrics['acc']:.4f} "
+            f"| brier={val_metrics['brier']:.4f}"
+        )
+        return model
 
     model = build_model(
         model_type=model_type,
@@ -325,10 +367,10 @@ def train_binary_classifier(
     print(f"Training nn_baseline {model_type} classifier for {epochs} epochs...")
     dc_model.fit(train_ds, nb_epoch=epochs, callbacks=[clip_callback])
 
-    val_metrics = evaluate_classification_dc(
-        dc_model,
-        val_x,
-        val_y,
+    val_metrics = evaluate_classification(
+        model_obj=dc_model,
+        x=val_x,
+        y=val_y,
         encoder_type=encoder_type,
         model_type=model_type,
         mc_dropout_samples=mc_dropout_samples,
@@ -341,7 +383,7 @@ def train_binary_classifier(
 
 
 def save_checkpoint(
-    dc_model: UnifiedTorchModel,
+    model_obj: Any,
     checkpoint_path: str,
     n_features: int,
     ecfp_size: int,
@@ -356,9 +398,10 @@ def save_checkpoint(
     mc_dropout_rate: float = 0.2,
 ) -> None:
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    backend = "tabpfn" if model_type == "tabpfn" else "torch"
     ckpt = {
-        "model_state_dict": dc_model.model.state_dict(),
         "model_type": model_type,
+        "backend": backend,
         "n_features": int(n_features),
         "n_tasks": 1,
         "ecfp_size": int(ecfp_size),
@@ -371,6 +414,10 @@ def save_checkpoint(
         "mc_dropout_samples": int(mc_dropout_samples),
         "mc_dropout_rate": float(mc_dropout_rate),
     }
+    if backend == "torch":
+        ckpt["model_state_dict"] = model_obj.model.state_dict()
+    else:
+        ckpt["tabpfn_model"] = model_obj
     torch.save(ckpt, checkpoint_path)
     print(f"Saved checkpoint: {checkpoint_path}")
 
@@ -379,6 +426,7 @@ def inspect_checkpoint_hparams(checkpoint_path: str) -> Dict[str, object]:
     ckpt = torch.load(checkpoint_path, map_location="cpu")
     meta = {
         "model_type": ckpt.get("model_type"),
+        "backend": ckpt.get("backend", "torch"),
         "n_features": ckpt.get("n_features"),
         "n_tasks": ckpt.get("n_tasks"),
         "ecfp_size": ckpt.get("ecfp_size"),
@@ -399,14 +447,16 @@ def inspect_checkpoint_hparams(checkpoint_path: str) -> Dict[str, object]:
 
 def _normalize_model_type(model_type_meta: Optional[object]) -> str:
     raw = "" if model_type_meta is None else str(model_type_meta).lower()
-    if raw in {"evidential", "mc_dropout"}:
+    if raw in {"evidential", "mc_dropout", "tabpfn"}:
         return raw
     if "mc_dropout" in raw:
         return "mc_dropout"
+    if "tabpfn" in raw:
+        return "tabpfn"
     return "evidential"
 
 
-def load_checkpoint(checkpoint_path: str) -> Tuple[torch.nn.Module, Dict[str, object]]:
+def load_checkpoint(checkpoint_path: str) -> Tuple[Any, Dict[str, object]]:
     meta = inspect_checkpoint_hparams(checkpoint_path)
     n_features = meta.get("n_features")
     n_tasks = meta.get("n_tasks", 1)
@@ -415,6 +465,14 @@ def load_checkpoint(checkpoint_path: str) -> Tuple[torch.nn.Module, Dict[str, ob
 
     encoder_type = str(meta.get("encoder_type", "identity"))
     model_type = _normalize_model_type(meta.get("model_type"))
+    backend = str(meta.get("backend", "torch"))
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    if backend == "tabpfn" or model_type == "tabpfn":
+        if "tabpfn_model" not in ckpt:
+            raise ValueError("Checkpoint missing tabpfn_model.")
+        model = ckpt["tabpfn_model"]
+        return model, meta
+
     mc_dropout_rate = float(meta.get("mc_dropout_rate", 0.2))
     model = build_model(
         model_type=model_type,
@@ -424,7 +482,6 @@ def load_checkpoint(checkpoint_path: str) -> Tuple[torch.nn.Module, Dict[str, ob
         encoder_type=encoder_type,
         dropout_rate=mc_dropout_rate,
     )
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     return model, meta
@@ -501,6 +558,27 @@ def _infer_evidential_from_features(
             "prob_class2_negative": p_negative,
             "epistemic_uncertainty": epistemic,
             "aleatoric_uncertainty": aleatoric,
+        }
+    )
+
+
+def _infer_tabpfn_from_features(model: Any, x: np.ndarray) -> pd.DataFrame:
+    probs = model.predict_proba(x.astype(np.float32))
+    probs = np.asarray(probs, dtype=np.float32)
+    if probs.ndim != 2 or probs.shape[1] < 2:
+        raise RuntimeError(f"Unexpected TabPFN probabilities shape: {probs.shape}")
+    p_negative = probs[:, 0]
+    p_positive = probs[:, 1]
+    eps = 1e-10
+    entropy = -(
+        p_positive * np.log(p_positive + eps) + p_negative * np.log(p_negative + eps)
+    )
+    return pd.DataFrame(
+        {
+            "prob_class1_positive": p_positive,
+            "prob_class2_negative": p_negative,
+            "epistemic_uncertainty": entropy,
+            "aleatoric_uncertainty": np.zeros_like(entropy),
         }
     )
 
@@ -584,7 +662,7 @@ def _infer_mc_dropout_from_features(
 
 @torch.no_grad()
 def _infer_from_features(
-    model: torch.nn.Module,
+    model: Any,
     x: np.ndarray,
     smiles_out: List[str],
     input_indices: List[int],
@@ -593,6 +671,8 @@ def _infer_from_features(
     mc_dropout_samples: int = 100,
 ) -> pd.DataFrame:
     normalized_type = _normalize_model_type(model_type)
+    if normalized_type == "tabpfn":
+        return _infer_tabpfn_from_features(model=model, x=x)
     if normalized_type == "mc_dropout":
         return _infer_mc_dropout_from_features(
             model=model,
@@ -611,7 +691,7 @@ def _infer_from_features(
 
 @torch.no_grad()
 def infer_from_smiles(
-    model: torch.nn.Module,
+    model: Any,
     smiles: List[str],
     ecfp_size: int,
     radius: int,
@@ -634,7 +714,7 @@ def infer_from_smiles(
 
 
 def infer_from_file(
-    model: torch.nn.Module,
+    model: Any,
     input_path: str,
     smiles_column: str,
     ecfp_size: int,
@@ -766,10 +846,18 @@ def main() -> None:
     parser.add_argument("--grad_clip", type=float, default=5.0)
     parser.add_argument(
         "--model_type",
-        choices=["evidential", "mc_dropout"],
+        choices=["evidential", "mc_dropout", "tabpfn"],
         default="evidential",
         help="Choose uncertainty model type for training/inference.",
     )
+    parser.add_argument(
+        "--tabpfn_device",
+        type=str,
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Device used by TabPFN (only when --model_type tabpfn).",
+    )
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--mc_dropout_samples",
         type=int,
@@ -828,10 +916,19 @@ def main() -> None:
         train_x, train_y = splits["train"]["X"], splits["train"]["y"]
         val_x, val_y = splits["val"]["X"], splits["val"]["y"]
         test_x, test_y = splits["test"]["X"], splits["test"]["y"]
-        train_ds_for_shape = _to_dc_dataset(train_x, train_y, encoder_type=args.encoder_type)
-        n_features = get_n_features(train_ds_for_shape, encoder_type=args.encoder_type)
+        if args.model_type == "tabpfn":
+            if args.encoder_type == "dmpnn":
+                raise ValueError(
+                    "TabPFN does not support --use_graph. Use ECFP/identity features."
+                )
+            n_features = int(train_x.shape[1])
+        else:
+            train_ds_for_shape = _to_dc_dataset(
+                train_x, train_y, encoder_type=args.encoder_type
+            )
+            n_features = get_n_features(train_ds_for_shape, encoder_type=args.encoder_type)
 
-        dc_model = train_binary_classifier(
+        trained_model = train_binary_classifier(
             train_x=train_x,
             train_y=train_y,
             val_x=val_x,
@@ -847,12 +944,14 @@ def main() -> None:
             mc_dropout_train_samples=args.mc_dropout_train_samples,
             mc_dropout_rate=args.mc_dropout_rate,
             mc_dropout_samples=args.mc_dropout_samples,
+            tabpfn_device=args.tabpfn_device,
+            random_state=args.seed,
         )
 
-        test_metrics = evaluate_classification_dc(
-            dc_model,
-            test_x,
-            test_y,
+        test_metrics = evaluate_classification(
+            model_obj=trained_model,
+            x=test_x,
+            y=test_y,
             encoder_type=args.encoder_type,
             model_type=args.model_type,
             mc_dropout_samples=args.mc_dropout_samples,
@@ -867,7 +966,7 @@ def main() -> None:
             save_dir = repo_root / save_dir
         ckpt_path = save_dir / f"{args.model_name}.pt"
         save_checkpoint(
-            dc_model=dc_model,
+            model_obj=trained_model,
             checkpoint_path=str(ckpt_path),
             n_features=n_features,
             ecfp_size=args.ecfp_size,
