@@ -22,15 +22,6 @@ Original 3-base-model variant (legacy) is:
 
 ---
 
-## 0) Required Hugging Face Auth (TabPFN gated model)
-
-Run this before any TabPFN command:
-
-```bash
-export HF_TOKEN=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
-```
-
----
 
 ## 1) Train Domain Classifier (for weighted CP)
 

@@ -128,7 +128,7 @@ def load_custom_ecfp_tox_pkl(
     reload: bool = True,
 ) -> Dict[str, Dict[str, np.ndarray]]:
     files = {
-        "train": "HEK_unb_naive_BM_train.pkl",
+        "train": "HEK293_train_BM.pkl",
         "val": "HEK293_test_BM.pkl",
         "test": "tox21_all.pkl",
     }
@@ -1001,7 +1001,7 @@ def main() -> None:
     mc_dropout_samples = int(meta.get("mc_dropout_samples", args.mc_dropout_samples))
     if args.inference_all_splits:
         split_files = {
-            "train": data_dir / "HEK_unb_naive_BM_train.pkl",
+            "train": data_dir / "HEK293_train_BM.pkl",
             "val": data_dir / "HEK293_test_BM.pkl",
             "test": data_dir / "tox21_all.pkl",
         }
