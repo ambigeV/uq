@@ -350,15 +350,36 @@ def _fit_weights_uncertainty_inverse_isotonic(
     y_val: np.ndarray,
     target_recall: float = 0.95,
     tau: float = 1.0,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    score_cap: float = 1e6,
+    ood_lambda: float = 0.75,
+    ood_z_tolerance: float = 1.5,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     """
     Calibrate per-method uncertainty via isotonic regression against validation error.
 
     x: uncertainty score
     y: 1 if prediction is wrong at that method's threshold, else 0
+
+    Weighting:
+    - Build empirical CDF quantiles against each method's validation isotonic distribution.
+    - Use exponential inverse-uncertainty scores exp(-tau * quantile), normalized per sample.
     """
     y = np.asarray(y_val, dtype=int).reshape(-1)
     calibrated = np.zeros_like(u_val, dtype=np.float64)
+    calibrated_test = np.zeros_like(u_test, dtype=np.float64)
     iso_coeff_val = np.zeros(p_val.shape[0], dtype=np.float64)
     iso_coeff_test = np.zeros(p_val.shape[0], dtype=np.float64)
 
@@ -377,6 +398,7 @@ def _fit_weights_uncertainty_inverse_isotonic(
             iso_coeff_val[k] = float(np.mean(ratio_val))
             u_test_k = np.asarray(u_test[k], dtype=float).reshape(-1)
             cal_test_k = np.full_like(u_test_k, float(np.mean(err_k)), dtype=np.float64)
+            calibrated_test[k] = cal_test_k
             ratio_test = cal_test_k / np.clip(u_test_k, 1e-12, None)
             iso_coeff_test[k] = float(np.mean(ratio_test))
             continue
@@ -392,16 +414,80 @@ def _fit_weights_uncertainty_inverse_isotonic(
         iso_coeff_val[k] = float(np.mean(ratio_val))
         u_test_k = np.asarray(u_test[k], dtype=float).reshape(-1)
         cal_test_k = iso.predict(u_test_k).astype(np.float64)
+        calibrated_test[k] = cal_test_k
         ratio_test = cal_test_k / np.clip(u_test_k, 1e-12, None)
         iso_coeff_test[k] = float(np.mean(ratio_test))
 
-    inv = (1.0 / np.clip(calibrated, 1e-6, None)).mean(axis=1)
-    score = np.maximum(inv, 1e-12) ** float(tau)
-    return score / score.sum(), iso_coeff_val, iso_coeff_test
+    _ = ood_lambda
+    _ = ood_z_tolerance
+    cap = float(max(score_cap, 1e-6))
+
+    # Empirical CDF quantile against validation isotonic-uncertainty distribution.
+    quantile_val = np.zeros_like(calibrated, dtype=np.float64)
+    quantile_test = np.zeros_like(calibrated_test, dtype=np.float64)
+    for k in range(calibrated.shape[0]):
+        ref = np.sort(np.asarray(calibrated[k], dtype=np.float64).reshape(-1))
+        n_ref = len(ref)
+        if n_ref == 0:
+            quantile_val[k] = np.full_like(calibrated[k], 0.5, dtype=np.float64)
+            quantile_test[k] = np.full_like(calibrated_test[k], 0.5, dtype=np.float64)
+            continue
+        q_val_idx = np.searchsorted(ref, calibrated[k], side="right")
+        q_test_idx = np.searchsorted(ref, calibrated_test[k], side="right")
+        quantile_val[k] = (q_val_idx.astype(np.float64) + 1.0) / float(n_ref + 1.0)
+        quantile_test[k] = (q_test_idx.astype(np.float64) + 1.0) / float(n_ref + 1.0)
+    quantile_val = np.clip(quantile_val, 1e-8, 1.0)
+    quantile_test = np.clip(quantile_test, 1e-8, 1.0)
+
+    # Exponential inverse-uncertainty weighting in quantile space.
+    # Lower quantile (less uncertain vs val reference) => larger score.
+    exp_val = np.exp(-float(tau) * quantile_val)
+    exp_test = np.exp(-float(tau) * quantile_test)
+    inv_val = np.clip(exp_val, 1e-12, cap)
+    inv_test_raw = np.clip(exp_test, 1e-12, cap)
+    val_mean = np.mean(calibrated, axis=1, keepdims=True)
+    val_std = np.std(calibrated, axis=1, ddof=0, keepdims=True)
+    val_std = np.clip(val_std, 1e-6, None)
+    z_test = (calibrated_test - val_mean) / val_std
+    z_test_abs = np.abs(z_test)
+    ood_penalty = np.ones_like(inv_test_raw, dtype=np.float64)
+    inv_test = inv_test_raw * ood_penalty
+
+    sum_val = np.clip(inv_val.sum(axis=0, keepdims=True), 1e-12, None)
+    sum_test = np.clip(inv_test.sum(axis=0, keepdims=True), 1e-12, None)
+    sample_w_val = inv_val / sum_val
+    sample_w_test = inv_test / sum_test
+    # Keep a compact per-method summary (mean over val samples) for logs/bar plots.
+    mean_w = np.mean(sample_w_val, axis=1)
+    mean_w = mean_w / np.clip(mean_w.sum(), 1e-12, None)
+    return (
+        mean_w,
+        iso_coeff_val,
+        iso_coeff_test,
+        calibrated,
+        calibrated_test,
+        sample_w_val,
+        sample_w_test,
+        z_test,
+        z_test_abs,
+        quantile_test,
+        inv_test_raw,
+        ood_penalty,
+    )
 
 
 def _apply_weights(p: np.ndarray, w: np.ndarray) -> np.ndarray:
-    return (w[:, None] * p).sum(axis=0)
+    p_arr = np.asarray(p, dtype=np.float64)
+    w_arr = np.asarray(w, dtype=np.float64)
+    if w_arr.ndim == 1:
+        if w_arr.shape[0] != p_arr.shape[0]:
+            raise ValueError(f"Weight length mismatch: {w_arr.shape[0]} vs {p_arr.shape[0]}.")
+        return (w_arr[:, None] * p_arr).sum(axis=0)
+    if w_arr.ndim == 2:
+        if w_arr.shape != p_arr.shape:
+            raise ValueError(f"Adaptive weight shape mismatch: {w_arr.shape} vs {p_arr.shape}.")
+        return (w_arr * p_arr).sum(axis=0)
+    raise ValueError(f"Unsupported weight ndim={w_arr.ndim}; expected 1 or 2.")
 
 
 def _load_labels(label_dir: Path, split_name: str, label_column: str) -> np.ndarray:
@@ -680,6 +766,203 @@ def _export_uncertainty_distributions(
             pd.DataFrame(csv_rows).to_csv(out_dir / f"{stem}.csv", index=False)
 
 
+def _export_isotonic_uncertainty_boxplots(
+    *,
+    methods: Sequence[str],
+    val_store: Dict[str, List[np.ndarray]],
+    test_store: Dict[str, List[np.ndarray]],
+    out_dir: Path,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _export_one_split(split: str, store: Dict[str, List[np.ndarray]], out_png: Path) -> None:
+        labels: List[str] = []
+        values: List[np.ndarray] = []
+        for method in methods:
+            arrays = [np.asarray(a, dtype=float).reshape(-1) for a in store.get(method, []) if np.asarray(a).size > 0]
+            if not arrays:
+                continue
+            merged = np.concatenate(arrays, axis=0)
+            if merged.size == 0:
+                continue
+            labels.append(_display_model_name(f"base::{method}"))
+            values.append(merged)
+        if not values:
+            return
+
+        fig, ax = plt.subplots(1, 1, figsize=(max(12, 1.4 * len(labels)), 6))
+        bp = ax.boxplot(
+            values,
+            labels=labels,
+            patch_artist=True,
+            showfliers=False,
+            whis=(5, 95),
+        )
+        for patch in bp["boxes"]:
+            patch.set_facecolor("#4C78A8")
+            patch.set_alpha(0.65)
+        ax.set_ylabel("Isotonic-calibrated uncertainty")
+        ax.set_xlabel("Base model")
+        ax.set_title(f"{split} isotonic-calibrated uncertainty by base model")
+        ax.grid(axis="y", alpha=0.25)
+        ax.tick_params(axis="x", rotation=30)
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=220, bbox_inches="tight")
+        plt.close(fig)
+
+    _export_one_split(
+        split="Validation",
+        store=val_store,
+        out_png=out_dir / "isotonic_uncertainty_boxplot_val.png",
+    )
+    _export_one_split(
+        split="Test",
+        store=test_store,
+        out_png=out_dir / "isotonic_uncertainty_boxplot_test.png",
+    )
+
+    # Paired val/test boxplots per base model for direct distribution-gap inspection.
+    paired_labels: List[str] = []
+    paired_values: List[np.ndarray] = []
+    paired_positions: List[float] = []
+    paired_sides: List[str] = []
+    tick_positions: List[float] = []
+    pos = 1.0
+    pair_gap = 1.15
+    for method in methods:
+        val_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in val_store.get(method, []) if np.asarray(a).size > 0]
+        test_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in test_store.get(method, []) if np.asarray(a).size > 0]
+        if not val_arrays and not test_arrays:
+            continue
+        val_values = np.concatenate(val_arrays, axis=0) if val_arrays else np.asarray([], dtype=float)
+        test_values = np.concatenate(test_arrays, axis=0) if test_arrays else np.asarray([], dtype=float)
+        if val_values.size == 0 and test_values.size == 0:
+            continue
+        label = _display_model_name(f"base::{method}")
+        left_pos = pos
+        right_pos = pos + 0.34
+        tick_positions.append(0.5 * (left_pos + right_pos))
+        paired_labels.append(label)
+        pos += pair_gap
+        if val_values.size > 0:
+            paired_values.append(val_values)
+            paired_positions.append(left_pos)
+            paired_sides.append("val")
+        if test_values.size > 0:
+            paired_values.append(test_values)
+            paired_positions.append(right_pos)
+            paired_sides.append("test")
+
+    if paired_values:
+        fig, ax = plt.subplots(1, 1, figsize=(max(13, 1.6 * len(paired_labels)), 6.2))
+        bp = ax.boxplot(
+            paired_values,
+            positions=paired_positions,
+            widths=0.26,
+            patch_artist=True,
+            showfliers=False,
+            whis=(5, 95),
+        )
+        for patch, side in zip(bp["boxes"], paired_sides):
+            patch.set_facecolor("#4C78A8" if side == "val" else "#F58518")
+            patch.set_alpha(0.68)
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels(paired_labels, rotation=30, ha="right")
+        ax.set_ylabel("Isotonic-calibrated uncertainty")
+        ax.set_xlabel("Base model")
+        ax.set_title("Validation vs test isotonic-calibrated uncertainty by base model")
+        ax.grid(axis="y", alpha=0.25)
+        from matplotlib.patches import Patch
+        ax.legend(
+            handles=[
+                Patch(facecolor="#4C78A8", alpha=0.68, label="val"),
+                Patch(facecolor="#F58518", alpha=0.68, label="test"),
+            ],
+            frameon=False,
+            loc="upper right",
+        )
+        fig.tight_layout()
+        fig.savefig(out_dir / "isotonic_uncertainty_boxplot_val_test_paired.png", dpi=220, bbox_inches="tight")
+        plt.close(fig)
+
+
+def _export_inverse_isotonic_test_diagnostics(
+    *,
+    methods: Sequence[str],
+    z_score_test_store: Dict[str, List[np.ndarray]],
+    inverse_score_test_store: Dict[str, List[np.ndarray]],
+    quantile_test_store: Dict[str, List[np.ndarray]],
+    resultant_weight_test_store: Dict[str, List[np.ndarray]],
+    out_dir: Path,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _export_boxplot(
+        *,
+        store: Dict[str, List[np.ndarray]],
+        ylabel: str,
+        title: str,
+        out_png: Path,
+    ) -> None:
+        labels: List[str] = []
+        values: List[np.ndarray] = []
+        for method in methods:
+            arrays = [np.asarray(a, dtype=float).reshape(-1) for a in store.get(method, []) if np.asarray(a).size > 0]
+            if not arrays:
+                continue
+            merged = np.concatenate(arrays, axis=0)
+            if merged.size == 0:
+                continue
+            labels.append(_display_model_name(f"base::{method}"))
+            values.append(merged)
+        if not values:
+            return
+        fig, ax = plt.subplots(1, 1, figsize=(max(12, 1.4 * len(labels)), 6))
+        bp = ax.boxplot(
+            values,
+            labels=labels,
+            patch_artist=True,
+            showfliers=False,
+            whis=(5, 95),
+        )
+        for patch in bp["boxes"]:
+            patch.set_facecolor("#72B7B2")
+            patch.set_alpha(0.70)
+        ax.set_ylabel(ylabel)
+        ax.set_xlabel("Base model")
+        ax.set_title(title)
+        ax.grid(axis="y", alpha=0.25)
+        ax.tick_params(axis="x", rotation=30)
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=220, bbox_inches="tight")
+        plt.close(fig)
+
+    _export_boxplot(
+        store=z_score_test_store,
+        ylabel="Z-score vs calibration isotonic uncertainty distribution",
+        title="Test isotonic uncertainty z-score by base model",
+        out_png=out_dir / "inverse_isotonic_test_zscore_boxplot.png",
+    )
+    _export_boxplot(
+        store=inverse_score_test_store,
+        ylabel="Inverse-isotonic score (after tau and cap)",
+        title="Test inverse-isotonic score by base model",
+        out_png=out_dir / "inverse_isotonic_test_inverse_score_boxplot.png",
+    )
+    _export_boxplot(
+        store=quantile_test_store,
+        ylabel="Empirical CDF quantile vs val isotonic uncertainty",
+        title="Test isotonic uncertainty quantile by base model",
+        out_png=out_dir / "inverse_isotonic_test_quantile_boxplot.png",
+    )
+    _export_boxplot(
+        store=resultant_weight_test_store,
+        ylabel="Resultant isotonic-inverse test weight",
+        title="Test isotonic-inverse resultant weight by base model",
+        out_png=out_dir / "inverse_isotonic_test_resultant_weight_boxplot.png",
+    )
+
+
 def _export_brier_by_uncertainty_cutoff(
     store: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]],
     out_dir: Path,
@@ -804,6 +1087,7 @@ def _export_confusion_matrix_grid(
     out_csv.parent.mkdir(parents=True, exist_ok=True)
 
     n_models = len(entries)
+    cm_font_scale = 1.75
     fig, axes = plt.subplots(
         2, n_models, figsize=(max(21, 4.8 * n_models), 11.5), squeeze=False
     )
@@ -813,6 +1097,11 @@ def _export_confusion_matrix_grid(
     for col, entry in enumerate(entries):
         model_name = str(entry["model_name"])
         display_name = _display_model_name(model_name)
+        title_name = display_name
+        if title_name.startswith("base_"):
+            title_name = title_name[len("base_"):]
+        elif title_name.startswith("ensemble_"):
+            title_name = title_name[len("ensemble_"):]
         for row, split in enumerate(["val", "test"]):
             cm_counts = np.asarray(entry[f"{split}_cm"], dtype=float)
             row_sums = cm_counts.sum(axis=1, keepdims=True)
@@ -828,18 +1117,21 @@ def _export_confusion_matrix_grid(
                         f"{val:.1f}%",
                         ha="center",
                         va="center",
-                        fontsize=18,
+                        fontsize=18 * cm_font_scale,
                         color="black",
                     )
             ax.set_xticks([0, 1])
-            ax.set_xticklabels(["Pred 0", "Pred 1"], fontsize=16)
-            ax.set_yticks([0, 1])
-            ax.set_yticklabels(["True 0", "True 1"], fontsize=16)
-            if row == 0:
-                ax.set_title(display_name, fontsize=18)
+            ax.set_xticklabels(["Pred 0", "Pred 1"], fontsize=16 * cm_font_scale)
             if col == 0:
-                ax.set_ylabel(f"{split}\nlabel", fontsize=17)
-            ax.set_xlabel("prediction", fontsize=16)
+                ax.set_yticks([0, 1])
+                ax.set_yticklabels(["True 0", "True 1"], fontsize=16 * cm_font_scale)
+            else:
+                ax.set_yticks([])
+            if row == 0:
+                ax.set_title(title_name, fontsize=18 * cm_font_scale)
+            if col == 0:
+                ax.set_ylabel(f"{split}\nlabel", fontsize=17 * cm_font_scale)
+            ax.set_xlabel("prediction", fontsize=16 * cm_font_scale)
 
             csv_rows.append(
                 {
@@ -855,7 +1147,10 @@ def _export_confusion_matrix_grid(
                 }
             )
 
-    fig.suptitle("Confusion matrices by method (row-normalized by true label)", fontsize=22)
+    fig.suptitle(
+        "Confusion matrices by method (row-normalized by true label)",
+        fontsize=22 * cm_font_scale,
+    )
     # Avoid tight_layout warning with colorbar + multi-axes grids.
     fig.subplots_adjust(left=0.06, right=0.93, bottom=0.10, top=0.88, wspace=0.30, hspace=0.28)
     fig.savefig(out_png, dpi=220)
@@ -1852,6 +2147,24 @@ def main() -> None:
     parser.add_argument("--l2", type=float, default=1e-3)
     parser.add_argument("--uncertainty_tau", type=float, default=1.0)
     parser.add_argument(
+        "--iso_inverse_score_cap",
+        type=float,
+        default=1e6,
+        help="Upper cap for inverse-isotonic pre-normalization score.",
+    )
+    parser.add_argument(
+        "--iso_ood_lambda",
+        type=float,
+        default=0.75,
+        help="Legacy argument (unused in current quantile-exponential inverse-isotonic weighting).",
+    )
+    parser.add_argument(
+        "--iso_ood_z_tolerance",
+        type=float,
+        default=1.5,
+        help="Legacy argument (unused in current quantile-exponential inverse-isotonic weighting).",
+    )
+    parser.add_argument(
         "--uncertainty_weight_source",
         type=str,
         default="total",
@@ -2059,6 +2372,12 @@ def main() -> None:
     all_val_probs: Dict[str, List[np.ndarray]] = {k: [] for k in all_test_probs.keys()}
     all_test_uncs: Dict[str, List[np.ndarray]] = {k: [] for k in all_test_probs.keys()}
     all_weights: Dict[str, List[np.ndarray]] = {k: [] for k in all_test_probs.keys()}
+    isotonic_uncertainty_val_store: Dict[str, List[np.ndarray]] = {m: [] for m in methods}
+    isotonic_uncertainty_test_store: Dict[str, List[np.ndarray]] = {m: [] for m in methods}
+    inverse_isotonic_zscore_test_store: Dict[str, List[np.ndarray]] = {m: [] for m in methods}
+    inverse_isotonic_score_test_store: Dict[str, List[np.ndarray]] = {m: [] for m in methods}
+    inverse_isotonic_quantile_test_store: Dict[str, List[np.ndarray]] = {m: [] for m in methods}
+    inverse_isotonic_resultant_weight_test_store: Dict[str, List[np.ndarray]] = {m: [] for m in methods}
     aggregate_metrics: Dict[str, List[Dict[str, Any]]] = {}
     report_rows: List[Dict[str, object]] = []
     conformal_rows: List[Dict[str, object]] = []
@@ -2472,17 +2791,51 @@ def main() -> None:
 
         u_val_for_iso = u_val if args.uncertainty_weight_source == "total" else u_val_epi
         u_test_for_iso = u_test if args.uncertainty_weight_source == "total" else u_test_epi
-        iso_w, iso_coeff_val, iso_coeff_test = _fit_weights_uncertainty_inverse_isotonic(
+        (
+            iso_w_mean,
+            iso_coeff_val,
+            iso_coeff_test,
+            iso_calibrated_val,
+            iso_calibrated_test,
+            iso_sample_w_val,
+            iso_sample_w_test,
+            iso_z_test,
+            iso_z_test_abs,
+            iso_quantile_test,
+            iso_inv_score_test,
+            _iso_unused_penalty,
+        ) = _fit_weights_uncertainty_inverse_isotonic(
             p_val=p_val,
             u_val=u_val_for_iso,
             u_test=u_test_for_iso,
             y_val=y_val,
             target_recall=args.target_recall,
             tau=args.uncertainty_tau,
+            score_cap=args.iso_inverse_score_cap,
+            ood_lambda=args.iso_ood_lambda,
+            ood_z_tolerance=args.iso_ood_z_tolerance,
         )
+        for idx, method in enumerate(methods):
+            isotonic_uncertainty_val_store[method].append(
+                np.asarray(iso_calibrated_val[idx], dtype=np.float64).reshape(-1)
+            )
+            isotonic_uncertainty_test_store[method].append(
+                np.asarray(iso_calibrated_test[idx], dtype=np.float64).reshape(-1)
+            )
+            inverse_isotonic_zscore_test_store[method].append(
+                np.asarray(iso_z_test[idx], dtype=np.float64).reshape(-1)
+            )
+            inverse_isotonic_score_test_store[method].append(
+                np.asarray(iso_inv_score_test[idx], dtype=np.float64).reshape(-1)
+            )
+            inverse_isotonic_quantile_test_store[method].append(
+                np.asarray(iso_quantile_test[idx], dtype=np.float64).reshape(-1)
+            )
+            inverse_isotonic_resultant_weight_test_store[method].append(
+                np.asarray(iso_sample_w_test[idx], dtype=np.float64).reshape(-1)
+            )
         weights = {
             "uniform": np.ones(len(methods), dtype=np.float64) / len(methods),
-            "uncertainty_inverse_isotonic": iso_w,
             "softmax_brier_model_score": _fit_weights_softmax_brier_per_model(
                 p_val=p_val, y_val=y_val, temp=args.score_temp
             ),
@@ -2495,15 +2848,34 @@ def main() -> None:
         }
 
         print("[Stacking methods]")
-        for stack_name, w in weights.items():
-            val_prob = _apply_weights(p_val, w)
-            test_prob = _apply_weights(p_test, w)
-            val_unc_epi = _apply_weights(u_val_epi, w)
-            test_unc_epi = _apply_weights(u_test_epi, w)
-            val_unc_ale = _apply_weights(u_val_ale, w)
-            test_unc_ale = _apply_weights(u_test_ale, w)
-            val_unc = _apply_weights(u_val, w)
-            test_unc = _apply_weights(u_test, w)
+        stack_order = [
+            "uncertainty_inverse_isotonic",
+            "uniform",
+            "softmax_brier_model_score",
+            "brier_opt",
+            "logloss_opt",
+        ]
+        for stack_name in stack_order:
+            if stack_name == "uncertainty_inverse_isotonic":
+                w_val = iso_sample_w_val
+                w_test = iso_sample_w_test
+                w_summary = iso_w_mean
+                adaptive_note = "sample_adaptive_iso_inverse"
+            else:
+                w_static = weights[stack_name]
+                w_val = w_static
+                w_test = w_static
+                w_summary = w_static
+                adaptive_note = ""
+
+            val_prob = _apply_weights(p_val, w_val)
+            test_prob = _apply_weights(p_test, w_test)
+            val_unc_epi = _apply_weights(u_val_epi, w_val)
+            test_unc_epi = _apply_weights(u_test_epi, w_test)
+            val_unc_ale = _apply_weights(u_val_ale, w_val)
+            test_unc_ale = _apply_weights(u_test_ale, w_test)
+            val_unc = _apply_weights(u_val, w_val)
+            test_unc = _apply_weights(u_test, w_test)
             _accumulate_uncertainty_values(
                 uncertainty_store,
                 scenario="all",
@@ -2641,19 +3013,37 @@ def main() -> None:
             all_val_probs[stack_name].append(val_prob)
             all_test_probs[stack_name].append(test_prob)
             all_test_uncs[stack_name].append(test_unc)
-            all_weights[stack_name].append(w)
+            all_weights[stack_name].append(w_summary)
             stack_key = f"stack::{stack_name}"
             aggregate_metrics.setdefault(stack_key, []).append(test_metrics)
             radar_metrics_store["all"]["val"].setdefault(stack_key, []).append(val_metrics)
             radar_metrics_store["all"]["test"].setdefault(stack_key, []).append(test_metrics)
             confusion_store["all"]["val"].setdefault(stack_key, []).append(_cm_counts_from_metrics(val_metrics))
             confusion_store["all"]["test"].setdefault(stack_key, []).append(_cm_counts_from_metrics(test_metrics))
-            w_str = ", ".join(f"{m}={ww:.4f}" for m, ww in zip(methods, w))
+            w_str = ", ".join(f"{m}={ww:.4f}" for m, ww in zip(methods, w_summary))
             if stack_name == "uncertainty_inverse_isotonic":
                 coef_val_str = ", ".join(f"{m}={cc:.4f}" for m, cc in zip(methods, iso_coeff_val))
                 coef_test_str = ", ".join(f"{m}={cc:.4f}" for m, cc in zip(methods, iso_coeff_test))
+                z_mean_str = ", ".join(
+                    f"{m}={zz:.3f}" for m, zz in zip(methods, np.mean(iso_z_test_abs, axis=1))
+                )
+                z_p95_str = ", ".join(
+                    f"{m}={zz:.3f}" for m, zz in zip(methods, np.quantile(iso_z_test_abs, 0.95, axis=1))
+                )
                 print(f"- {stack_name} | isotonic_coef_val: {coef_val_str}")
                 print(f"- {stack_name} | isotonic_coef_test: {coef_test_str}")
+                print(f"- {stack_name} | ood_abs_z_mean(test): {z_mean_str}")
+                print(f"- {stack_name} | ood_abs_z_p95(test): {z_p95_str}")
+                q_mean_str = ", ".join(
+                    f"{m}={qq:.3f}" for m, qq in zip(methods, np.mean(iso_quantile_test, axis=1))
+                )
+                print(f"- {stack_name} | empirical_cdf_quantile_mean(test): {q_mean_str}")
+                print(
+                    f"- {stack_name} | weighting: {adaptive_note}; "
+                    f"score_cap={args.iso_inverse_score_cap:.1f}; "
+                    f"tau={args.uncertainty_tau:.3f}; "
+                    f"method=exp(-tau*quantile)"
+                )
             print(f"- {stack_name} | weights: {w_str}")
             print(f"  val  | {_format_metric_line(val_metrics)}")
             print(f"  test | {_format_metric_line(test_metrics)}")
@@ -2666,7 +3056,7 @@ def main() -> None:
                 model_name=stack_name,
                 metrics=val_metrics,
                 weights=(
-                    w_str
+                    (w_str if not adaptive_note else f"{w_str} | {adaptive_note}")
                     if stack_name != "uncertainty_inverse_isotonic"
                     else (
                         w_str
@@ -2674,6 +3064,11 @@ def main() -> None:
                         + ", ".join(f"{m}={cc:.4f}" for m, cc in zip(methods, iso_coeff_val))
                         + " | isotonic_coef_test: "
                         + ", ".join(f"{m}={cc:.4f}" for m, cc in zip(methods, iso_coeff_test))
+                        + " | "
+                        + adaptive_note
+                        + f" | score_cap={args.iso_inverse_score_cap:.1f}"
+                        + f" | tau={args.uncertainty_tau:.3f}"
+                        + " | method=exp(-tau*quantile)"
                     )
                 ),
             )
@@ -2686,7 +3081,7 @@ def main() -> None:
                 model_name=stack_name,
                 metrics=test_metrics,
                 weights=(
-                    w_str
+                    (w_str if not adaptive_note else f"{w_str} | {adaptive_note}")
                     if stack_name != "uncertainty_inverse_isotonic"
                     else (
                         w_str
@@ -2694,6 +3089,11 @@ def main() -> None:
                         + ", ".join(f"{m}={cc:.4f}" for m, cc in zip(methods, iso_coeff_val))
                         + " | isotonic_coef_test: "
                         + ", ".join(f"{m}={cc:.4f}" for m, cc in zip(methods, iso_coeff_test))
+                        + " | "
+                        + adaptive_note
+                        + f" | score_cap={args.iso_inverse_score_cap:.1f}"
+                        + f" | tau={args.uncertainty_tau:.3f}"
+                        + " | method=exp(-tau*quantile)"
                     )
                 ),
             )
@@ -3034,6 +3434,20 @@ def main() -> None:
     _export_conformal_histograms(
         store=conformal_hist_store,
         out_dir=uncertainty_dist_dir,
+    )
+    _export_isotonic_uncertainty_boxplots(
+        methods=methods,
+        val_store=isotonic_uncertainty_val_store,
+        test_store=isotonic_uncertainty_test_store,
+        out_dir=summary_csv.parent,
+    )
+    _export_inverse_isotonic_test_diagnostics(
+        methods=methods,
+        z_score_test_store=inverse_isotonic_zscore_test_store,
+        inverse_score_test_store=inverse_isotonic_score_test_store,
+        quantile_test_store=inverse_isotonic_quantile_test_store,
+        resultant_weight_test_store=inverse_isotonic_resultant_weight_test_store,
+        out_dir=summary_csv.parent,
     )
     print(f"Saved uncertainty distribution artifacts under: {uncertainty_dist_dir}")
 
