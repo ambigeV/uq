@@ -1,0 +1,4 @@
+tabpfn-client
+scikit-learn>=1.4
+numpy>=1.26
+python-dotenv
