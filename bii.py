@@ -13,10 +13,12 @@ import torch
 
 try:
     from tabpfn import TabPFNClassifier
+    from tabpfn.constants import ModelVersion
 
     _TABPFN_AVAILABLE = True
 except Exception:
     TabPFNClassifier = None  # type: ignore[assignment]
+    ModelVersion = None  # type: ignore[assignment]
     _TABPFN_AVAILABLE = False
 
 
@@ -283,6 +285,7 @@ def train_binary_classifier(
     mc_dropout_rate: float = 0.2,
     mc_dropout_samples: int = 100,
     tabpfn_device: str = "auto",
+    tabpfn_n_estimators: int = 4,
     random_state: int = 0,
 ) -> Any:
     n_tasks = train_y.shape[1]
@@ -295,8 +298,14 @@ def train_binary_classifier(
             )
         if encoder_type == "dmpnn":
             raise ValueError("TabPFN currently supports ECFP/identity features only.")
-        model = TabPFNClassifier(device=tabpfn_device, random_state=random_state)
-        print("Training TabPFN classifier...")
+        model = TabPFNClassifier.create_default_for_version(ModelVersion.V2_5)
+        model.set_params(
+            n_estimators=tabpfn_n_estimators,
+            random_state=random_state,
+            ignore_pretraining_limits=True,
+            device=tabpfn_device,
+        )
+        print("Training TabPFN v2.5 classifier...")
         model.fit(train_x.astype(np.float32), train_y.reshape(-1).astype(int))
         val_metrics = evaluate_classification(
             model_obj=model,
@@ -857,6 +866,12 @@ def main() -> None:
         default="auto",
         help="Device used by TabPFN (only when --model_type tabpfn).",
     )
+    parser.add_argument(
+        "--tabpfn_n_estimators",
+        type=int,
+        default=4,
+        help="Number of estimators for TabPFN v2.5 (only when --model_type tabpfn).",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--mc_dropout_samples",
@@ -945,6 +960,7 @@ def main() -> None:
             mc_dropout_rate=args.mc_dropout_rate,
             mc_dropout_samples=args.mc_dropout_samples,
             tabpfn_device=args.tabpfn_device,
+            tabpfn_n_estimators=args.tabpfn_n_estimators,
             random_state=args.seed,
         )
 

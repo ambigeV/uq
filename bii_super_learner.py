@@ -2,22 +2,40 @@ import argparse
 from datetime import datetime
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
-import deepchem as dc
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.isotonic import IsotonicRegression
 import torch
-from nn import graphdata_to_batchmolgraph
-from nn_baseline import build_model
+from cp_utils import (
+    _display_model_name,
+    _get_weighted_cp_sample_weights,
+    _compute_weighted_cp_weights_from_domain_model,
+    _compute_weighted_cp_weights_online_rf,
+    _build_label_conditional_conformal_scores,
+    _accumulate_conformal_hist_values,
+    _export_conformal_histograms,
+    _export_reliability_diagrams,
+    _conformal_single_label_accept_mask,
+    _csa_fit,
+    _csa_thr_at_alpha,
+    _csa_predict,
+    _csa_fit_label_conditional,
+    _csa_predict_label_conditional,
+    _export_conformal_trend_confusion_grid,
+    _export_csa_decision_space_scatter,
+    _export_credal_ac_label_grid,
+)
 
 
 PROB_COL = "prob_class1_positive"
 EPI_COL = "epistemic_uncertainty"
 ALE_COL = "aleatoric_uncertainty"
+# Per-molecule export: combined scalar uncertainty (epistemic + aleatoric) from BIi CSVs.
+ISO_COL = "isotropic_uncertainty"
 
 
 def _safe_read_pickle(path: Path) -> pd.DataFrame:
@@ -164,10 +182,28 @@ def _compute_ece(
 
 
 def _compute_confusion_matrix_binary(
-    y_true: np.ndarray, probs: np.ndarray, threshold: float = 0.5
+    y_true: np.ndarray,
+    probs: np.ndarray,
+    threshold: float = 0.5,
+    mask: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     y = np.asarray(y_true, dtype=float).reshape(-1)
     p = np.asarray(probs, dtype=float).reshape(-1)
+    if len(y) != len(p):
+        raise ValueError(f"Confusion input length mismatch: y={len(y)} vs p={len(p)}.")
+    if mask is not None:
+        m = np.asarray(mask, dtype=bool).reshape(-1)
+        if len(m) != len(y):
+            raise ValueError(f"Confusion mask length mismatch: mask={len(m)} vs y={len(y)}.")
+        y = y[m]
+        p = p[m]
+    if len(y) == 0:
+        return {
+            "confusion_tn": 0.0,
+            "confusion_fp": 0.0,
+            "confusion_fn": 0.0,
+            "confusion_tp": 0.0,
+        }
     pred = (p >= float(threshold)).astype(int)
     return {
         "confusion_tn": float(np.sum((pred == 0) & (y == 0))),
@@ -351,12 +387,7 @@ def _fit_weights_uncertainty_inverse_isotonic(
     target_recall: float = 0.95,
     tau: float = 1.0,
     score_cap: float = 1e6,
-    ood_lambda: float = 0.75,
-    ood_z_tolerance: float = 1.5,
 ) -> Tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
     np.ndarray,
     np.ndarray,
     np.ndarray,
@@ -418,8 +449,6 @@ def _fit_weights_uncertainty_inverse_isotonic(
         ratio_test = cal_test_k / np.clip(u_test_k, 1e-12, None)
         iso_coeff_test[k] = float(np.mean(ratio_test))
 
-    _ = ood_lambda
-    _ = ood_z_tolerance
     cap = float(max(score_cap, 1e-6))
 
     # Empirical CDF quantile against validation isotonic-uncertainty distribution.
@@ -444,14 +473,7 @@ def _fit_weights_uncertainty_inverse_isotonic(
     exp_val = np.exp(-float(tau) * quantile_val)
     exp_test = np.exp(-float(tau) * quantile_test)
     inv_val = np.clip(exp_val, 1e-12, cap)
-    inv_test_raw = np.clip(exp_test, 1e-12, cap)
-    val_mean = np.mean(calibrated, axis=1, keepdims=True)
-    val_std = np.std(calibrated, axis=1, ddof=0, keepdims=True)
-    val_std = np.clip(val_std, 1e-6, None)
-    z_test = (calibrated_test - val_mean) / val_std
-    z_test_abs = np.abs(z_test)
-    ood_penalty = np.ones_like(inv_test_raw, dtype=np.float64)
-    inv_test = inv_test_raw * ood_penalty
+    inv_test = np.clip(exp_test, 1e-12, cap)
 
     sum_val = np.clip(inv_val.sum(axis=0, keepdims=True), 1e-12, None)
     sum_test = np.clip(inv_test.sum(axis=0, keepdims=True), 1e-12, None)
@@ -468,11 +490,8 @@ def _fit_weights_uncertainty_inverse_isotonic(
         calibrated_test,
         sample_w_val,
         sample_w_test,
-        z_test,
-        z_test_abs,
         quantile_test,
-        inv_test_raw,
-        ood_penalty,
+        inv_test,
     )
 
 
@@ -490,6 +509,38 @@ def _apply_weights(p: np.ndarray, w: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unsupported weight ndim={w_arr.ndim}; expected 1 or 2.")
 
 
+def _downweight_rejected_method_weights(
+    sample_weights: np.ndarray,
+    accepted_masks: np.ndarray,
+) -> np.ndarray:
+    """
+    Penalize per-sample method weights when that method rejects the sample.
+
+    Parameters
+    ----------
+    sample_weights : (K, N) adaptive base-method weights.
+    accepted_masks : (K, N) bool where True means method accepted sample.
+    Rejected methods are set to zero weight for that sample.
+    If all methods are rejected on a sample, fallback to the original
+    inverse-isotonic adaptive weights for that sample.
+    """
+    w = np.asarray(sample_weights, dtype=np.float64)
+    m = np.asarray(accepted_masks, dtype=bool)
+    if w.shape != m.shape:
+        raise ValueError(f"Weight/mask shape mismatch: {w.shape} vs {m.shape}.")
+
+    penalized = np.where(m, w, 0.0)
+    denom = np.sum(penalized, axis=0, keepdims=True)
+    out = np.zeros_like(penalized, dtype=np.float64)
+    valid = np.asarray(denom > 0.0).reshape(-1)
+    if np.any(valid):
+        out[:, valid] = penalized[:, valid] / denom[:, valid]
+    if np.any(~valid):
+        base = np.clip(w[:, ~valid], 1e-12, None)
+        out[:, ~valid] = base / np.clip(np.sum(base, axis=0, keepdims=True), 1e-12, None)
+    return out
+
+
 def _load_labels(label_dir: Path, split_name: str, label_column: str) -> np.ndarray:
     pkl_path = label_dir / f"{split_name}.pkl"
     df = _safe_read_pickle(pkl_path)
@@ -498,12 +549,27 @@ def _load_labels(label_dir: Path, split_name: str, label_column: str) -> np.ndar
     return df[label_column].to_numpy(dtype=np.float64).reshape(-1)
 
 
+def _load_optional_text_column(
+    label_dir: Path, split_name: str, column_name: str
+) -> Optional[np.ndarray]:
+    pkl_path = label_dir / f"{split_name}.pkl"
+    df = _safe_read_pickle(pkl_path)
+    if column_name not in df.columns:
+        return None
+    return df[column_name].astype(str).to_numpy().reshape(-1)
+
+
 def _ensure_same_length(y: np.ndarray, p: np.ndarray, name: str) -> None:
     if len(y) != p.shape[1]:
         raise ValueError(
             f"Length mismatch on {name}: labels={len(y)} vs predictions={p.shape[1]}. "
             "Current BIi CSVs do not include row ids, so strict alignment is required."
         )
+
+
+def _sanitize_method_csv_prefix(method: str) -> str:
+    out = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in method.strip())
+    return out or "method"
 
 
 def _format_metric_line(metrics: Dict[str, Any]) -> str:
@@ -550,40 +616,6 @@ def _append_metric_row(
     rows.append(row)
 
 
-def _display_model_name(model_key: str) -> str:
-    if "::" in model_key:
-        family, name = model_key.split("::", 1)
-    else:
-        family, name = "base", model_key
-    lname = name.lower()
-    if family == "base":
-        if lname == "ensemble":
-            return "base_gbm"
-        if "mc" in lname:
-            # Distinguish balanced vs unbalanced MC variants.
-            return "base_mc2" if "unb" in lname else "base_mc1"
-        if "evd" in lname or "new" in lname:
-            # Distinguish balanced vs unbalanced EVD/new variants.
-            return "base_evd2" if "unb" in lname else "base_evd1"
-        return f"base_{name}"
-    if family == "stack":
-        mapped = {
-            "uniform": "ensemble_uniform",
-            "uncertainty_inverse_isotonic": "ensemble_uncertainty_iso",
-            "softmax_brier_model_score": "ensemble_softmax",
-            "brier_opt": "ensemble_brier",
-            "logloss_opt": "ensemble_logloss",
-        }
-        return mapped.get(name, f"ensemble_{name}")
-    if family == "baseline":
-        mapped = {
-            "always_pos": "baseline_all_pos",
-            "always_neg": "baseline_all_neg",
-        }
-        return mapped.get(name, f"baseline_{name}")
-    return model_key
-
-
 def _cm_counts_from_metrics(metrics: Dict[str, Any]) -> np.ndarray:
     return np.asarray(
         [
@@ -595,6 +627,22 @@ def _cm_counts_from_metrics(metrics: Dict[str, Any]) -> np.ndarray:
                 float(metrics.get("confusion_fn", 0.0)),
                 float(metrics.get("confusion_tp", 0.0)),
             ],
+        ],
+        dtype=float,
+    )
+
+
+def _cm_counts_from_probs(
+    y_true: np.ndarray,
+    probs: np.ndarray,
+    threshold: float,
+    mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    cm = _compute_confusion_matrix_binary(y_true=y_true, probs=probs, threshold=threshold, mask=mask)
+    return np.asarray(
+        [
+            [cm["confusion_tn"], cm["confusion_fp"]],
+            [cm["confusion_fn"], cm["confusion_tp"]],
         ],
         dtype=float,
     )
@@ -889,7 +937,6 @@ def _export_isotonic_uncertainty_boxplots(
 def _export_inverse_isotonic_test_diagnostics(
     *,
     methods: Sequence[str],
-    z_score_test_store: Dict[str, List[np.ndarray]],
     inverse_score_test_store: Dict[str, List[np.ndarray]],
     quantile_test_store: Dict[str, List[np.ndarray]],
     resultant_weight_test_store: Dict[str, List[np.ndarray]],
@@ -937,12 +984,6 @@ def _export_inverse_isotonic_test_diagnostics(
         fig.savefig(out_png, dpi=220, bbox_inches="tight")
         plt.close(fig)
 
-    _export_boxplot(
-        store=z_score_test_store,
-        ylabel="Z-score vs calibration isotonic uncertainty distribution",
-        title="Test isotonic uncertainty z-score by base model",
-        out_png=out_dir / "inverse_isotonic_test_zscore_boxplot.png",
-    )
     _export_boxplot(
         store=inverse_score_test_store,
         ylabel="Inverse-isotonic score (after tau and cap)",
@@ -1094,8 +1135,17 @@ def _export_confusion_matrix_grid(
     vmax = 100.0
 
     csv_rows: List[Dict[str, Any]] = []
+    base_cols: List[int] = []
+    ensemble_cols: List[int] = []
+    other_cols: List[int] = []
     for col, entry in enumerate(entries):
         model_name = str(entry["model_name"])
+        if model_name.startswith("base::"):
+            base_cols.append(col)
+        elif model_name.startswith("stack::"):
+            ensemble_cols.append(col)
+        else:
+            other_cols.append(col)
         display_name = _display_model_name(model_name)
         title_name = display_name
         if title_name.startswith("base_"):
@@ -1107,10 +1157,12 @@ def _export_confusion_matrix_grid(
             row_sums = cm_counts.sum(axis=1, keepdims=True)
             cm = 100.0 * cm_counts / np.clip(row_sums, 1e-12, None)
             ax = axes[row, col]
-            ax.imshow(cm, cmap="Blues", vmin=0.0, vmax=vmax)
+            # Keep a moderate saturation so cells still have contrast.
+            ax.imshow(cm, cmap="Blues", vmin=0.0, vmax=vmax, alpha=0.88)
             for i in range(2):
                 for j in range(2):
                     val = float(cm[i, j])
+                    text_color = "white" if val >= 55.0 else "black"
                     ax.text(
                         j,
                         i,
@@ -1118,7 +1170,7 @@ def _export_confusion_matrix_grid(
                         ha="center",
                         va="center",
                         fontsize=18 * cm_font_scale,
-                        color="black",
+                        color=text_color,
                     )
             ax.set_xticks([0, 1])
             ax.set_xticklabels(["Pred 0", "Pred 1"], fontsize=16 * cm_font_scale)
@@ -1147,12 +1199,49 @@ def _export_confusion_matrix_grid(
                 }
             )
 
-    fig.suptitle(
-        "Confusion matrices by method (row-normalized by true label)",
-        fontsize=22 * cm_font_scale,
-    )
+    def _add_group_annotation(cols: List[int], label: str) -> None:
+        if not cols:
+            return
+        left_box = axes[0, min(cols)].get_position()
+        right_box = axes[0, max(cols)].get_position()
+        x_center = 0.5 * (left_box.x0 + right_box.x1)
+        fig.text(
+            x_center,
+            0.925,
+            label,
+            ha="center",
+            va="center",
+            fontsize=12 * cm_font_scale,
+            fontweight="bold",
+            color="#1f2937",
+        )
+
+    _add_group_annotation(base_cols, "Base models")
+    _add_group_annotation(ensemble_cols, "Ensembles")
+    _add_group_annotation(other_cols, "Other")
+
+    # Intentionally no global title: keep figure compact for reports.
     # Avoid tight_layout warning with colorbar + multi-axes grids.
     fig.subplots_adjust(left=0.06, right=0.93, bottom=0.10, top=0.88, wspace=0.30, hspace=0.28)
+
+    if base_cols and ensemble_cols:
+        # Place separator between the true subplot groups.
+        # Must be computed after subplots_adjust so get_position() returns final coordinates.
+        base_right = axes[0, max(base_cols)].get_position().x1
+        ens_left = axes[0, min(ensemble_cols)].get_position().x0
+        split_x = base_right + 0.5 * (ens_left - base_right)
+        sep_line = plt.Line2D(
+            [split_x, split_x],
+            [0.10, 0.88],
+            transform=fig.transFigure,
+            color="#374151",
+            linestyle="--",
+            linewidth=3.0,
+            alpha=0.85,
+            zorder=3,
+        )
+        fig.add_artist(sep_line)
+
     fig.savefig(out_png, dpi=220)
     plt.close(fig)
     pd.DataFrame(csv_rows).to_csv(out_csv, index=False)
@@ -1563,528 +1652,179 @@ def _export_radar_base_vs_baselines(
         pd.DataFrame(csv_rows).to_csv(out_csv, index=False)
 
 
-def _get_weighted_cp_sample_weights(
+def _export_radar_inverse_iso_vs_base_models(
+    radar_metrics_store: Dict[str, Dict[str, Dict[str, List[Dict[str, Any]]]]],
     *,
-    split_name: str,
-    n_samples: int,
-) -> np.ndarray:
+    scenario: str,
+    out_png: Path,
+    out_csv: Path,
+) -> None:
     """
-    Placeholder hook for weighted conformal prediction importance weights w(x).
-
-    Expected semantics under covariate shift:
-      w(x) ~ p_test(x) / p_calibration(x)
-
-    Replace this body with your project-specific weighting function once available.
-    Until then we return all-ones, which recovers standard (unweighted) conformal.
+    Polar radar comparing only the uncertainty-inverse-isotonic stack to every
+    standalone base model (all `base::*` keys). Intended for compact views, e.g.
+    one ensemble line plus three base learners when `--methods` lists three bases.
     """
-    _ = split_name
-    return np.ones(int(n_samples), dtype=np.float64)
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
 
+    stack_key = "stack::uncertainty_inverse_isotonic"
+    metric_spec = [
+        ("AUC", True),
+        ("F1", True),
+        ("MCC", True),
+        ("Accuracy", True),
+        ("NLL", False),
+        ("Brier", False),
+        ("ECE", False),
+    ]
+    metric_names = [m for m, _ in metric_spec]
+    metric_dirs = {m: hb for m, hb in metric_spec}
+    splits = ["val", "test"]
+    radar_floor = 0.20
 
-def _build_domain_ecfp_features_from_smiles(
-    smiles: np.ndarray,
-    ecfp_size: int,
-    ecfp_radius: int,
-) -> np.ndarray:
-    featurizer = dc.feat.CircularFingerprint(size=int(ecfp_size), radius=int(ecfp_radius))
-    raw = featurizer.featurize([str(s) for s in smiles.tolist()])
-    feats = np.zeros((len(raw), int(ecfp_size)), dtype=np.float32)
-    for i, f in enumerate(raw):
-        if f is None:
-            continue
-        arr = np.asarray(f, dtype=np.float32).reshape(-1)
-        if arr.size == int(ecfp_size):
-            feats[i] = arr
-    return feats
+    fig, axes = plt.subplots(1, 2, figsize=(20.0, 9.6), subplot_kw={"polar": True})
+    angles = np.linspace(0, 2 * np.pi, len(metric_names), endpoint=False)
+    angles_closed = np.concatenate([angles, angles[:1]])
+    csv_rows: List[Dict[str, Any]] = []
+    legend_items: Dict[str, Any] = {}
 
+    for c, split in enumerate(splits):
+        ax = axes[c]
+        per_model_runs = radar_metrics_store.get(scenario, {}).get(split, {})
+        mean_by_model: Dict[str, Dict[str, float]] = {}
+        for model_name, rows in per_model_runs.items():
+            if not rows:
+                continue
+            metric_keys = sorted(set().union(*[rr.keys() for rr in rows]))
+            mm: Dict[str, float] = {}
+            for metric_name in metric_keys:
+                sample = rows[0].get(metric_name, np.nan)
+                if not isinstance(sample, (int, float, np.number)):
+                    continue
+                vals = np.asarray([rr.get(metric_name, np.nan) for rr in rows], dtype=float)
+                finite = np.isfinite(vals)
+                mm[metric_name] = float(np.mean(vals[finite])) if np.any(finite) else float("nan")
+            mean_by_model[model_name] = mm
 
-def _build_domain_graph_features_from_smiles(smiles: np.ndarray) -> np.ndarray:
-    featurizer = dc.feat.DMPNNFeaturizer()
-    raw = featurizer.featurize([str(s) for s in smiles.tolist()])
-    clean = [f for f in raw if f is not None]
-    if not clean:
-        raise ValueError("No valid graph features produced by DMPNN featurizer.")
-    return np.array(clean, dtype=object)
-
-
-def _build_domain_split_features(
-    *,
-    label_dir: Path,
-    split_name: str,
-    encoder_type: str,
-    smiles_column: str,
-    ecfp_size: int,
-    ecfp_radius: int,
-) -> np.ndarray:
-    pkl_path = label_dir / f"{split_name}.pkl"
-    df = _safe_read_pickle(pkl_path)
-    if smiles_column not in df.columns:
-        raise ValueError(f"Missing '{smiles_column}' in {pkl_path}")
-    smiles = df[smiles_column].astype(str).to_numpy()
-    if encoder_type == "dmpnn":
-        return _build_domain_graph_features_from_smiles(smiles)
-    return _build_domain_ecfp_features_from_smiles(
-        smiles,
-        ecfp_size=ecfp_size,
-        ecfp_radius=ecfp_radius,
-    )
-
-
-def _load_domain_classifier_checkpoint(ckpt_path: Path) -> Tuple[torch.nn.Module, Dict[str, Any], torch.device]:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    payload = torch.load(ckpt_path, map_location=device)
-    metadata = dict(payload.get("metadata", {}))
-    n_features = int(metadata.get("n_features", 0))
-    n_tasks = int(metadata.get("n_tasks", 1))
-    encoder_type = str(metadata.get("encoder_type", "identity"))
-    if n_features <= 0:
-        raise ValueError(f"Invalid n_features in domain model checkpoint: {ckpt_path}")
-    model = build_model(
-        model_type="baseline",
-        n_features=n_features,
-        n_tasks=n_tasks,
-        mode="classification",
-        encoder_type=encoder_type,
-    ).to(device)
-    model.load_state_dict(payload["state_dict"])
-    model.eval()
-    return model, metadata, device
-
-
-@torch.no_grad()
-def _predict_domain_positive_prob(
-    model: torch.nn.Module,
-    features: np.ndarray,
-    device: torch.device,
-    encoder_type: str,
-    batch_size: int = 1024,
-) -> np.ndarray:
-    out = np.zeros((len(features),), dtype=np.float64)
-    for i in range(0, len(features), int(batch_size)):
-        xb_raw = features[i:i + int(batch_size)]
-        if encoder_type == "dmpnn":
-            xb = graphdata_to_batchmolgraph(list(xb_raw)).to(device)
-        else:
-            xb = torch.from_numpy(np.asarray(xb_raw, dtype=np.float32)).to(device)
-        _, logits = model(xb)
-        p = torch.sigmoid(logits).detach().cpu().numpy().reshape(-1)
-        out[i:i + int(batch_size)] = p.astype(np.float64)
-    return out
-
-
-def _compute_weighted_cp_weights_from_domain_model(
-    *,
-    label_dir: Path,
-    val_split: str,
-    test_split: str,
-    domain_model_path: Path,
-    default_label_column: str,
-    weight_clip_max: float,
-    prob_clip: float,
-    ratio_offset: float,
-) -> Tuple[np.ndarray, np.ndarray]:
-    model, metadata, device = _load_domain_classifier_checkpoint(domain_model_path)
-    encoder_type = str(metadata.get("encoder_type", "identity"))
-    label_column = str(metadata.get("label_column", default_label_column))
-    smiles_column = str(metadata.get("smiles_column", "SMILES"))
-    ecfp_size = int(metadata.get("ecfp_size", 1024))
-    ecfp_radius = int(metadata.get("ecfp_radius", 2))
-
-    x_val = _build_domain_split_features(
-        label_dir=label_dir,
-        split_name=val_split,
-        encoder_type=encoder_type,
-        smiles_column=smiles_column,
-        ecfp_size=ecfp_size,
-        ecfp_radius=ecfp_radius,
-    )
-    x_test = _build_domain_split_features(
-        label_dir=label_dir,
-        split_name=test_split,
-        encoder_type=encoder_type,
-        smiles_column=smiles_column,
-        ecfp_size=ecfp_size,
-        ecfp_radius=ecfp_radius,
-    )
-    # Enforce robust clipping for weighted CP ratio stability.
-    p_eps = float(max(prob_clip, 1e-2))
-    p_val = np.clip(
-        _predict_domain_positive_prob(model, x_val, device=device, encoder_type=encoder_type),
-        p_eps,
-        1.0 - p_eps,
-    )
-    p_test = np.clip(
-        _predict_domain_positive_prob(model, x_test, device=device, encoder_type=encoder_type),
-        p_eps,
-        1.0 - p_eps,
-    )
-    off = float(max(ratio_offset, 0.0))
-    # Stable weighted CP instantiation:
-    # w(x) = (p(x) + off) / (1 - p(x) + off), where p(x)=P(test domain|x).
-    # off>0 softens extreme ratios when p(x) is near 1.
-    w_val = (p_val + off) / np.clip(1.0 - p_val + off, 1e-12, None)
-    w_test = (p_test + off) / np.clip(1.0 - p_test + off, 1e-12, None)
-    w_max = float(max(weight_clip_max, 1.0))
-    w_val = np.clip(w_val, 1e-8, w_max).astype(np.float64)
-    w_test = np.clip(w_test, 1e-8, w_max).astype(np.float64)
-    return w_val, w_test
-
-
-def _compute_weighted_cp_weights_online_rf(
-    *,
-    label_dir: Path,
-    val_split: str,
-    test_split: str,
-    smiles_column: str,
-    ecfp_size: int,
-    ecfp_radius: int,
-    weight_clip_max: float,
-    prob_clip: float,
-    ratio_offset: float,
-    n_estimators: int,
-    max_depth: int,
-    seed: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    # Online lightweight domain classifier: val=0, test=1.
-    x_val = _build_domain_split_features(
-        label_dir=label_dir,
-        split_name=val_split,
-        encoder_type="identity",
-        smiles_column=smiles_column,
-        ecfp_size=ecfp_size,
-        ecfp_radius=ecfp_radius,
-    )
-    x_test = _build_domain_split_features(
-        label_dir=label_dir,
-        split_name=test_split,
-        encoder_type="identity",
-        smiles_column=smiles_column,
-        ecfp_size=ecfp_size,
-        ecfp_radius=ecfp_radius,
-    )
-    x_val = np.asarray(x_val, dtype=np.float32)
-    x_test = np.asarray(x_test, dtype=np.float32)
-    y_val_domain = np.zeros(len(x_val), dtype=int)
-    y_test_domain = np.ones(len(x_test), dtype=int)
-    x_domain = np.concatenate([x_val, x_test], axis=0)
-    y_domain = np.concatenate([y_val_domain, y_test_domain], axis=0)
-
-    rf = RandomForestClassifier(
-        n_estimators=int(max(n_estimators, 1)),
-        max_depth=None if int(max_depth) <= 0 else int(max_depth),
-        random_state=int(seed),
-        n_jobs=-1,
-    )
-    rf.fit(x_domain, y_domain)
-    p_val = rf.predict_proba(x_val)[:, 1].astype(np.float64)
-    p_test = rf.predict_proba(x_test)[:, 1].astype(np.float64)
-
-    p_eps = float(max(prob_clip, 1e-2))
-    p_val = np.clip(p_val, p_eps, 1.0 - p_eps)
-    p_test = np.clip(p_test, p_eps, 1.0 - p_eps)
-    off = float(max(ratio_offset, 0.0))
-    w_val = (p_val + off) / np.clip(1.0 - p_val + off, 1e-12, None)
-    w_test = (p_test + off) / np.clip(1.0 - p_test + off, 1e-12, None)
-    w_max = float(max(weight_clip_max, 1.0))
-    w_val = np.clip(w_val, 1e-8, w_max).astype(np.float64)
-    w_test = np.clip(w_test, 1e-8, w_max).astype(np.float64)
-    return w_val, w_test
-
-
-def _build_label_conditional_conformal_scores(
-    y_val: np.ndarray,
-    prob_pos_val: np.ndarray,
-    sample_weights_val: np.ndarray | None = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    y = np.asarray(y_val, dtype=int).reshape(-1)
-    p = np.clip(np.asarray(prob_pos_val, dtype=float).reshape(-1), 1e-8, 1.0 - 1e-8)
-    if sample_weights_val is None:
-        w = np.ones_like(p, dtype=np.float64)
-    else:
-        w = np.asarray(sample_weights_val, dtype=np.float64).reshape(-1)
-        if len(w) != len(p):
-            raise ValueError(
-                f"sample_weights_val length mismatch: {len(w)} vs {len(p)}."
+        base_keys = sorted(m for m in mean_by_model if m.startswith("base::"))
+        if stack_key not in mean_by_model or not base_keys:
+            ax.set_xticks(angles)
+            ax.set_xticklabels(metric_names, fontsize=15)
+            ax.set_yticks([0.0, 0.25, 0.5, 0.75, 1.0])
+            ax.set_yticklabels(
+                ["0.00", "0.25", "0.50", "0.75", "1.00"], fontsize=14
             )
-        w = np.clip(w, 1e-12, None)
-    # Nonconformity for positive label uses p(y=1|x); for negative label uses p(y=0|x)=1-p.
-    scores_pos = 1.0 - p[y == 1]
-    weights_pos = w[y == 1]
-    scores_neg = 1.0 - (1.0 - p[y == 0])  # equals p for y==0 samples
-    weights_neg = w[y == 0]
+            ax.set_ylim(0.0, 1.0)
+            ax.grid(alpha=0.25)
+            ax.set_title(split.upper(), fontsize=18, pad=18)
+            continue
 
-    order_pos = np.argsort(scores_pos, kind="mergesort")
-    order_neg = np.argsort(scores_neg, kind="mergesort")
-    return (
-        scores_pos[order_pos],
-        scores_neg[order_neg],
-        weights_pos[order_pos],
-        weights_neg[order_neg],
-    )
+        selected_models = [stack_key] + base_keys
+
+        raw = np.full((len(selected_models), len(metric_names)), np.nan, dtype=float)
+        for i, model_name in enumerate(selected_models):
+            vals = mean_by_model[model_name]
+            for j, metric_name in enumerate(metric_names):
+                raw[i, j] = float(vals.get(metric_name, np.nan))
+
+        norm = np.zeros_like(raw, dtype=float)
+        for j, metric_name in enumerate(metric_names):
+            col = raw[:, j]
+            finite = np.isfinite(col)
+            if not np.any(finite):
+                continue
+            cvals = col[finite]
+            c_min = float(np.min(cvals))
+            c_max = float(np.max(cvals))
+            if abs(c_max - c_min) < 1e-12:
+                norm[finite, j] = 0.5
+            else:
+                if metric_dirs[metric_name]:
+                    norm[finite, j] = (cvals - c_min) / (c_max - c_min)
+                else:
+                    norm[finite, j] = (c_max - cvals) / (c_max - c_min)
+            norm[~finite, j] = 0.0
+        norm_shifted = radar_floor + (1.0 - radar_floor) * norm
+
+        # Solid stack vs dashed bases; stack hue separated from base hues for contrast.
+        stack_color = "#8B0000"
+        n_b = len(base_keys)
+        if n_b <= 0:
+            base_color_by_key = {}
+        elif n_b == 1:
+            base_color_by_key = {base_keys[0]: mcolors.hsv_to_rgb((0.52, 0.98, 0.52))}
+        else:
+            hues = np.linspace(0.08, 0.92, num=n_b, endpoint=False)
+            hues = (hues + 0.18) % 1.0
+            base_color_by_key = {
+                bk: mcolors.hsv_to_rgb((float(h), 0.98, 0.52))
+                for h, bk in zip(hues, base_keys)
+            }
+
+        for i, model_name in enumerate(selected_models):
+            values = np.concatenate([norm_shifted[i], norm_shifted[i, :1]])
+            display_name = _display_model_name(model_name)
+            if model_name == stack_key:
+                line, = ax.plot(
+                    angles_closed,
+                    values,
+                    linewidth=2.6,
+                    linestyle="-",
+                    color=stack_color,
+                    label=display_name,
+                )
+                ax.fill(angles_closed, values, color=stack_color, alpha=0.12, linewidth=0.0)
+            else:
+                bc = base_color_by_key[model_name]
+                line, = ax.plot(
+                    angles_closed,
+                    values,
+                    linewidth=2.3,
+                    linestyle=(0, (6, 3)),
+                    color=bc,
+                    label=display_name,
+                )
+            if display_name not in legend_items:
+                legend_items[display_name] = line
+            row: Dict[str, Any] = {
+                "scenario": scenario,
+                "split": split,
+                "model_name": model_name,
+                "model_display_name": display_name,
+            }
+            for j, metric_name in enumerate(metric_names):
+                row[f"{metric_name}_mean_raw"] = float(raw[i, j]) if np.isfinite(raw[i, j]) else float("nan")
+                row[f"{metric_name}_radar_norm"] = float(norm[i, j])
+                row[f"{metric_name}_radar_plot_radius"] = float(norm_shifted[i, j])
+            csv_rows.append(row)
+
+        ax.set_xticks(angles)
+        ax.set_xticklabels(metric_names, fontsize=16)
+        ax.set_yticks([0.0, 0.25, 0.5, 0.75, 1.0])
+        ax.set_yticklabels(["0.00", "0.25", "0.50", "0.75", "1.00"], fontsize=15)
+        ax.set_ylim(0.0, 1.0)
+        ax.grid(alpha=0.25)
+        ax.set_title(split.upper(), fontsize=18, pad=18)
+
+    if legend_items:
+        fig.legend(
+            handles=list(legend_items.values()),
+            labels=list(legend_items.keys()),
+            loc="upper center",
+            bbox_to_anchor=(0.5, 1.05),
+            ncol=min(4, max(1, len(legend_items))),
+            frameon=False,
+            fontsize=16,
+        )
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    fig.savefig(out_png, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    if csv_rows:
+        pd.DataFrame(csv_rows).to_csv(out_csv, index=False)
 
 
 def _derived_csv_path(base_path: Path, suffix: str) -> Path:
     return base_path.with_name(f"{base_path.stem}_{suffix}{base_path.suffix}")
-
-
-def _accumulate_conformal_hist_values(
-    store: Dict[str, Dict[str, List[np.ndarray]]],
-    *,
-    split: str,
-    y_true: np.ndarray,
-    prob: np.ndarray,
-    accepted_mask: np.ndarray,
-    pred_label: np.ndarray,
-) -> None:
-    y = np.asarray(y_true, dtype=int).reshape(-1)
-    p = np.clip(np.asarray(prob, dtype=float).reshape(-1), 1e-8, 1.0 - 1e-8)
-    mask = np.asarray(accepted_mask, dtype=bool).reshape(-1)
-    pred = np.asarray(pred_label, dtype=int).reshape(-1)
-    if mask.sum() == 0:
-        return
-    y_acc = y[mask]
-    p_acc = p[mask]
-    pred_acc = pred[mask]
-    correct = pred_acc == y_acc
-    nll = -(y_acc * np.log(p_acc) + (1 - y_acc) * np.log(1 - p_acc))
-    conf = np.maximum(p_acc, 1.0 - p_acc)
-
-    payload = store.setdefault(
-        split,
-        {
-            "nll_correct": [],
-            "nll_wrong": [],
-            "conf_correct": [],
-            "conf_wrong": [],
-        },
-    )
-    payload["nll_correct"].append(nll[correct])
-    payload["nll_wrong"].append(nll[~correct])
-    payload["conf_correct"].append(conf[correct])
-    payload["conf_wrong"].append(conf[~correct])
-
-
-def _export_conformal_histograms(
-    store: Dict[str, Dict[str, List[np.ndarray]]],
-    out_dir: Path,
-    bins_nll: int = 60,
-    bins_conf: int = 40,
-) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    def _concat(parts: List[np.ndarray]) -> np.ndarray:
-        valid = [x for x in parts if x.size > 0]
-        return np.concatenate(valid, axis=0) if valid else np.asarray([], dtype=float)
-
-    # Plot 1: per-sample NLL histogram on accepted samples.
-    fig_nll, axes_nll = plt.subplots(1, 2, figsize=(13, 4.8), sharey=False)
-    for split, ax in zip(["val", "test"], axes_nll):
-        payload = store.get(split, {})
-        nll_correct = _concat(payload.get("nll_correct", []))
-        nll_wrong = _concat(payload.get("nll_wrong", []))
-        if nll_correct.size == 0 and nll_wrong.size == 0:
-            ax.text(0.5, 0.5, "No accepted samples", ha="center", va="center", transform=ax.transAxes)
-            ax.set_axis_off()
-            continue
-        all_vals = np.concatenate([x for x in [nll_correct, nll_wrong] if x.size > 0], axis=0)
-        vmin = float(np.min(all_vals))
-        vmax = float(np.max(all_vals))
-        if vmax <= vmin:
-            vmax = vmin + 1e-6
-        bins = np.linspace(vmin, vmax, bins_nll + 1)
-        if nll_correct.size > 0:
-            ax.hist(nll_correct, bins=bins, alpha=0.55, label="accepted_correct", color="#4C78A8")
-        if nll_wrong.size > 0:
-            ax.hist(nll_wrong, bins=bins, alpha=0.55, label="accepted_wrong", color="#E45756")
-        ax.set_xlabel("Per-sample NLL contribution")
-        ax.set_ylabel("Count")
-        ax.set_title(f"{split} accepted samples")
-        ax.grid(alpha=0.2)
-    axes_nll[1].legend(frameon=False, fontsize=9, loc="best")
-    fig_nll.tight_layout()
-    fig_nll.savefig(out_dir / "conformal_accepted_nll_hist.png", dpi=220)
-    plt.close(fig_nll)
-
-    # Plot 2: confidence histogram on accepted samples.
-    fig_conf, axes_conf = plt.subplots(1, 2, figsize=(13, 4.8), sharey=False)
-    conf_bins = np.linspace(0.0, 1.0, bins_conf + 1)
-    for split, ax in zip(["val", "test"], axes_conf):
-        payload = store.get(split, {})
-        conf_correct = _concat(payload.get("conf_correct", []))
-        conf_wrong = _concat(payload.get("conf_wrong", []))
-        if conf_correct.size == 0 and conf_wrong.size == 0:
-            ax.text(0.5, 0.5, "No accepted samples", ha="center", va="center", transform=ax.transAxes)
-            ax.set_axis_off()
-            continue
-        if conf_correct.size > 0:
-            ax.hist(conf_correct, bins=conf_bins, alpha=0.55, label="accepted_correct", color="#4C78A8")
-        if conf_wrong.size > 0:
-            ax.hist(conf_wrong, bins=conf_bins, alpha=0.55, label="accepted_wrong", color="#E45756")
-        ax.set_xlabel("Confidence max(p, 1-p)")
-        ax.set_ylabel("Count")
-        ax.set_title(f"{split} accepted samples")
-        ax.grid(alpha=0.2)
-    axes_conf[1].legend(frameon=False, fontsize=9, loc="best")
-    fig_conf.tight_layout()
-    fig_conf.savefig(out_dir / "conformal_accepted_confidence_hist.png", dpi=220)
-    plt.close(fig_conf)
-
-
-def _export_reliability_diagrams(
-    store: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]],
-    out_dir: Path,
-    n_bins: int = 20,
-) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    bins = np.linspace(0.0, 1.0, int(n_bins) + 1)
-
-    for scenario in ["all", "conformal"]:
-        # Reuse one uncertainty bucket to avoid duplicated prob/y payloads.
-        scenario_store = store.get(scenario, {})
-        rel_store = scenario_store.get("total", {}) or scenario_store.get("epistemic", {})
-        if not rel_store:
-            continue
-
-        rows: List[Dict[str, Any]] = []
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
-        plotted_any = False
-        for split, ax in zip(["val", "test"], axes):
-            ax.plot([0.0, 1.0], [0.0, 1.0], linestyle="--", color="gray", linewidth=1.0, label="perfect")
-            for model_key in sorted(rel_store.keys()):
-                payload = rel_store[model_key]
-                prob_parts = [x for x in payload.get(f"{split}_prob", []) if x.size > 0]
-                y_parts = [x for x in payload.get(f"{split}_y", []) if x.size > 0]
-                if not prob_parts or not y_parts:
-                    continue
-                prob = np.concatenate(prob_parts, axis=0)
-                y = np.asarray(np.concatenate(y_parts, axis=0), dtype=int)
-                if len(prob) == 0 or len(prob) != len(y):
-                    continue
-
-                pred = (prob >= 0.5).astype(int)
-                conf = np.maximum(prob, 1.0 - prob)
-                correct = (pred == y).astype(float)
-
-                x_vals: List[float] = []
-                y_vals: List[float] = []
-                for i in range(n_bins):
-                    left, right = bins[i], bins[i + 1]
-                    if i == n_bins - 1:
-                        mask = (conf >= left) & (conf <= right)
-                    else:
-                        mask = (conf >= left) & (conf < right)
-                    count = int(mask.sum())
-                    if count == 0:
-                        continue
-                    conf_bin = conf[mask]
-                    corr_bin = correct[mask]
-                    mean_conf = float(np.mean(conf_bin))
-                    emp_acc = float(np.mean(corr_bin))
-                    x_vals.append(mean_conf)
-                    y_vals.append(emp_acc)
-                    rows.append(
-                        {
-                            "scenario": scenario,
-                            "split": split,
-                            "model_family": payload["model_family"],
-                            "model_name": payload["model_name"],
-                            "bin_index": int(i),
-                            "bin_left": float(left),
-                            "bin_right": float(right),
-                            "count": count,
-                            "mean_confidence": mean_conf,
-                            "empirical_accuracy": emp_acc,
-                        }
-                    )
-                if x_vals:
-                    label = _display_model_name(f"{payload['model_family']}::{payload['model_name']}")
-                    ax.plot(x_vals, y_vals, marker="o", linewidth=1.2, label=label)
-                    plotted_any = True
-
-            ax.set_title(f"{split} reliability")
-            ax.set_xlabel("Mean confidence max(p, 1-p)")
-            ax.grid(alpha=0.25)
-        axes[0].set_ylabel("Empirical accuracy")
-        axes[0].set_xlim(0.0, 1.0)
-        axes[1].set_xlim(0.0, 1.0)
-        axes[0].set_ylim(0.0, 1.0)
-        axes[1].set_ylim(0.0, 1.0)
-        if plotted_any:
-            axes[1].legend(fontsize=8, frameon=False, loc="best")
-        fig.tight_layout()
-        fig.savefig(out_dir / f"{scenario}_reliability_diagram.png", dpi=220)
-        plt.close(fig)
-        if rows:
-            pd.DataFrame(rows).to_csv(out_dir / f"{scenario}_reliability_diagram.csv", index=False)
-
-
-def _conformal_single_label_accept_mask(
-    prob_pos_test: np.ndarray,
-    sorted_scores_pos: np.ndarray,
-    sorted_scores_neg: np.ndarray,
-    alpha: float,
-    sorted_weights_pos: np.ndarray | None = None,
-    sorted_weights_neg: np.ndarray | None = None,
-    test_sample_weights: np.ndarray | None = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    p = np.clip(np.asarray(prob_pos_test, dtype=float).reshape(-1), 1e-8, 1.0 - 1e-8)
-    n = len(p)
-    if len(sorted_scores_pos) == 0 or len(sorted_scores_neg) == 0:
-        return np.zeros(n, dtype=bool), np.zeros(n, dtype=int)
-    if test_sample_weights is None:
-        w_test = np.ones(n, dtype=np.float64)
-    else:
-        w_test = np.asarray(test_sample_weights, dtype=np.float64).reshape(-1)
-        if len(w_test) != n:
-            raise ValueError(f"test_sample_weights length mismatch: {len(w_test)} vs {n}.")
-        w_test = np.clip(w_test, 1e-12, None)
-
-    w_pos = (
-        np.ones(len(sorted_scores_pos), dtype=np.float64)
-        if sorted_weights_pos is None
-        else np.clip(np.asarray(sorted_weights_pos, dtype=np.float64).reshape(-1), 1e-12, None)
-    )
-    w_neg = (
-        np.ones(len(sorted_scores_neg), dtype=np.float64)
-        if sorted_weights_neg is None
-        else np.clip(np.asarray(sorted_weights_neg, dtype=np.float64).reshape(-1), 1e-12, None)
-    )
-    if len(w_pos) != len(sorted_scores_pos):
-        raise ValueError(
-            f"sorted_weights_pos length mismatch: {len(w_pos)} vs {len(sorted_scores_pos)}."
-        )
-    if len(w_neg) != len(sorted_scores_neg):
-        raise ValueError(
-            f"sorted_weights_neg length mismatch: {len(w_neg)} vs {len(sorted_scores_neg)}."
-        )
-
-    s_pos = 1.0 - p
-    s_neg = p
-
-    idx_pos = np.searchsorted(sorted_scores_pos, s_pos, side="left")
-    idx_neg = np.searchsorted(sorted_scores_neg, s_neg, side="left")
-    suffix_pos = np.cumsum(w_pos[::-1], dtype=np.float64)[::-1]
-    suffix_neg = np.cumsum(w_neg[::-1], dtype=np.float64)[::-1]
-    # Avoid out-of-bounds when searchsorted returns len(sorted_scores_*).
-    tail_w_pos = np.zeros_like(s_pos, dtype=np.float64)
-    tail_w_neg = np.zeros_like(s_neg, dtype=np.float64)
-    valid_pos = idx_pos < len(sorted_scores_pos)
-    valid_neg = idx_neg < len(sorted_scores_neg)
-    if np.any(valid_pos):
-        tail_w_pos[valid_pos] = suffix_pos[idx_pos[valid_pos]]
-    if np.any(valid_neg):
-        tail_w_neg[valid_neg] = suffix_neg[idx_neg[valid_neg]]
-    total_w_pos = float(np.sum(w_pos))
-    total_w_neg = float(np.sum(w_neg))
-    # Weighted generalization: with unit weights this is the usual smoothed split-CP p-value.
-    pval_pos = (tail_w_pos + w_test) / (total_w_pos + w_test)
-    pval_neg = (tail_w_neg + w_test) / (total_w_neg + w_test)
-
-    in_pos = pval_pos > float(alpha)
-    in_neg = pval_neg > float(alpha)
-    accepted = np.logical_xor(in_pos, in_neg)
-    pred_label = np.where(np.logical_and(in_pos, np.logical_not(in_neg)), 1, 0).astype(int)
-    return accepted, pred_label
 
 
 def _evaluate_accepted_subset(
@@ -2127,7 +1867,6 @@ def _evaluate_accepted_subset(
     metrics["rejection_rate"] = float(1.0 - metrics["acceptance_rate"])
     return metrics
 
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Stack BIi method predictions using validation-set learned weights."
@@ -2151,18 +1890,6 @@ def main() -> None:
         type=float,
         default=1e6,
         help="Upper cap for inverse-isotonic pre-normalization score.",
-    )
-    parser.add_argument(
-        "--iso_ood_lambda",
-        type=float,
-        default=0.75,
-        help="Legacy argument (unused in current quantile-exponential inverse-isotonic weighting).",
-    )
-    parser.add_argument(
-        "--iso_ood_z_tolerance",
-        type=float,
-        default=1.5,
-        help="Legacy argument (unused in current quantile-exponential inverse-isotonic weighting).",
     )
     parser.add_argument(
         "--uncertainty_weight_source",
@@ -2191,6 +1918,44 @@ def main() -> None:
         type=float,
         default=0.1,
         help="Conformal significance level for single-label acceptance filtering.",
+    )
+    parser.add_argument(
+        "--conformal_trend_alphas",
+        type=str,
+        default="0.01,0.05,0.10",
+        help="Comma-separated conformal alphas used for additional test confusion-matrix trend grid.",
+    )
+    parser.add_argument(
+        "--conformal_method",
+        type=str,
+        default="standard",
+        choices=["standard", "csa", "csa_lc"],
+        help=(
+            "Conformal prediction method for ensemble credal sets. "
+            "'standard': label-conditional weighted split-CP on the aggregated ensemble probability. "
+            "'csa': Conformal Score Aggregation on K-dimensional base-model score vectors "
+            "(marginal coverage only — sensitive to class imbalance). "
+            "'csa_lc': Label-conditional CSA — fits two independent CSA objects, one per class, "
+            "giving per-class coverage >= 1-alpha while still capturing inter-model disagreement."
+        ),
+    )
+    parser.add_argument(
+        "--csa_n_directions",
+        type=int,
+        default=128,
+        help="[CSA] Number of random projection directions M in the positive orthant of S^{K-1}.",
+    )
+    parser.add_argument(
+        "--csa_split_ratio",
+        type=float,
+        default=0.5,
+        help="[CSA] Fraction of validation samples assigned to stage-1 envelope fitting (rest used for stage-2 scalar calibration).",
+    )
+    parser.add_argument(
+        "--csa_seed",
+        type=int,
+        default=0,
+        help="[CSA] Base RNG seed for projection-direction sampling and calibration split (run_id is added per run).",
     )
     parser.add_argument(
         "--conformal_summary_csv",
@@ -2277,6 +2042,34 @@ def main() -> None:
         default=0,
         help="Random seed for online_rf weighted CP source.",
     )
+    parser.add_argument(
+        "--export_base_per_molecule_csv_dir",
+        type=str,
+        default="",
+        help=(
+            "If set, write per-run CSVs with one row per molecule on val_split (and optionally train_split): "
+            "optional id column, y_true, per-base-model prob_class1_positive, epistemic_uncertainty, "
+            "isotropic_uncertainty (epistemic+aleatoric, same as BIi total column), "
+            "cp_accepted (1/0), cp_pred_label from the same label-conditional weighted split-CP used in metrics "
+            "(calibration scores always built from val_split). "
+            "Train query weights use _get_weighted_cp_sample_weights (often all-ones) unless you extend weighting."
+        ),
+    )
+    parser.add_argument(
+        "--train_split",
+        type=str,
+        default="",
+        help=(
+            "Optional split name (cytotoxicity_data/<name>.pkl) for extra per-molecule export when "
+            "--export_base_per_molecule_csv_dir is set. Requires matching prediction CSVs under pred_root."
+        ),
+    )
+    parser.add_argument(
+        "--per_molecule_id_column",
+        type=str,
+        default="SMILES",
+        help="If present in label pkls, copied into per-molecule export CSVs (e.g. SMILES).",
+    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent
@@ -2305,6 +2098,17 @@ def main() -> None:
 
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
     run_ids = [int(x.strip()) for x in args.run_ids.split(",") if x.strip()]
+    test_pred_split = "tox21_all" if args.test_split == "tox21_all_ACA" else args.test_split
+    if test_pred_split != args.test_split:
+        print(
+            f"[Split override] labels/test split='{args.test_split}', "
+            f"prediction files read from split='{test_pred_split}'."
+        )
+    conformal_trend_alphas = [float(x.strip()) for x in args.conformal_trend_alphas.split(",") if x.strip()]
+    conformal_trend_alphas = sorted(set(conformal_trend_alphas))
+    for alpha in conformal_trend_alphas:
+        if not (0.0 < alpha < 1.0):
+            raise ValueError(f"Each conformal trend alpha must be in (0, 1), got {alpha}.")
     if not methods:
         raise ValueError("No methods provided.")
     if not run_ids:
@@ -2312,6 +2116,9 @@ def main() -> None:
 
     y_val = _load_labels(label_dir=label_dir, split_name=args.val_split, label_column=args.label_column)
     y_test = _load_labels(label_dir=label_dir, split_name=args.test_split, label_column=args.label_column)
+    ac_labels_test = _load_optional_text_column(
+        label_dir=label_dir, split_name=args.test_split, column_name="ac_label"
+    )
     cp_w_val = _get_weighted_cp_sample_weights(
         split_name=args.val_split, n_samples=len(y_val)
     )
@@ -2362,9 +2169,38 @@ def main() -> None:
         f"p05={np.quantile(cp_w_test, 0.05):.4f} p95={np.quantile(cp_w_test, 0.95):.4f}"
     )
 
+    export_base_per_molecule_dir: Optional[Path] = None
+    if args.export_base_per_molecule_csv_dir.strip():
+        export_base_per_molecule_dir = Path(args.export_base_per_molecule_csv_dir.strip())
+        if not export_base_per_molecule_dir.is_absolute():
+            export_base_per_molecule_dir = repo_root / export_base_per_molecule_dir
+        export_base_per_molecule_dir.mkdir(parents=True, exist_ok=True)
+
+    train_split_name = args.train_split.strip()
+    y_train: Optional[np.ndarray] = None
+    cp_w_train: Optional[np.ndarray] = None
+    smiles_val_export: Optional[np.ndarray] = None
+    smiles_train_export: Optional[np.ndarray] = None
+    id_col = args.per_molecule_id_column.strip() or "SMILES"
+    if export_base_per_molecule_dir is not None:
+        smiles_val_export = _load_optional_text_column(
+            label_dir=label_dir, split_name=args.val_split, column_name=id_col
+        )
+        if train_split_name:
+            y_train = _load_labels(
+                label_dir=label_dir, split_name=train_split_name, label_column=args.label_column
+            )
+            cp_w_train = _get_weighted_cp_sample_weights(
+                split_name=train_split_name, n_samples=len(y_train)
+            )
+            smiles_train_export = _load_optional_text_column(
+                label_dir=label_dir, split_name=train_split_name, column_name=id_col
+            )
+
     all_test_probs: Dict[str, List[np.ndarray]] = {
         "uniform": [],
         "uncertainty_inverse_isotonic": [],
+        "uncertainty_inverse_isotonic_reject_filtered": [],
         "softmax_brier_model_score": [],
         "brier_opt": [],
         "logloss_opt": [],
@@ -2374,10 +2210,16 @@ def main() -> None:
     all_weights: Dict[str, List[np.ndarray]] = {k: [] for k in all_test_probs.keys()}
     isotonic_uncertainty_val_store: Dict[str, List[np.ndarray]] = {m: [] for m in methods}
     isotonic_uncertainty_test_store: Dict[str, List[np.ndarray]] = {m: [] for m in methods}
-    inverse_isotonic_zscore_test_store: Dict[str, List[np.ndarray]] = {m: [] for m in methods}
     inverse_isotonic_score_test_store: Dict[str, List[np.ndarray]] = {m: [] for m in methods}
     inverse_isotonic_quantile_test_store: Dict[str, List[np.ndarray]] = {m: [] for m in methods}
     inverse_isotonic_resultant_weight_test_store: Dict[str, List[np.ndarray]] = {m: [] for m in methods}
+    # credal_ac_accept_store[stack_name][alpha_key] = list of accepted_mask arrays (one per run)
+    credal_ac_accept_store: Dict[str, Dict[str, List[np.ndarray]]] = {
+        sn: {} for sn in ["uncertainty_inverse_isotonic", "uncertainty_inverse_isotonic_reject_filtered"]
+    }
+    # Accumulate raw p_test / u_test_epi across runs for CSA scatter plots.
+    csa_scatter_p_test_runs: List[np.ndarray] = []
+    csa_scatter_u_epi_runs: List[np.ndarray] = []
     aggregate_metrics: Dict[str, List[Dict[str, Any]]] = {}
     report_rows: List[Dict[str, object]] = []
     conformal_rows: List[Dict[str, object]] = []
@@ -2392,6 +2234,85 @@ def main() -> None:
         "all": {"val": {}, "test": {}},
         "conformal": {"val": {}, "test": {}},
     }
+    conformal_trend_confusion_store: Dict[str, Dict[str, List[np.ndarray]]] = {
+        "all_test": {}
+    }
+    for alpha in conformal_trend_alphas:
+        conformal_trend_confusion_store[f"alpha_{alpha:.4f}"] = {}
+    category_specs: List[Tuple[str, str, np.ndarray]] = []
+    if ac_labels_test is not None and len(ac_labels_test) == len(y_test):
+        target_categories = [
+            ("AC", "ac"),
+            ("non-AC (no MMP match)", "non_ac_no_mmp_match"),
+            ("non-AC", "non_ac"),
+        ]
+        for category_name, category_slug in target_categories:
+            mask = (ac_labels_test == category_name)
+            category_specs.append((category_name, category_slug, np.asarray(mask, dtype=bool)))
+        cat_counts = ", ".join(
+            f"{name}={int(mask.sum())}" for name, _, mask in category_specs
+        )
+        print(f"[Category confusion] ac_label categories on test split: {cat_counts}")
+    elif ac_labels_test is not None:
+        print(
+            "[Category confusion] ac_label exists but length mismatches y_test; "
+            "skip category-specific confusion plots."
+        )
+    category_confusion_store: Dict[str, Dict[str, Dict[str, Dict[str, List[np.ndarray]]]]] = {}
+    category_trend_confusion_store: Dict[str, Dict[str, Dict[str, List[np.ndarray]]]] = {}
+    if category_specs:
+        for _, category_slug, _ in category_specs:
+            category_confusion_store[category_slug] = {
+                "all": {"val": {}, "test": {}},
+                "conformal": {"val": {}, "test": {}},
+            }
+            category_trend_confusion_store[category_slug] = {"all_test": {}}
+            for alpha in conformal_trend_alphas:
+                category_trend_confusion_store[category_slug][f"alpha_{alpha:.4f}"] = {}
+
+    def _append_category_confusion(
+        *,
+        scenario: str,
+        model_key: str,
+        val_cm: np.ndarray,
+        test_prob: np.ndarray,
+        threshold: float,
+        accepted_mask: Optional[np.ndarray] = None,
+    ) -> None:
+        if not category_specs:
+            return
+        for _, category_slug, category_mask in category_specs:
+            category_confusion_store[category_slug][scenario]["val"].setdefault(model_key, []).append(
+                np.asarray(val_cm, dtype=float)
+            )
+            test_mask = category_mask if accepted_mask is None else np.logical_and(category_mask, accepted_mask)
+            cm_test = _cm_counts_from_probs(
+                y_true=y_test,
+                probs=test_prob,
+                threshold=threshold,
+                mask=test_mask,
+            )
+            category_confusion_store[category_slug][scenario]["test"].setdefault(model_key, []).append(cm_test)
+
+    def _append_category_trend_confusion(
+        *,
+        row_key: str,
+        model_key: str,
+        test_prob: np.ndarray,
+        threshold: float,
+        accepted_mask: Optional[np.ndarray] = None,
+    ) -> None:
+        if not category_specs:
+            return
+        for _, category_slug, category_mask in category_specs:
+            test_mask = category_mask if accepted_mask is None else np.logical_and(category_mask, accepted_mask)
+            cm_test = _cm_counts_from_probs(
+                y_true=y_test,
+                probs=test_prob,
+                threshold=threshold,
+                mask=test_mask,
+            )
+            category_trend_confusion_store[category_slug][row_key].setdefault(model_key, []).append(cm_test)
     radar_metrics_store: Dict[str, Dict[str, Dict[str, List[Dict[str, Any]]]]] = {
         "all": {"val": {}, "test": {}},
         "conformal": {"val": {}, "test": {}},
@@ -2402,13 +2323,76 @@ def main() -> None:
             pred_root=pred_root, split_name=args.val_split, methods=methods, run_id=run_id
         )
         p_test, u_test_epi, u_test_ale, u_test, tags_test = _load_split_predictions(
-            pred_root=pred_root, split_name=args.test_split, methods=methods, run_id=run_id
+            pred_root=pred_root, split_name=test_pred_split, methods=methods, run_id=run_id
         )
         if tags_val != tags_test:
             raise RuntimeError(f"Method ordering mismatch for run {run_id}.")
 
         _ensure_same_length(y_val, p_val, f"val run {run_id}")
         _ensure_same_length(y_test, p_test, f"test run {run_id}")
+
+        # Accumulate for CSA decision-space scatter plots.
+        csa_scatter_p_test_runs.append(p_test.copy())
+        csa_scatter_u_epi_runs.append(u_test_epi.copy())
+
+        # Fit CSA once per run using all K base-model probabilities.
+        # Base models still use standard label-conditional split-CP (CSA is
+        # meaningful only when K > 1; base-model CP is unchanged regardless).
+        csa_obj = None
+        lc_csa_obj = None
+        if args.conformal_method == "csa":
+            csa_obj = _csa_fit(
+                p_val=p_val,
+                y_val=y_val,
+                alpha=args.conformal_alpha,
+                M=args.csa_n_directions,
+                split_ratio=args.csa_split_ratio,
+                seed=args.csa_seed + run_id,
+            )
+        elif args.conformal_method == "csa_lc":
+            lc_csa_obj = _csa_fit_label_conditional(
+                p_val=p_val,
+                y_val=y_val,
+                alpha=args.conformal_alpha,
+                M=args.csa_n_directions,
+                split_ratio=args.csa_split_ratio,
+                seed=args.csa_seed + run_id,
+            )
+
+        val_molecule_export: Optional[Dict[str, Any]] = None
+        train_molecule_export: Optional[Dict[str, Any]] = None
+        p_train: Optional[np.ndarray] = None
+        u_train_epi: Optional[np.ndarray] = None
+        u_train_total: Optional[np.ndarray] = None
+        if export_base_per_molecule_dir is not None and train_split_name and y_train is not None:
+            p_train_stack, u_train_epi_stack, _, u_train_stack, tags_train = _load_split_predictions(
+                pred_root=pred_root, split_name=train_split_name, methods=methods, run_id=run_id
+            )
+            if tags_train != tags_val:
+                raise RuntimeError(f"Method ordering mismatch on train for run {run_id}.")
+            _ensure_same_length(y_train, p_train_stack, f"train run {run_id}")
+            p_train = p_train_stack
+            u_train_epi = u_train_epi_stack
+            u_train_total = u_train_stack
+        if export_base_per_molecule_dir is not None:
+            val_molecule_export = {
+                "row_index": np.arange(len(y_val), dtype=np.int64),
+                "y_true": y_val.astype(np.float64).reshape(-1),
+                "conformal_alpha": np.full(len(y_val), float(args.conformal_alpha), dtype=np.float64),
+                "cp_calibrated_on_split": np.full(len(y_val), args.val_split, dtype=object),
+            }
+            if smiles_val_export is not None and len(smiles_val_export) == len(y_val):
+                val_molecule_export[id_col] = smiles_val_export
+            if train_split_name and y_train is not None and p_train is not None:
+                train_molecule_export = {
+                    "row_index": np.arange(len(y_train), dtype=np.int64),
+                    "y_true": y_train.astype(np.float64).reshape(-1),
+                    "conformal_alpha": np.full(len(y_train), float(args.conformal_alpha), dtype=np.float64),
+                    "cp_calibrated_on_split": np.full(len(y_train), args.val_split, dtype=object),
+                }
+                if smiles_train_export is not None and len(smiles_train_export) == len(y_train):
+                    train_molecule_export[id_col] = smiles_train_export
+
         print(f"\n=== Run {run_id} ===")
         print("[Base methods]")
         for idx, method in enumerate(methods):
@@ -2561,6 +2545,22 @@ def main() -> None:
             radar_metrics_store["all"]["test"].setdefault(base_key, []).append(test_m)
             confusion_store["all"]["val"].setdefault(base_key, []).append(_cm_counts_from_metrics(val_m))
             confusion_store["all"]["test"].setdefault(base_key, []).append(_cm_counts_from_metrics(test_m))
+            conformal_trend_confusion_store["all_test"].setdefault(base_key, []).append(
+                _cm_counts_from_metrics(test_m)
+            )
+            _append_category_confusion(
+                scenario="all",
+                model_key=base_key,
+                val_cm=_cm_counts_from_metrics(val_m),
+                test_prob=p_test[idx],
+                threshold=thr,
+            )
+            _append_category_trend_confusion(
+                row_key="all_test",
+                model_key=base_key,
+                test_prob=p_test[idx],
+                threshold=thr,
+            )
             _append_metric_row(
                 report_rows,
                 row_type="per_run",
@@ -2592,6 +2592,25 @@ def main() -> None:
                 sorted_weights_neg=scores_neg_w,
                 test_sample_weights=cp_w_val,
             )
+            accepted_mask_train = None
+            pred_label_train = None
+            if (
+                export_base_per_molecule_dir is not None
+                and train_molecule_export is not None
+                and p_train is not None
+                and cp_w_train is not None
+                and u_train_epi is not None
+                and u_train_total is not None
+            ):
+                accepted_mask_train, pred_label_train = _conformal_single_label_accept_mask(
+                    prob_pos_test=p_train[idx],
+                    sorted_scores_pos=scores_pos,
+                    sorted_scores_neg=scores_neg,
+                    alpha=args.conformal_alpha,
+                    sorted_weights_pos=scores_pos_w,
+                    sorted_weights_neg=scores_neg_w,
+                    test_sample_weights=cp_w_train,
+                )
             accepted_mask, pred_label_test = _conformal_single_label_accept_mask(
                 prob_pos_test=p_test[idx],
                 sorted_scores_pos=scores_pos,
@@ -2601,6 +2620,55 @@ def main() -> None:
                 sorted_weights_neg=scores_neg_w,
                 test_sample_weights=cp_w_test,
             )
+            if val_molecule_export is not None:
+                pfx = _sanitize_method_csv_prefix(method)
+                val_molecule_export[f"{pfx}_{PROB_COL}"] = np.asarray(p_val[idx], dtype=np.float64)
+                val_molecule_export[f"{pfx}_{EPI_COL}"] = np.asarray(u_val_epi[idx], dtype=np.float64)
+                val_molecule_export[f"{pfx}_{ISO_COL}"] = np.asarray(u_val[idx], dtype=np.float64)
+                val_molecule_export[f"{pfx}_cp_accepted"] = np.asarray(accepted_mask_val, dtype=np.int8)
+                val_molecule_export[f"{pfx}_cp_pred_label"] = np.asarray(pred_label_val, dtype=np.int8)
+            if (
+                train_molecule_export is not None
+                and accepted_mask_train is not None
+                and pred_label_train is not None
+                and u_train_epi is not None
+                and u_train_total is not None
+            ):
+                pfx = _sanitize_method_csv_prefix(method)
+                train_molecule_export[f"{pfx}_{PROB_COL}"] = np.asarray(p_train[idx], dtype=np.float64)
+                train_molecule_export[f"{pfx}_{EPI_COL}"] = np.asarray(u_train_epi[idx], dtype=np.float64)
+                train_molecule_export[f"{pfx}_{ISO_COL}"] = np.asarray(u_train_total[idx], dtype=np.float64)
+                train_molecule_export[f"{pfx}_cp_accepted"] = np.asarray(accepted_mask_train, dtype=np.int8)
+                train_molecule_export[f"{pfx}_cp_pred_label"] = np.asarray(pred_label_train, dtype=np.int8)
+            for alpha in conformal_trend_alphas:
+                accepted_mask_alpha, _ = _conformal_single_label_accept_mask(
+                    prob_pos_test=p_test[idx],
+                    sorted_scores_pos=scores_pos,
+                    sorted_scores_neg=scores_neg,
+                    alpha=float(alpha),
+                    sorted_weights_pos=scores_pos_w,
+                    sorted_weights_neg=scores_neg_w,
+                    test_sample_weights=cp_w_test,
+                )
+                conf_test_alpha = _evaluate_accepted_subset(
+                    y_true=y_test,
+                    prob=p_test[idx],
+                    uncertainty=u_test[idx],
+                    accepted_mask=accepted_mask_alpha,
+                    n_bins=args.ece_bins,
+                    threshold=thr,
+                )
+                if int(conf_test_alpha.get("accepted_count", 0.0)) > 0:
+                    conformal_trend_confusion_store[f"alpha_{alpha:.4f}"].setdefault(base_key, []).append(
+                        _cm_counts_from_metrics(conf_test_alpha)
+                    )
+                _append_category_trend_confusion(
+                    row_key=f"alpha_{alpha:.4f}",
+                    model_key=base_key,
+                    test_prob=p_test[idx],
+                    threshold=thr,
+                    accepted_mask=accepted_mask_alpha,
+                )
             _accumulate_conformal_hist_values(
                 conformal_hist_store,
                 split="val",
@@ -2768,6 +2836,19 @@ def main() -> None:
                 confusion_store["conformal"]["test"].setdefault(base_key, []).append(
                     _cm_counts_from_metrics(conf_test_m)
                 )
+            _append_category_confusion(
+                scenario="conformal",
+                model_key=base_key,
+                val_cm=_cm_counts_from_probs(
+                    y_true=y_val,
+                    probs=p_val[idx],
+                    threshold=thr,
+                    mask=accepted_mask_val,
+                ),
+                test_prob=p_test[idx],
+                threshold=thr,
+                accepted_mask=accepted_mask,
+            )
             _append_metric_row(
                 conformal_rows,
                 row_type="conformal_per_run",
@@ -2789,6 +2870,15 @@ def main() -> None:
                 weights=f"alpha={args.conformal_alpha}",
             )
 
+        if val_molecule_export is not None and export_base_per_molecule_dir is not None:
+            out_v = export_base_per_molecule_dir / f"base_per_molecule_{args.val_split}_run_{run_id}.csv"
+            pd.DataFrame(val_molecule_export).to_csv(out_v, index=False)
+            print(f"[Export] wrote {out_v}")
+        if train_molecule_export is not None and export_base_per_molecule_dir is not None:
+            out_t = export_base_per_molecule_dir / f"base_per_molecule_{train_split_name}_run_{run_id}.csv"
+            pd.DataFrame(train_molecule_export).to_csv(out_t, index=False)
+            print(f"[Export] wrote {out_t}")
+
         u_val_for_iso = u_val if args.uncertainty_weight_source == "total" else u_val_epi
         u_test_for_iso = u_test if args.uncertainty_weight_source == "total" else u_test_epi
         (
@@ -2799,11 +2889,8 @@ def main() -> None:
             iso_calibrated_test,
             iso_sample_w_val,
             iso_sample_w_test,
-            iso_z_test,
-            iso_z_test_abs,
             iso_quantile_test,
             iso_inv_score_test,
-            _iso_unused_penalty,
         ) = _fit_weights_uncertainty_inverse_isotonic(
             p_val=p_val,
             u_val=u_val_for_iso,
@@ -2812,8 +2899,6 @@ def main() -> None:
             target_recall=args.target_recall,
             tau=args.uncertainty_tau,
             score_cap=args.iso_inverse_score_cap,
-            ood_lambda=args.iso_ood_lambda,
-            ood_z_tolerance=args.iso_ood_z_tolerance,
         )
         for idx, method in enumerate(methods):
             isotonic_uncertainty_val_store[method].append(
@@ -2821,9 +2906,6 @@ def main() -> None:
             )
             isotonic_uncertainty_test_store[method].append(
                 np.asarray(iso_calibrated_test[idx], dtype=np.float64).reshape(-1)
-            )
-            inverse_isotonic_zscore_test_store[method].append(
-                np.asarray(iso_z_test[idx], dtype=np.float64).reshape(-1)
             )
             inverse_isotonic_score_test_store[method].append(
                 np.asarray(iso_inv_score_test[idx], dtype=np.float64).reshape(-1)
@@ -2833,6 +2915,34 @@ def main() -> None:
             )
             inverse_isotonic_resultant_weight_test_store[method].append(
                 np.asarray(iso_sample_w_test[idx], dtype=np.float64).reshape(-1)
+            )
+        base_accept_mask_val = np.zeros_like(p_val, dtype=bool)
+        base_accept_mask_test = np.zeros_like(p_test, dtype=bool)
+        for idx in range(len(methods)):
+            base_scores_pos, base_scores_neg, base_scores_pos_w, base_scores_neg_w = (
+                _build_label_conditional_conformal_scores(
+                    y_val=y_val,
+                    prob_pos_val=p_val[idx],
+                    sample_weights_val=cp_w_val,
+                )
+            )
+            base_accept_mask_val[idx], _ = _conformal_single_label_accept_mask(
+                prob_pos_test=p_val[idx],
+                sorted_scores_pos=base_scores_pos,
+                sorted_scores_neg=base_scores_neg,
+                alpha=args.conformal_alpha,
+                sorted_weights_pos=base_scores_pos_w,
+                sorted_weights_neg=base_scores_neg_w,
+                test_sample_weights=cp_w_val,
+            )
+            base_accept_mask_test[idx], _ = _conformal_single_label_accept_mask(
+                prob_pos_test=p_test[idx],
+                sorted_scores_pos=base_scores_pos,
+                sorted_scores_neg=base_scores_neg,
+                alpha=args.conformal_alpha,
+                sorted_weights_pos=base_scores_pos_w,
+                sorted_weights_neg=base_scores_neg_w,
+                test_sample_weights=cp_w_test,
             )
         weights = {
             "uniform": np.ones(len(methods), dtype=np.float64) / len(methods),
@@ -2850,17 +2960,32 @@ def main() -> None:
         print("[Stacking methods]")
         stack_order = [
             "uncertainty_inverse_isotonic",
+            "uncertainty_inverse_isotonic_reject_filtered",
             "uniform",
             "softmax_brier_model_score",
             "brier_opt",
             "logloss_opt",
         ]
+        iso_stack_names = {
+            "uncertainty_inverse_isotonic",
+            "uncertainty_inverse_isotonic_reject_filtered",
+        }
         for stack_name in stack_order:
             if stack_name == "uncertainty_inverse_isotonic":
                 w_val = iso_sample_w_val
                 w_test = iso_sample_w_test
                 w_summary = iso_w_mean
                 adaptive_note = "sample_adaptive_iso_inverse"
+            elif stack_name == "uncertainty_inverse_isotonic_reject_filtered":
+                w_val = _downweight_rejected_method_weights(
+                    iso_sample_w_val, base_accept_mask_val
+                )
+                w_test = _downweight_rejected_method_weights(
+                    iso_sample_w_test, base_accept_mask_test
+                )
+                w_summary = np.mean(w_val, axis=1)
+                w_summary = w_summary / np.clip(np.sum(w_summary), 1e-12, None)
+                adaptive_note = "sample_adaptive_iso_inverse_reject_filtered(hard_zero)"
             else:
                 w_static = weights[stack_name]
                 w_val = w_static
@@ -3020,20 +3145,28 @@ def main() -> None:
             radar_metrics_store["all"]["test"].setdefault(stack_key, []).append(test_metrics)
             confusion_store["all"]["val"].setdefault(stack_key, []).append(_cm_counts_from_metrics(val_metrics))
             confusion_store["all"]["test"].setdefault(stack_key, []).append(_cm_counts_from_metrics(test_metrics))
+            conformal_trend_confusion_store["all_test"].setdefault(stack_key, []).append(
+                _cm_counts_from_metrics(test_metrics)
+            )
+            _append_category_confusion(
+                scenario="all",
+                model_key=stack_key,
+                val_cm=_cm_counts_from_metrics(val_metrics),
+                test_prob=test_prob,
+                threshold=thr,
+            )
+            _append_category_trend_confusion(
+                row_key="all_test",
+                model_key=stack_key,
+                test_prob=test_prob,
+                threshold=thr,
+            )
             w_str = ", ".join(f"{m}={ww:.4f}" for m, ww in zip(methods, w_summary))
-            if stack_name == "uncertainty_inverse_isotonic":
+            if stack_name in iso_stack_names:
                 coef_val_str = ", ".join(f"{m}={cc:.4f}" for m, cc in zip(methods, iso_coeff_val))
                 coef_test_str = ", ".join(f"{m}={cc:.4f}" for m, cc in zip(methods, iso_coeff_test))
-                z_mean_str = ", ".join(
-                    f"{m}={zz:.3f}" for m, zz in zip(methods, np.mean(iso_z_test_abs, axis=1))
-                )
-                z_p95_str = ", ".join(
-                    f"{m}={zz:.3f}" for m, zz in zip(methods, np.quantile(iso_z_test_abs, 0.95, axis=1))
-                )
                 print(f"- {stack_name} | isotonic_coef_val: {coef_val_str}")
                 print(f"- {stack_name} | isotonic_coef_test: {coef_test_str}")
-                print(f"- {stack_name} | ood_abs_z_mean(test): {z_mean_str}")
-                print(f"- {stack_name} | ood_abs_z_p95(test): {z_p95_str}")
                 q_mean_str = ", ".join(
                     f"{m}={qq:.3f}" for m, qq in zip(methods, np.mean(iso_quantile_test, axis=1))
                 )
@@ -3057,7 +3190,7 @@ def main() -> None:
                 metrics=val_metrics,
                 weights=(
                     (w_str if not adaptive_note else f"{w_str} | {adaptive_note}")
-                    if stack_name != "uncertainty_inverse_isotonic"
+                    if stack_name not in iso_stack_names
                     else (
                         w_str
                         + " | isotonic_coef_val: "
@@ -3082,7 +3215,7 @@ def main() -> None:
                 metrics=test_metrics,
                 weights=(
                     (w_str if not adaptive_note else f"{w_str} | {adaptive_note}")
-                    if stack_name != "uncertainty_inverse_isotonic"
+                    if stack_name not in iso_stack_names
                     else (
                         w_str
                         + " | isotonic_coef_val: "
@@ -3098,27 +3231,213 @@ def main() -> None:
                 ),
             )
 
-            scores_pos, scores_neg, scores_pos_w, scores_neg_w = _build_label_conditional_conformal_scores(
-                y_val=y_val, prob_pos_val=val_prob, sample_weights_val=cp_w_val
-            )
-            accepted_mask_val, pred_label_val = _conformal_single_label_accept_mask(
-                prob_pos_test=val_prob,
-                sorted_scores_pos=scores_pos,
-                sorted_scores_neg=scores_neg,
-                alpha=args.conformal_alpha,
-                sorted_weights_pos=scores_pos_w,
-                sorted_weights_neg=scores_neg_w,
-                test_sample_weights=cp_w_val,
-            )
-            accepted_mask, pred_label_test = _conformal_single_label_accept_mask(
-                prob_pos_test=test_prob,
-                sorted_scores_pos=scores_pos,
-                sorted_scores_neg=scores_neg,
-                alpha=args.conformal_alpha,
-                sorted_weights_pos=scores_pos_w,
-                sorted_weights_neg=scores_neg_w,
-                test_sample_weights=cp_w_test,
-            )
+            # --- conformal credal sets (standard / csa / csa_lc) -------------
+            if args.conformal_method == "csa" and csa_obj is not None:
+                # CSA (marginal): one shared acceptance region over all K scores.
+                _credal_val, accepted_mask_val, pred_label_val = _csa_predict(
+                    csa_obj, p_val
+                )
+                credal_test_arr, accepted_mask, pred_label_test = _csa_predict(
+                    csa_obj, p_test
+                )
+                for alpha in conformal_trend_alphas:
+                    _, accepted_mask_alpha, _ = _csa_predict(
+                        csa_obj, p_test, alpha=float(alpha)
+                    )
+                    conf_test_alpha = _evaluate_accepted_subset(
+                        y_true=y_test,
+                        prob=test_prob,
+                        uncertainty=test_unc,
+                        accepted_mask=accepted_mask_alpha,
+                        n_bins=args.ece_bins,
+                        threshold=thr,
+                    )
+                    if int(conf_test_alpha.get("accepted_count", 0.0)) > 0:
+                        conformal_trend_confusion_store[f"alpha_{alpha:.4f}"].setdefault(stack_key, []).append(
+                            _cm_counts_from_metrics(conf_test_alpha)
+                        )
+                    _append_category_trend_confusion(
+                        row_key=f"alpha_{alpha:.4f}",
+                        model_key=stack_key,
+                        test_prob=test_prob,
+                        threshold=thr,
+                        accepted_mask=accepted_mask_alpha,
+                    )
+                    if stack_name in iso_stack_names:
+                        credal_ac_accept_store[stack_name].setdefault(
+                            f"alpha_{alpha:.4f}", []
+                        ).append(accepted_mask_alpha.copy())
+                if stack_name in iso_stack_names:
+                    test_out = summary_csv.parent / f"{stack_name}_conformal_test_run_{run_id}.csv"
+                    pd.DataFrame(
+                        {
+                            "credal_set_conformal": credal_test_arr,
+                            "accepted": accepted_mask.astype(bool),
+                            "csa_t_hat": float(csa_obj["t_hat"]),
+                            "csa_beta_star": float(csa_obj["beta_star"]),
+                            "csa_M": int(csa_obj["M"]),
+                            "csa_K": int(csa_obj["K"]),
+                        }
+                    ).to_csv(test_out, index=False)
+                    print(f"[CSA {stack_name}] saved: {test_out}")
+            elif args.conformal_method == "csa_lc" and lc_csa_obj is not None:
+                # CSA-LC: two independent CSA objects, one per class.
+                # Per-class coverage >= 1-alpha; inter-model disagreement visible.
+                _credal_val, accepted_mask_val, pred_label_val = _csa_predict_label_conditional(
+                    lc_csa_obj, p_val
+                )
+                credal_test_arr, accepted_mask, pred_label_test = _csa_predict_label_conditional(
+                    lc_csa_obj, p_test
+                )
+                for alpha in conformal_trend_alphas:
+                    _, accepted_mask_alpha, _ = _csa_predict_label_conditional(
+                        lc_csa_obj, p_test, alpha=float(alpha)
+                    )
+                    conf_test_alpha = _evaluate_accepted_subset(
+                        y_true=y_test,
+                        prob=test_prob,
+                        uncertainty=test_unc,
+                        accepted_mask=accepted_mask_alpha,
+                        n_bins=args.ece_bins,
+                        threshold=thr,
+                    )
+                    if int(conf_test_alpha.get("accepted_count", 0.0)) > 0:
+                        conformal_trend_confusion_store[f"alpha_{alpha:.4f}"].setdefault(stack_key, []).append(
+                            _cm_counts_from_metrics(conf_test_alpha)
+                        )
+                    _append_category_trend_confusion(
+                        row_key=f"alpha_{alpha:.4f}",
+                        model_key=stack_key,
+                        test_prob=test_prob,
+                        threshold=thr,
+                        accepted_mask=accepted_mask_alpha,
+                    )
+                    if stack_name in iso_stack_names:
+                        credal_ac_accept_store[stack_name].setdefault(
+                            f"alpha_{alpha:.4f}", []
+                        ).append(accepted_mask_alpha.copy())
+                if stack_name in iso_stack_names:
+                    test_out = summary_csv.parent / f"{stack_name}_conformal_test_run_{run_id}.csv"
+                    pd.DataFrame(
+                        {
+                            "credal_set_conformal": credal_test_arr,
+                            "accepted": accepted_mask.astype(bool),
+                            "csa_lc_t_hat_pos": float(lc_csa_obj["pos"]["t_hat"]),
+                            "csa_lc_t_hat_neg": float(lc_csa_obj["neg"]["t_hat"]),
+                            "csa_lc_beta_star_pos": float(lc_csa_obj["pos"]["beta_star"]),
+                            "csa_lc_beta_star_neg": float(lc_csa_obj["neg"]["beta_star"]),
+                            "csa_lc_M": int(lc_csa_obj["pos"]["M"]),
+                            "csa_lc_K": int(lc_csa_obj["pos"]["K"]),
+                        }
+                    ).to_csv(test_out, index=False)
+                    print(f"[CSA-LC {stack_name}] saved: {test_out}")
+            else:
+                # Standard: label-conditional weighted split-CP on aggregated prob.
+                scores_pos, scores_neg, scores_pos_w, scores_neg_w = _build_label_conditional_conformal_scores(
+                    y_val=y_val, prob_pos_val=val_prob, sample_weights_val=cp_w_val
+                )
+                accepted_mask_val, pred_label_val = _conformal_single_label_accept_mask(
+                    prob_pos_test=val_prob,
+                    sorted_scores_pos=scores_pos,
+                    sorted_scores_neg=scores_neg,
+                    alpha=args.conformal_alpha,
+                    sorted_weights_pos=scores_pos_w,
+                    sorted_weights_neg=scores_neg_w,
+                    test_sample_weights=cp_w_val,
+                )
+                accepted_mask, pred_label_test = _conformal_single_label_accept_mask(
+                    prob_pos_test=test_prob,
+                    sorted_scores_pos=scores_pos,
+                    sorted_scores_neg=scores_neg,
+                    alpha=args.conformal_alpha,
+                    sorted_weights_pos=scores_pos_w,
+                    sorted_weights_neg=scores_neg_w,
+                    test_sample_weights=cp_w_test,
+                )
+                for alpha in conformal_trend_alphas:
+                    accepted_mask_alpha, _ = _conformal_single_label_accept_mask(
+                        prob_pos_test=test_prob,
+                        sorted_scores_pos=scores_pos,
+                        sorted_scores_neg=scores_neg,
+                        alpha=float(alpha),
+                        sorted_weights_pos=scores_pos_w,
+                        sorted_weights_neg=scores_neg_w,
+                        test_sample_weights=cp_w_test,
+                    )
+                    conf_test_alpha = _evaluate_accepted_subset(
+                        y_true=y_test,
+                        prob=test_prob,
+                        uncertainty=test_unc,
+                        accepted_mask=accepted_mask_alpha,
+                        n_bins=args.ece_bins,
+                        threshold=thr,
+                    )
+                    if int(conf_test_alpha.get("accepted_count", 0.0)) > 0:
+                        conformal_trend_confusion_store[f"alpha_{alpha:.4f}"].setdefault(stack_key, []).append(
+                            _cm_counts_from_metrics(conf_test_alpha)
+                        )
+                    _append_category_trend_confusion(
+                        row_key=f"alpha_{alpha:.4f}",
+                        model_key=stack_key,
+                        test_prob=test_prob,
+                        threshold=thr,
+                        accepted_mask=accepted_mask_alpha,
+                    )
+                    if stack_name in iso_stack_names:
+                        credal_ac_accept_store[stack_name].setdefault(
+                            f"alpha_{alpha:.4f}", []
+                        ).append(accepted_mask_alpha.copy())
+                if stack_name in iso_stack_names:
+                    s_pos_test = 1.0 - np.clip(test_prob, 1e-8, 1.0 - 1e-8)
+                    s_neg_test = np.clip(test_prob, 1e-8, 1.0 - 1e-8)
+
+                    def _credal_set_from_scores(
+                        prob_pos_arr: np.ndarray, test_sample_weights: np.ndarray
+                    ) -> np.ndarray:
+                        p = np.clip(np.asarray(prob_pos_arr, dtype=float).reshape(-1), 1e-8, 1.0 - 1e-8)
+                        w_test = np.clip(
+                            np.asarray(test_sample_weights, dtype=np.float64).reshape(-1), 1e-12, None
+                        )
+                        w_pos = np.clip(np.asarray(scores_pos_w, dtype=np.float64).reshape(-1), 1e-12, None)
+                        w_neg = np.clip(np.asarray(scores_neg_w, dtype=np.float64).reshape(-1), 1e-12, None)
+                        s_pos = 1.0 - p
+                        s_neg = p
+                        idx_pos = np.searchsorted(scores_pos, s_pos, side="left")
+                        idx_neg = np.searchsorted(scores_neg, s_neg, side="left")
+                        suffix_pos = np.cumsum(w_pos[::-1], dtype=np.float64)[::-1]
+                        suffix_neg = np.cumsum(w_neg[::-1], dtype=np.float64)[::-1]
+                        tail_w_pos = np.zeros_like(s_pos, dtype=np.float64)
+                        tail_w_neg = np.zeros_like(s_neg, dtype=np.float64)
+                        valid_pos = idx_pos < len(scores_pos)
+                        valid_neg = idx_neg < len(scores_neg)
+                        if np.any(valid_pos):
+                            tail_w_pos[valid_pos] = suffix_pos[idx_pos[valid_pos]]
+                        if np.any(valid_neg):
+                            tail_w_neg[valid_neg] = suffix_neg[idx_neg[valid_neg]]
+                        total_w_pos = float(np.sum(w_pos))
+                        total_w_neg = float(np.sum(w_neg))
+                        pval_pos = (tail_w_pos + w_test) / (total_w_pos + w_test)
+                        pval_neg = (tail_w_neg + w_test) / (total_w_neg + w_test)
+                        in_pos = pval_pos > float(args.conformal_alpha)
+                        in_neg = pval_neg > float(args.conformal_alpha)
+                        credal = np.full(p.shape, "{None}", dtype=object)
+                        credal[np.logical_and(np.logical_not(in_pos), in_neg)] = "{0}"
+                        credal[np.logical_and(in_pos, np.logical_not(in_neg))] = "{1}"
+                        credal[np.logical_and(in_pos, in_neg)] = "{0,1}"
+                        return credal
+
+                    credal_test = _credal_set_from_scores(test_prob, cp_w_test)
+                    test_rows = pd.DataFrame(
+                        {
+                            "nonuniformity_pos": s_pos_test.astype(float),
+                            "nonuniformity_neg": s_neg_test.astype(float),
+                            "credal_set_conformal": credal_test,
+                            "accepted": accepted_mask.astype(bool),
+                        }
+                    )
+                    test_out = summary_csv.parent / f"{stack_name}_conformal_test_run_{run_id}.csv"
+                    test_rows.to_csv(test_out, index=False)
+                    print(f"[{stack_name}] saved: {test_out}")
             _accumulate_conformal_hist_values(
                 conformal_hist_store,
                 split="val",
@@ -3286,6 +3605,19 @@ def main() -> None:
                 confusion_store["conformal"]["test"].setdefault(stack_key, []).append(
                     _cm_counts_from_metrics(conf_test_m)
                 )
+            _append_category_confusion(
+                scenario="conformal",
+                model_key=stack_key,
+                val_cm=_cm_counts_from_probs(
+                    y_true=y_val,
+                    probs=val_prob,
+                    threshold=thr,
+                    mask=accepted_mask_val,
+                ),
+                test_prob=test_prob,
+                threshold=thr,
+                accepted_mask=accepted_mask,
+            )
             _append_metric_row(
                 conformal_rows,
                 row_type="conformal_per_run",
@@ -3443,13 +3775,58 @@ def main() -> None:
     )
     _export_inverse_isotonic_test_diagnostics(
         methods=methods,
-        z_score_test_store=inverse_isotonic_zscore_test_store,
         inverse_score_test_store=inverse_isotonic_score_test_store,
         quantile_test_store=inverse_isotonic_quantile_test_store,
         resultant_weight_test_store=inverse_isotonic_resultant_weight_test_store,
         out_dir=summary_csv.parent,
     )
     print(f"Saved uncertainty distribution artifacts under: {uncertainty_dist_dir}")
+
+    # Export credal-set acceptance vs ac_label grid for iso-stack methods.
+    if category_specs and ac_labels_test is not None and len(ac_labels_test) == len(y_test):
+        iso_slug_map = {
+            "uncertainty_inverse_isotonic": "inv_iso",
+            "uncertainty_inverse_isotonic_reject_filtered": "inv_iso_rf",
+        }
+        for sn, slug in iso_slug_map.items():
+            if credal_ac_accept_store.get(sn):
+                _export_credal_ac_label_grid(
+                    stack_name=sn,
+                    credal_ac_accept_store=credal_ac_accept_store[sn],
+                    conformal_trend_alphas=conformal_trend_alphas,
+                    ac_labels_test=ac_labels_test,
+                    category_specs=category_specs,
+                    out_png=summary_csv.parent / f"credal_ac_label_grid_{slug}.png",
+                    out_csv=summary_csv.parent / f"credal_ac_label_grid_{slug}.csv",
+                    norm="column",
+                )
+                print(f"[credal ac_label grid] saved: credal_ac_label_grid_{slug}.png")
+                _export_credal_ac_label_grid(
+                    stack_name=sn,
+                    credal_ac_accept_store=credal_ac_accept_store[sn],
+                    conformal_trend_alphas=conformal_trend_alphas,
+                    ac_labels_test=ac_labels_test,
+                    category_specs=category_specs,
+                    out_png=summary_csv.parent / f"credal_ac_label_grid_{slug}_row_norm.png",
+                    out_csv=summary_csv.parent / f"credal_ac_label_grid_{slug}_row_norm.csv",
+                    norm="row",
+                )
+                print(f"[credal ac_label grid] saved: credal_ac_label_grid_{slug}_row_norm.png")
+
+        # Export CSA decision-space scatter plots (CP score space + epistemic uncertainty space).
+        if csa_scatter_p_test_runs and args.conformal_method in ("csa", "csa_lc", "standard"):
+            for sn in iso_slug_map:
+                if credal_ac_accept_store.get(sn):
+                    _export_csa_decision_space_scatter(
+                        stack_name=sn,
+                        p_test_runs=csa_scatter_p_test_runs,
+                        u_test_epi_runs=csa_scatter_u_epi_runs,
+                        credal_ac_accept_store=credal_ac_accept_store[sn],
+                        conformal_trend_alphas=conformal_trend_alphas,
+                        category_specs=category_specs,
+                        methods=methods,
+                        out_dir=summary_csv.parent,
+                    )
 
     # Export confusion matrices without/with conformal filtering.
     def _model_sort_key(name: str) -> Tuple[int, str]:
@@ -3477,6 +3854,105 @@ def main() -> None:
             out_png=summary_csv.parent / f"confusion_matrices_val_test_all_methods_{scenario}.png",
             out_csv=summary_csv.parent / f"confusion_matrices_val_test_all_methods_{scenario}.csv",
         )
+        if category_specs:
+            for category_name, category_slug, _ in category_specs:
+                cat_entries: List[Dict[str, Any]] = []
+                cat_store = category_confusion_store[category_slug][scenario]
+                cat_model_names = sorted(
+                    set(cat_store["val"].keys()) | set(cat_store["test"].keys()),
+                    key=_model_sort_key,
+                )
+                for model_name in cat_model_names:
+                    val_runs = cat_store["val"].get(model_name, [])
+                    test_runs = cat_store["test"].get(model_name, [])
+                    if not val_runs or not test_runs:
+                        continue
+                    val_sum = np.sum(np.stack(val_runs, axis=0), axis=0)
+                    test_sum = np.sum(np.stack(test_runs, axis=0), axis=0)
+                    cat_entries.append(
+                        {
+                            "model_name": model_name,
+                            "val_cm": val_sum,
+                            "test_cm": test_sum,
+                        }
+                    )
+                if cat_entries:
+                    _export_confusion_matrix_grid(
+                        entries=cat_entries,
+                        out_png=summary_csv.parent
+                        / f"confusion_matrices_val_test_all_methods_{scenario}_{category_slug}.png",
+                        out_csv=summary_csv.parent
+                        / f"confusion_matrices_val_test_all_methods_{scenario}_{category_slug}.csv",
+                    )
+                    print(
+                        f"Saved category confusion ({scenario}, {category_name}): "
+                        f"confusion_matrices_val_test_all_methods_{scenario}_{category_slug}.png"
+                    )
+
+    # Export one extra test-only confusion trend grid:
+    # all test vs conformal accepted subsets across selected alpha levels.
+    trend_row_specs: List[Tuple[str, str]] = [("all_test", "All test")]
+    for alpha in conformal_trend_alphas:
+        conf_level_pct = int(round((1.0 - float(alpha)) * 100.0))
+        trend_row_specs.append((f"alpha_{alpha:.4f}", f"CP {conf_level_pct}% accepted"))
+    trend_model_names = sorted(
+        {
+            model_name
+            for row_key in [rk for rk, _ in trend_row_specs]
+            for model_name in conformal_trend_confusion_store.get(row_key, {}).keys()
+        },
+        key=_model_sort_key,
+    )
+    trend_entries: List[Dict[str, Any]] = []
+    for model_name in trend_model_names:
+        row_cms: Dict[str, np.ndarray] = {}
+        for row_key, _ in trend_row_specs:
+            runs = conformal_trend_confusion_store.get(row_key, {}).get(model_name, [])
+            if runs:
+                row_cms[row_key] = np.sum(np.stack(runs, axis=0), axis=0)
+            else:
+                row_cms[row_key] = np.zeros((2, 2), dtype=float)
+        trend_entries.append({"model_name": model_name, "row_cms": row_cms})
+    _export_conformal_trend_confusion_grid(
+        entries=trend_entries,
+        row_specs=trend_row_specs,
+        out_png=summary_csv.parent / "confusion_matrices_test_conformal_trend.png",
+        out_csv=summary_csv.parent / "confusion_matrices_test_conformal_trend.csv",
+    )
+    if category_specs:
+        for category_name, category_slug, _ in category_specs:
+            cat_trend_store = category_trend_confusion_store[category_slug]
+            cat_trend_model_names = sorted(
+                {
+                    model_name
+                    for row_key in [rk for rk, _ in trend_row_specs]
+                    for model_name in cat_trend_store.get(row_key, {}).keys()
+                },
+                key=_model_sort_key,
+            )
+            cat_trend_entries: List[Dict[str, Any]] = []
+            for model_name in cat_trend_model_names:
+                row_cms: Dict[str, np.ndarray] = {}
+                for row_key, _ in trend_row_specs:
+                    runs = cat_trend_store.get(row_key, {}).get(model_name, [])
+                    if runs:
+                        row_cms[row_key] = np.sum(np.stack(runs, axis=0), axis=0)
+                    else:
+                        row_cms[row_key] = np.zeros((2, 2), dtype=float)
+                cat_trend_entries.append({"model_name": model_name, "row_cms": row_cms})
+            if cat_trend_entries:
+                _export_conformal_trend_confusion_grid(
+                    entries=cat_trend_entries,
+                    row_specs=trend_row_specs,
+                    out_png=summary_csv.parent
+                    / f"confusion_matrices_test_conformal_trend_{category_slug}.png",
+                    out_csv=summary_csv.parent
+                    / f"confusion_matrices_test_conformal_trend_{category_slug}.csv",
+                )
+                print(
+                    f"Saved category conformal-trend confusion ({category_name}): "
+                    f"confusion_matrices_test_conformal_trend_{category_slug}.png"
+                )
 
     # Export 2 * len(methods) radar figures:
     # one base-focused radar for each CLI-provided base method, for both all and conformal scenarios.
@@ -3503,6 +3979,18 @@ def main() -> None:
         radar_metrics_store=radar_metrics_store,
         out_png=summary_csv.parent / "radar_all_base_vs_allpos_allneg.png",
         out_csv=summary_csv.parent / "radar_all_base_vs_allpos_allneg.csv",
+    )
+    _export_radar_inverse_iso_vs_base_models(
+        radar_metrics_store=radar_metrics_store,
+        scenario="all",
+        out_png=summary_csv.parent / "radar_all_inverse_iso_vs_bases.png",
+        out_csv=summary_csv.parent / "radar_all_inverse_iso_vs_bases.csv",
+    )
+    _export_radar_inverse_iso_vs_base_models(
+        radar_metrics_store=radar_metrics_store,
+        scenario="conformal",
+        out_png=summary_csv.parent / "radar_conformal_inverse_iso_vs_bases.png",
+        out_csv=summary_csv.parent / "radar_conformal_inverse_iso_vs_bases.csv",
     )
 
     if conformal_aggregate:

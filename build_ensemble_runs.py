@@ -4,10 +4,21 @@ import json
 from pathlib import Path
 from typing import Dict, List, Sequence
 
+import pandas as pd
+
 
 EXPECTED_KEYS = ("Pos_Prob", "Neg_Prob")
 DEFAULT_FOLDERS = ("tox21_test", "cytosafe_val")
 DEFAULT_RUNS = 5
+
+# Column pairs (Pos_Prob_col, Neg_Prob_col) in gbm_prediction.csv
+GBM_MODEL_COLS = [
+    ("LGBM_BSM_Pos_Prob",   "LGBM_BSM_Neg_Prob"),
+    ("LGBM_Naive_Pos_Prob", "LGBM_Naive_Neg_Prob"),
+    ("LGBM_Unb_Pos_Prob",   "LGBM_Unb_Neg_Prob"),
+    ("kNN_Pos_Prob",         "kNN_Neg_Prob"),
+    ("XGB_Pos_Prob",         "XGB_Neg_Prob"),
+]
 
 
 def _load_model_json(path: Path) -> Dict[str, List[float]]:
@@ -40,6 +51,17 @@ def _validate_and_collect(folder: Path) -> List[Dict[str, List[float]]]:
                 f"{folder} json index {idx} has inconsistent list lengths "
                 f"(Pos_Prob={len(model['Pos_Prob'])}, Neg_Prob={len(model['Neg_Prob'])}, expected={expected_len})."
             )
+    return model_outputs
+
+
+def _load_model_outputs_from_csv(csv_path: Path) -> List[Dict[str, List[float]]]:
+    df = pd.read_csv(csv_path)
+    model_outputs = []
+    for pos_col, neg_col in GBM_MODEL_COLS:
+        model_outputs.append({
+            "Pos_Prob": df[pos_col].tolist(),
+            "Neg_Prob": df[neg_col].tolist(),
+        })
     return model_outputs
 
 
@@ -99,9 +121,19 @@ def process_folder(folder: Path, runs: int) -> None:
     print(f"[ok] {folder}: wrote {runs} files with {len(rows)} rows each.")
 
 
+def process_gbm_csv(csv_path: Path, out_folder: Path, runs: int) -> None:
+    out_folder.mkdir(parents=True, exist_ok=True)
+    model_outputs = _load_model_outputs_from_csv(csv_path)
+    rows = _build_rows(model_outputs)
+    for run_idx in range(1, runs + 1):
+        out_path = out_folder / f"ensemble_run_{run_idx}.csv"
+        _write_run_csv(out_path, rows)
+    print(f"[ok] {csv_path.name} -> {out_folder}: wrote {runs} files with {len(rows)} rows each.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build ensemble CSV runs from 5 base-model JSON outputs."
+        description="Build ensemble CSV runs from 5 base-model JSON outputs or a gbm_prediction CSV."
     )
     parser.add_argument(
         "--repo-root",
@@ -113,7 +145,7 @@ def main() -> None:
         "--folders",
         nargs="+",
         default=list(DEFAULT_FOLDERS),
-        help="Folder names under repo root to process.",
+        help="Folder names under repo root to process (JSON mode).",
     )
     parser.add_argument(
         "--runs",
@@ -121,16 +153,32 @@ def main() -> None:
         default=DEFAULT_RUNS,
         help="Number of duplicate run csv files to emit per folder.",
     )
+    parser.add_argument(
+        "--gbm-csv",
+        type=Path,
+        default=None,
+        help="Path to gbm_prediction.csv; if given, runs CSV mode instead of JSON mode.",
+    )
+    parser.add_argument(
+        "--gbm-out",
+        type=Path,
+        default=None,
+        help="Output folder for CSV mode (default: <repo-root>/inference_outputs/BII).",
+    )
     args = parser.parse_args()
 
     if args.runs < 1:
         raise ValueError("--runs must be >= 1")
 
-    for folder_name in args.folders:
-        folder_path = args.repo_root / folder_name
-        if not folder_path.exists():
-            raise FileNotFoundError(f"Folder not found: {folder_path}")
-        process_folder(folder_path, args.runs)
+    if args.gbm_csv is not None:
+        out_folder = args.gbm_out or (args.repo_root / "inference_outputs" / "BII")
+        process_gbm_csv(args.gbm_csv, out_folder, args.runs)
+    else:
+        for folder_name in args.folders:
+            folder_path = args.repo_root / folder_name
+            if not folder_path.exists():
+                raise FileNotFoundError(f"Folder not found: {folder_path}")
+            process_folder(folder_path, args.runs)
 
 
 if __name__ == "__main__":
