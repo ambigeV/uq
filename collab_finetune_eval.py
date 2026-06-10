@@ -293,7 +293,10 @@ class UnifiedModel(nn.Module):
 
         # evidential
         logits = self.ffn(encoded)            # (B, 2*n_tasks)
-        evidence = torch.exp(logits)
+        # Clamp logits before exp to avoid float32 overflow -> inf alpha -> NaN
+        # loss. exp(20) ~ 4.85e8, so alpha is capped well below the float32 max
+        # while leaving normal-magnitude logits untouched.
+        evidence = torch.exp(logits.clamp(min=-20.0, max=20.0))
         alpha = evidence + 1.0
         B = logits.shape[0]
         alpha_r = alpha.view(B, self.n_tasks, 2)
