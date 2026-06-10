@@ -193,13 +193,14 @@ class MeanAggregation(nn.Module):
 class DMPNNEncoder(nn.Module):
     def __init__(self, d_v=133, d_e=14, d_h=300, depth=3, dropout=0.0, batch_norm=False):
         super().__init__()
-        self.mp = BondMessagePassing(d_v, d_e, d_h, depth, dropout)
+        # Name must match bii.py's encoder so checkpoints load cleanly.
+        self.message_passing = BondMessagePassing(d_v, d_e, d_h, depth, dropout)
         self.agg = MeanAggregation()
         self.bn = nn.BatchNorm1d(d_h) if batch_norm else nn.Identity()
         self.output_dim = d_h
 
     def forward(self, bmg: BatchMolGraph, V_d=None, X_d=None):
-        Hv = self.mp(bmg, V_d)
+        Hv = self.message_passing(bmg, V_d)
         H = self.agg(Hv, bmg.batch)
         return self.bn(H)
 
