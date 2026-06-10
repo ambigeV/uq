@@ -532,6 +532,32 @@ def _val_brier(model: UnifiedModel, loader: DataLoader, device: torch.device) ->
     return sq_errs / max(n, 1)
 
 
+def _val_loss(
+    model: UnifiedModel,
+    loader: DataLoader,
+    device: torch.device,
+    mc_train_samples: int,
+    epoch: int,
+) -> float:
+    """Average training-criterion loss over the validation loader (no grad)."""
+    model.eval()
+    total, n_batch = 0.0, 0
+    with torch.no_grad():
+        for batch in loader:
+            if len(batch) < 2:
+                continue
+            x_b, y_b = batch[0], batch[1].to(device)
+            x_b = x_b.to(device)
+            out = model(x_b)
+            if model.model_type == "evidential":
+                loss = evidential_clf_loss(out[1], y_b, epoch=epoch).mean()
+            else:
+                loss = mc_dropout_clf_loss(out, y_b, n_samples=mc_train_samples).mean()
+            total += loss.item()
+            n_batch += 1
+    return total / max(n_batch, 1)
+
+
 def train_model(
     model: UnifiedModel,
     train_loader: DataLoader,
@@ -542,11 +568,47 @@ def train_model(
     grad_clip: float = 5.0,
     mc_train_samples: int = 20,
     verbose: bool = True,
+    record_every: int = 10,
+    history_csv: Optional[str] = None,
+    backup_prefix: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
 ) -> UnifiedModel:
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     best_val, best_state, patience_counter = float("inf"), None, 0
     patience = max(10, epochs // 5)
+
+    # Periodic train/val loss log + checkpoint backups so a model can be
+    # picked after the run. Backups require `meta` (checkpoint format).
+    history: List[Dict[str, Any]] = []
+
+    def _flush_history() -> None:
+        if history_csv and history:
+            os.makedirs(os.path.dirname(os.path.abspath(history_csv)), exist_ok=True)
+            pd.DataFrame(history).to_csv(history_csv, index=False)
+
+    def _record(epoch_num: int, tr_loss: float) -> None:
+        v_loss = (
+            _val_loss(model, val_loader, device, mc_train_samples, epoch_num - 1)
+            if val_loader is not None else float("nan")
+        )
+        v_brier = (
+            _val_brier(model, val_loader, device)
+            if val_loader is not None else float("nan")
+        )
+        row = {
+            "epoch": epoch_num,
+            "train_loss": tr_loss,
+            "val_loss": v_loss,
+            "val_brier": v_brier,
+        }
+        ckpt_path = ""
+        if backup_prefix and meta is not None:
+            ckpt_path = f"{backup_prefix}_epoch{epoch_num}.pt"
+            save_checkpoint(model, ckpt_path, meta)
+        row["backup_checkpoint"] = ckpt_path
+        history.append(row)
+        _flush_history()
 
     for epoch in range(epochs):
         model.train()
@@ -575,6 +637,7 @@ def train_model(
             n_batch += 1
 
         avg_loss = total_loss / max(n_batch, 1)
+        stop_now = False
         if val_loader is not None:
             val_brier = _val_brier(model, val_loader, device)
             if verbose:
@@ -588,9 +651,18 @@ def train_model(
                 if patience_counter >= patience:
                     if verbose:
                         print(f"  Early stop at epoch {epoch + 1} (patience={patience})")
-                    break
+                    stop_now = True
         elif verbose:
             print(f"  Epoch {epoch + 1:3d}/{epochs} | train_loss={avg_loss:.4f}")
+
+        # Record train/val loss and back up the model every `record_every`
+        # epochs (and on the final / early-stop epoch).
+        is_last = (epoch + 1) == epochs or stop_now
+        if record_every > 0 and ((epoch + 1) % record_every == 0 or is_last):
+            _record(epoch + 1, avg_loss)
+
+        if stop_now:
+            break
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -790,6 +862,17 @@ def compute_metrics(
 # SECTION 9 — CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _derive_log_paths(out_ckpt: str, history_csv_arg: str) -> Tuple[str, str]:
+    """Return (backup_prefix, history_csv) for periodic logging/backups.
+
+    backup_prefix is the output checkpoint path without its .pt suffix;
+    per-epoch backups are saved as '<backup_prefix>_epoch<N>.pt'.
+    """
+    base = out_ckpt[:-3] if out_ckpt.endswith(".pt") else out_ckpt
+    history_csv = history_csv_arg or f"{base}_trainlog.csv"
+    return base, history_csv
+
+
 def _parse_args():
     p = argparse.ArgumentParser(
         description="Fine-tune / evaluate evidential or MC-dropout binary classifiers."
@@ -818,6 +901,14 @@ def _parse_args():
     p.add_argument("--grad_clip",   type=float, default=5.0)
     p.add_argument("--mc_train_samples", type=int, default=20)
     p.add_argument("--mc_infer_samples", type=int, default=100)
+
+    # Training-progress logging / checkpoint backups (finetune & train modes)
+    p.add_argument("--record_every", type=int, default=10,
+                   help="Log train/val loss and save a backup .pt every N epochs "
+                        "(0 disables). The final epoch is always recorded.")
+    p.add_argument("--history_csv", type=str, default="",
+                   help="Path for the train/val loss log CSV. "
+                        "Defaults to '<output_checkpoint>_trainlog.csv'.")
 
     # Model (only used when --mode train, i.e. training from scratch)
     p.add_argument("--model_type",   choices=["evidential", "mc_dropout"], default="evidential")
@@ -859,11 +950,16 @@ def main():
 
         train_loader = make_loader(X_tr, y_tr, enc, args.batch_size, shuffle=True)
 
+        out_ckpt = args.output_checkpoint or args.checkpoint.replace(".pt", "_finetuned.pt")
+        backup_prefix, history_csv = _derive_log_paths(out_ckpt, args.history_csv)
+
         print(f"\nFine-tuning {meta['model_type']} model for {args.epochs} epochs …")
         model = train_model(
             model, train_loader, val_loader, device,
             epochs=args.epochs, lr=args.lr, grad_clip=args.grad_clip,
             mc_train_samples=args.mc_train_samples,
+            record_every=args.record_every, history_csv=history_csv,
+            backup_prefix=backup_prefix, meta=meta,
         )
 
         # Optionally evaluate on val
@@ -876,8 +972,9 @@ def main():
             for k, v in metrics.items():
                 print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
 
-        out_ckpt = args.output_checkpoint or args.checkpoint.replace(".pt", "_finetuned.pt")
         save_checkpoint(model, out_ckpt, meta)
+        if history_csv:
+            print(f"Training log: {history_csv}")
 
     # ── TRAIN FROM SCRATCH ──────────────────────────────────────────────────
     elif args.mode == "train":
@@ -908,12 +1005,6 @@ def main():
             val_loader = make_loader(X_val, y_val, enc, args.batch_size, shuffle=False)
 
         train_loader = make_loader(X_tr, y_tr, enc, args.batch_size, shuffle=True)
-        print(f"Training from scratch for {args.epochs} epochs …")
-        model = train_model(
-            model, train_loader, val_loader, device,
-            epochs=args.epochs, lr=args.lr, grad_clip=args.grad_clip,
-            mc_train_samples=args.mc_train_samples,
-        )
 
         meta: Dict[str, Any] = {
             "model_type": args.model_type,
@@ -928,7 +1019,20 @@ def main():
             "label_column": lc,
         }
         out_ckpt = args.output_checkpoint or "trained_model.pt"
+        backup_prefix, history_csv = _derive_log_paths(out_ckpt, args.history_csv)
+
+        print(f"Training from scratch for {args.epochs} epochs …")
+        model = train_model(
+            model, train_loader, val_loader, device,
+            epochs=args.epochs, lr=args.lr, grad_clip=args.grad_clip,
+            mc_train_samples=args.mc_train_samples,
+            record_every=args.record_every, history_csv=history_csv,
+            backup_prefix=backup_prefix, meta=meta,
+        )
+
         save_checkpoint(model, out_ckpt, meta)
+        if history_csv:
+            print(f"Training log: {history_csv}")
 
     # ── EVAL ────────────────────────────────────────────────────────────────
     elif args.mode == "eval":

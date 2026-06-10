@@ -1289,3 +1289,381 @@ def _export_credal_ac_label_grid(
     plt.close(fig)
     if csv_rows:
         pd.DataFrame(csv_rows).to_csv(out_csv, index=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OOD Uncertainty Envelope (CSA-style, operates on epistemic uncertainty space)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _normalise_uncertainty(
+    u_val: np.ndarray,
+    u_test: np.ndarray,
+    normalisation: str,
+    percentile_q: float = 95.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Normalise per-model epistemic uncertainty vectors using val statistics only.
+
+    Parameters
+    ----------
+    u_val, u_test : (K, N) arrays — raw epistemic uncertainty per model per sample.
+    normalisation : "none" | "standardise" | "rank" | "percentile"
+    percentile_q  : used only when normalisation="percentile".
+
+    Returns
+    -------
+    U_val, U_test : (N, K) normalised arrays ready for geometric operations.
+    """
+    u_v = np.asarray(u_val, dtype=np.float64)   # (K, N_val)
+    u_t = np.asarray(u_test, dtype=np.float64)  # (K, N_test)
+
+    if normalisation == "none":
+        return u_v.T, u_t.T
+
+    if normalisation == "standardise":
+        mean = u_v.mean(axis=1, keepdims=True)                    # (K, 1)
+        std  = np.clip(u_v.std(axis=1, keepdims=True), 1e-12, None)
+        return ((u_v - mean) / std).T, ((u_t - mean) / std).T
+
+    if normalisation == "rank":
+        # Map each model's val uncertainties to [0,1] rank positions.
+        # Apply the same mapping to test via linear interpolation on sorted val.
+        K = u_v.shape[0]
+        U_val_out  = np.zeros_like(u_v.T)
+        U_test_out = np.zeros_like(u_t.T)
+        for k in range(K):
+            sorted_val = np.sort(u_v[k])
+            n = len(sorted_val)
+            ranks_val  = np.searchsorted(sorted_val, u_v[k], side="left") / max(n - 1, 1)
+            ranks_test = np.searchsorted(sorted_val, u_t[k], side="left") / max(n - 1, 1)
+            ranks_test = np.clip(ranks_test, 0.0, 1.0)
+            U_val_out[:, k]  = ranks_val
+            U_test_out[:, k] = ranks_test
+        return U_val_out, U_test_out
+
+    if normalisation == "percentile":
+        scale = np.clip(
+            np.percentile(u_v, float(percentile_q), axis=1, keepdims=True), 1e-12, None
+        )
+        return (u_v / scale).T, (u_t / scale).T
+
+    raise ValueError(f"Unknown normalisation '{normalisation}'. "
+                     "Choose from: none, standardise, rank, percentile.")
+
+
+def fit_ood_uncertainty_envelope(
+    u_val: np.ndarray,
+    u_test: np.ndarray,
+    alpha: float = 0.1,
+    M: int = 128,
+    split_ratio: float = 0.5,
+    seed: int = 0,
+    normalisation: str = "none",
+    percentile_q: float = 95.0,
+    envelope_source: str = "all",
+    ac_labels_val: Optional[np.ndarray] = None,
+    ac_labels_test: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    """Fit a CSA-style OOD envelope in K-dimensional epistemic uncertainty space.
+
+    No labels are required for fitting — purely geometric. ac_labels are passed
+    through for downstream annotation only.
+
+    Parameters
+    ----------
+    u_val, u_test    : (K, N) epistemic uncertainty per base model per sample.
+    alpha            : OOD significance level; envelope covers >= 1-alpha of val.
+    M                : number of random projection directions.
+    split_ratio      : fraction of val used for stage-1 envelope shape fitting.
+    seed             : RNG seed.
+    normalisation    : "none" | "standardise" | "rank" | "percentile".
+    percentile_q     : percentile used when normalisation="percentile".
+    envelope_source  : "all" — use all val samples;
+                       "non_ac_only" — use only val samples with ac_label="non-AC".
+    ac_labels_val    : (N_val,) string labels; required when envelope_source="non_ac_only".
+    ac_labels_test   : (N_test,) string labels; passed through for plotting only.
+
+    Returns
+    -------
+    dict with keys: ood_mask, T_scores, t_hat, directions, q_tilde,
+                    normalisation, envelope_source, ac_labels_test, alpha, K, M.
+    """
+    u_v = np.asarray(u_val,  dtype=np.float64)   # (K, N_val)
+    u_t = np.asarray(u_test, dtype=np.float64)   # (K, N_test)
+    K, N_val = u_v.shape
+
+    # ── Step 1: Optionally restrict val envelope to non-AC samples ────────────
+    if envelope_source == "non_ac_only":
+        if ac_labels_val is None:
+            raise ValueError(
+                "envelope_source='non_ac_only' requires ac_labels_val to be provided."
+            )
+        keep = np.asarray(ac_labels_val, dtype=str).reshape(-1) == "non-AC"
+        if keep.sum() < 4:
+            print(
+                f"[OOD envelope] Warning: only {keep.sum()} non-AC val samples found; "
+                "falling back to all val samples."
+            )
+            keep = np.ones(N_val, dtype=bool)
+        u_v = u_v[:, keep]
+        print(f"[OOD envelope] envelope_source=non_ac_only: using {keep.sum()}/{N_val} val samples.")
+
+    # ── Step 2: Normalise (fitted on restricted val, applied to full val+test) ─
+    U_val, U_test = _normalise_uncertainty(u_v, u_t, normalisation, percentile_q)
+    # U_val: (N_val_filtered, K), U_test: (N_test, K)
+
+    N_fit = U_val.shape[0]
+
+    # ── Step 3: Calibration split ─────────────────────────────────────────────
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(N_fit)
+    n1 = max(2, int(split_ratio * N_fit))
+    n2 = max(2, N_fit - n1)
+    I1, I2 = idx[:n1], idx[n1:n1 + n2]
+    S1, S2 = U_val[I1], U_val[I2]   # (n1, K), (n2, K)
+
+    # ── Step 4: Sample projection directions in positive orthant ──────────────
+    directions = _csa_sample_directions(K, M, seed=seed + 1)   # (M, K)
+
+    # ── Step 5: Stage 1 — learn envelope shape on I1 ─────────────────────────
+    P1 = S1 @ directions.T   # (n1, M)
+
+    def _cov1(beta: float) -> float:
+        q = np.quantile(P1, 1.0 - float(beta), axis=0)
+        return float(np.mean(np.all(P1 <= q[None, :], axis=1)))
+
+    beta_lo, beta_hi = 0.0, 1.0
+    for _ in range(60):
+        beta_mid = 0.5 * (beta_lo + beta_hi)
+        if _cov1(beta_mid) >= 1.0 - float(alpha):
+            beta_hi = beta_mid
+        else:
+            beta_lo = beta_mid
+    beta_star = float(beta_hi)
+    q_tilde = np.clip(np.quantile(P1, 1.0 - beta_star, axis=0), 1e-12, None)  # (M,)
+
+    # ── Step 6: Stage 2 — scalar conformal threshold on I2 ───────────────────
+    P2 = S2 @ directions.T                                      # (n2, M)
+    T2 = np.max(P2 / q_tilde[None, :], axis=1)                 # (n2,)
+    level = min(float(np.ceil((n2 + 1) * (1.0 - float(alpha))) / n2), 1.0)
+    t_hat = float(np.quantile(T2, level)) if n2 > 0 else float("inf")
+
+    print(
+        f"[OOD envelope] K={K} M={M} n1={n1} n2={n2} "
+        f"beta*={beta_star:.4f} t_hat={t_hat:.4f} alpha={alpha:.4f} "
+        f"normalisation={normalisation} envelope_source={envelope_source}"
+    )
+
+    # ── Step 7: Score test molecules ──────────────────────────────────────────
+    P_test = U_test @ directions.T                              # (N_test, M)
+    T_test = np.max(P_test / q_tilde[None, :], axis=1)         # (N_test,)
+    ood_mask = T_test > t_hat                                   # (N_test,) bool
+
+    return {
+        "ood_mask":        ood_mask,
+        "T_scores":        T_test,
+        "t_hat":           t_hat,
+        "T2":              T2,
+        "directions":      directions,
+        "q_tilde":         q_tilde,
+        "beta_star":       beta_star,
+        "normalisation":   normalisation,
+        "envelope_source": envelope_source,
+        "ac_labels_test":  ac_labels_test,
+        "alpha":           float(alpha),
+        "K":               int(K),
+        "M":               int(M),
+        "n1":              int(n1),
+        "n2":              int(n2),
+    }
+
+
+def _export_ood_uncertainty_scatter(
+    u_test_epi_runs: List[np.ndarray],
+    ood_mask: np.ndarray,
+    T_scores: np.ndarray,
+    t_hat: float,
+    methods: List[str],
+    category_specs: List[Tuple[str, str, np.ndarray]],
+    normalisation: str,
+    envelope_source: str,
+    out_png: Path,
+    out_csv: Path,
+) -> None:
+    """Scatter plot of test molecules in K-dimensional epistemic uncertainty space.
+
+    Colour encodes ac_label category; filled circles = in-distribution,
+    hollow X markers = OOD.  Supports K=2 (2D) and K=3 (3D).
+    Also writes a CSV with per-molecule T_score, ood_flag, and ac_label.
+    """
+    if not u_test_epi_runs:
+        return
+
+    K = u_test_epi_runs[0].shape[0]
+    if K not in (2, 3):
+        print(f"[OOD scatter] K={K} — supports only K=2 or K=3. Skipping.")
+        return
+
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    u_avg = np.mean(np.stack(u_test_epi_runs, axis=0), axis=0)  # (K, N)
+    N = u_avg.shape[1]
+    use_3d = K == 3
+    axis_labels = [_display_model_name(f"base::{m}") for m in methods]
+
+    cat_colors = ["#2ca02c", "#ff7f0e", "#d62728"]  # AC, non-AC (no MMP), non-AC
+    in_dist = ~ood_mask
+
+    if use_3d:
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+        fig = plt.figure(figsize=(9, 7))
+        ax = fig.add_subplot(1, 1, 1, projection="3d")
+    else:
+        fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+
+    if category_specs:
+        for (cat_name, _slug, cat_mask), color in zip(category_specs, cat_colors):
+            for flag, marker, pt_alpha, zorder, suffix in [
+                (True,  "o", 0.80, 3, "in-dist"),
+                (False, "X", 0.35, 2, "OOD"),
+            ]:
+                pts = np.asarray(cat_mask, dtype=bool) & (in_dist == flag)
+                if not pts.any():
+                    continue
+                label = f"{cat_name} ({suffix})"
+                kw = dict(c=color, marker=marker, s=28 if flag else 35,
+                          alpha=pt_alpha, zorder=zorder, label=label,
+                          edgecolors="none" if flag else color,
+                          linewidths=0.0 if flag else 0.7)
+                if use_3d:
+                    ax.scatter(u_avg[0, pts], u_avg[1, pts], u_avg[2, pts], **kw)
+                else:
+                    ax.scatter(u_avg[0, pts], u_avg[1, pts], **kw)
+    else:
+        # No ac_labels: colour by OOD status only
+        for flag, color, marker, label in [
+            (True,  "#2ca02c", "o", "in-distribution"),
+            (False, "#d62728", "X", "OOD"),
+        ]:
+            pts = in_dist == flag
+            if not pts.any():
+                continue
+            kw = dict(c=color, marker=marker, s=28, alpha=0.75, label=label)
+            if use_3d:
+                ax.scatter(u_avg[0, pts], u_avg[1, pts], u_avg[2, pts], **kw)
+            else:
+                ax.scatter(u_avg[0, pts], u_avg[1, pts], **kw)
+
+    if use_3d:
+        ax.set_xlabel(axis_labels[0], fontsize=9, labelpad=4)
+        ax.set_ylabel(axis_labels[1], fontsize=9, labelpad=4)
+        ax.set_zlabel(axis_labels[2], fontsize=9, labelpad=4)
+    else:
+        ax.set_xlabel(axis_labels[0], fontsize=10)
+        ax.set_ylabel(axis_labels[1], fontsize=10)
+
+    ax.grid(alpha=0.2)
+    ax.legend(fontsize=8, loc="best", frameon=False)
+    fig.suptitle(
+        f"OOD uncertainty envelope — epistemic space\n"
+        f"normalisation={normalisation}  envelope_source={envelope_source}  "
+        f"t_hat={t_hat:.3f}",
+        fontsize=10,
+    )
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OOD scatter] saved: {out_png}")
+
+    # CSV: one row per molecule
+    csv_rows: List[Dict[str, Any]] = []
+    for i in range(N):
+        row: Dict[str, Any] = {
+            "molecule_idx": i,
+            "T_score":      float(T_scores[i]),
+            "ood":          bool(ood_mask[i]),
+        }
+        if category_specs:
+            for cat_name, _slug, cat_mask in category_specs:
+                if np.asarray(cat_mask, dtype=bool)[i]:
+                    row["ac_label"] = cat_name
+                    break
+            else:
+                row["ac_label"] = "unknown"
+        csv_rows.append(row)
+    pd.DataFrame(csv_rows).to_csv(out_csv, index=False)
+    print(f"[OOD scatter] saved CSV: {out_csv}")
+
+
+def _export_ood_ac_label_grid(
+    ood_mask: np.ndarray,
+    category_specs: List[Tuple[str, str, np.ndarray]],
+    normalisation: str,
+    envelope_source: str,
+    out_png: Path,
+    out_csv: Path,
+    norm: str = "column",
+) -> None:
+    """Heatmap: rows = [In-distribution, OOD], cols = ac_label categories.
+
+    Reuses the same imshow style as _export_credal_ac_label_grid.
+    norm="column": within each ac_label, what fraction is OOD vs in-dist.
+    norm="row":    within OOD/in-dist, what fraction belongs to each ac_label.
+    """
+    if not category_specs:
+        return
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    n_cats = len(category_specs)
+    cat_names = [name for name, _, _ in category_specs]
+    cat_masks = [np.asarray(mask, dtype=bool) for _, _, mask in category_specs]
+    row_labels = ["In-dist", "OOD"]
+    font_scale = 1.5
+    in_dist = ~np.asarray(ood_mask, dtype=bool)
+
+    table = np.zeros((2, n_cats), dtype=float)
+    for c_idx, cat_mask in enumerate(cat_masks):
+        table[0, c_idx] = float(np.sum(in_dist & cat_mask))
+        table[1, c_idx] = float(np.sum(ood_mask  & cat_mask))
+
+    if norm == "row":
+        sums = np.clip(table.sum(axis=1, keepdims=True), 1e-12, None)
+    else:
+        sums = np.clip(table.sum(axis=0, keepdims=True), 1e-12, None)
+    table_pct = 100.0 * table / sums
+
+    fig, ax = plt.subplots(1, 1, figsize=(max(7, 2.8 * n_cats), 4.5))
+    ax.imshow(table_pct, cmap="Blues", vmin=0.0, vmax=100.0, alpha=0.88)
+    csv_rows: List[Dict[str, Any]] = []
+    for r in range(2):
+        for c in range(n_cats):
+            val = float(table_pct[r, c])
+            count = int(round(table[r, c]))
+            text_color = "white" if val >= 55.0 else "black"
+            ax.text(c, r, f"{val:.1f}%\n(n={count})",
+                    ha="center", va="center",
+                    fontsize=9 * font_scale, color=text_color)
+            csv_rows.append({
+                "row": row_labels[r],
+                "ac_label_category": cat_names[c],
+                "count": count,
+                f"{'row' if norm == 'row' else 'column'}_normalized_pct": float(val),
+            })
+    ax.set_xticks(np.arange(n_cats))
+    ax.set_xticklabels(cat_names, rotation=25, ha="right", fontsize=9 * font_scale)
+    ax.set_yticks([0, 1])
+    ax.set_yticklabels(row_labels, fontsize=9 * font_scale)
+    norm_desc = ("row-normalised" if norm == "row" else "column-normalised")
+    fig.suptitle(
+        f"OOD envelope vs ac_label — {norm_desc}\n"
+        f"normalisation={normalisation}  envelope_source={envelope_source}",
+        fontsize=10 * font_scale,
+        y=1.02,
+    )
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    if csv_rows:
+        pd.DataFrame(csv_rows).to_csv(out_csv, index=False)
+    print(f"[OOD grid] saved: {out_png}")

@@ -28,6 +28,9 @@ from cp_utils import (
     _export_conformal_trend_confusion_grid,
     _export_csa_decision_space_scatter,
     _export_credal_ac_label_grid,
+    fit_ood_uncertainty_envelope,
+    _export_ood_uncertainty_scatter,
+    _export_ood_ac_label_grid,
 )
 
 
@@ -1867,6 +1870,31 @@ def _evaluate_accepted_subset(
     metrics["rejection_rate"] = float(1.0 - metrics["acceptance_rate"])
     return metrics
 
+def _write_test_mol_csv(
+    out_path: Path,
+    pos_prob: np.ndarray,
+    epi: np.ndarray,
+    iso_cal: np.ndarray,
+    thr: float,
+    cp_accepted: np.ndarray,
+    cp_pred_label: np.ndarray,
+    smiles: Optional[np.ndarray] = None,
+) -> None:
+    rows: Dict[str, Any] = {}
+    if smiles is not None and len(smiles) == len(pos_prob):
+        rows["SMILES"] = smiles
+    rows["prob_class1_positive"] = np.asarray(pos_prob, dtype=np.float64)
+    rows["prob_class2_negative"] = 1.0 - np.asarray(pos_prob, dtype=np.float64)
+    rows["prediction"] = (np.asarray(pos_prob, dtype=np.float64) >= float(thr)).astype(np.int8)
+    rows["epistemic_uncertainty"] = np.asarray(epi, dtype=np.float64)
+    rows["calibrated_uncertainty"] = np.asarray(iso_cal, dtype=np.float64)
+    rows["cp_accepted"] = np.asarray(cp_accepted, dtype=np.int8)
+    rows["cp_pred_label"] = np.asarray(cp_pred_label, dtype=np.int8)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+    print(f"[Export] wrote {out_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Stack BIi method predictions using validation-set learned weights."
@@ -2070,6 +2098,64 @@ def main() -> None:
         default="SMILES",
         help="If present in label pkls, copied into per-molecule export CSVs (e.g. SMILES).",
     )
+    parser.add_argument(
+        "--inference_smiles_csv",
+        type=str,
+        default="",
+        help="Path to CSV with a SMILES column in the same row order as test predictions. Used to populate the SMILES column in per-molecule test CSVs.",
+    )
+    parser.add_argument(
+        "--no_test_labels",
+        dest="use_test_labels",
+        action="store_false",
+        help="Disable loading test-set ground-truth labels. Skips all test evaluation metrics; CP prediction on test still runs using val-calibrated scores.",
+    )
+    parser.add_argument(
+        "--no_ac_labels",
+        dest="use_ac_labels",
+        action="store_false",
+        help="Disable loading ac_label column and all activity-cliff category analysis.",
+    )
+    parser.add_argument(
+        "--no_per_molecule_csv",
+        dest="export_per_molecule_csv",
+        action="store_false",
+        help="Disable writing per-molecule test CSVs for base models and iso-stack variants.",
+    )
+    # OOD uncertainty envelope
+    parser.add_argument(
+        "--ood_envelope",
+        dest="ood_envelope",
+        action="store_true",
+        help="Fit a CSA-style OOD envelope in epistemic uncertainty space and export scatter + grid.",
+    )
+    parser.add_argument(
+        "--ood_normalisation",
+        type=str,
+        default="none",
+        choices=["none", "standardise", "rank", "percentile"],
+        help="[OOD] Per-model uncertainty normalisation fitted on val before envelope fitting.",
+    )
+    parser.add_argument(
+        "--ood_percentile_q",
+        type=float,
+        default=95.0,
+        help="[OOD] Percentile used when --ood_normalisation=percentile.",
+    )
+    parser.add_argument(
+        "--ood_envelope_source",
+        type=str,
+        default="all",
+        choices=["all", "non_ac_only"],
+        help="[OOD] Val samples used to fit the envelope: 'all' or 'non_ac_only'.",
+    )
+    parser.add_argument(
+        "--ood_alpha",
+        type=float,
+        default=None,
+        help="[OOD] Significance level for OOD envelope. Defaults to --conformal_alpha if not set.",
+    )
+    parser.set_defaults(use_test_labels=True, use_ac_labels=True, export_per_molecule_csv=True, ood_envelope=False)
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent
@@ -2115,15 +2201,28 @@ def main() -> None:
         raise ValueError("No run_ids provided.")
 
     y_val = _load_labels(label_dir=label_dir, split_name=args.val_split, label_column=args.label_column)
-    y_test = _load_labels(label_dir=label_dir, split_name=args.test_split, label_column=args.label_column)
-    ac_labels_test = _load_optional_text_column(
-        label_dir=label_dir, split_name=args.test_split, column_name="ac_label"
-    )
+    if args.use_test_labels:
+        y_test: Optional[np.ndarray] = _load_labels(
+            label_dir=label_dir, split_name=args.test_split, label_column=args.label_column
+        )
+        _n_test = len(y_test)
+    else:
+        y_test = None
+        _peek_path = pred_root / test_pred_split / f"{methods[0]}_run_{run_ids[0]}.csv"
+        _n_test = len(pd.read_csv(_peek_path))
+
+    if args.use_ac_labels:
+        ac_labels_test: Optional[np.ndarray] = _load_optional_text_column(
+            label_dir=label_dir, split_name=args.test_split, column_name="ac_label"
+        )
+    else:
+        ac_labels_test = None
+
     cp_w_val = _get_weighted_cp_sample_weights(
         split_name=args.val_split, n_samples=len(y_val)
     )
     cp_w_test = _get_weighted_cp_sample_weights(
-        split_name=args.test_split, n_samples=len(y_test)
+        split_name=args.test_split, n_samples=_n_test
     )
     if args.weighted_cp_source == "online_rf":
         cp_w_val, cp_w_test = _compute_weighted_cp_weights_online_rf(
@@ -2182,6 +2281,20 @@ def main() -> None:
     smiles_val_export: Optional[np.ndarray] = None
     smiles_train_export: Optional[np.ndarray] = None
     id_col = args.per_molecule_id_column.strip() or "SMILES"
+    test_smiles: Optional[np.ndarray] = None
+    if args.inference_smiles_csv.strip():
+        _smiles_path = Path(args.inference_smiles_csv.strip())
+        if not _smiles_path.is_absolute():
+            _smiles_path = repo_root / _smiles_path
+        if _smiles_path.exists():
+            _smiles_df = pd.read_csv(_smiles_path)
+            if id_col in _smiles_df.columns:
+                test_smiles = _smiles_df[id_col].astype(str).to_numpy()
+                print(f"[SMILES] loaded {len(test_smiles)} test SMILES from {_smiles_path}")
+            else:
+                print(f"[SMILES] column '{id_col}' not found in {_smiles_path}; SMILES omitted from test export.")
+        else:
+            print(f"[SMILES] file not found: {_smiles_path}; SMILES omitted from test export.")
     if export_base_per_molecule_dir is not None:
         smiles_val_export = _load_optional_text_column(
             label_dir=label_dir, split_name=args.val_split, column_name=id_col
@@ -2240,7 +2353,7 @@ def main() -> None:
     for alpha in conformal_trend_alphas:
         conformal_trend_confusion_store[f"alpha_{alpha:.4f}"] = {}
     category_specs: List[Tuple[str, str, np.ndarray]] = []
-    if ac_labels_test is not None and len(ac_labels_test) == len(y_test):
+    if ac_labels_test is not None and y_test is not None and len(ac_labels_test) == len(y_test):
         target_categories = [
             ("AC", "ac"),
             ("non-AC (no MMP match)", "non_ac_no_mmp_match"),
@@ -2328,8 +2441,11 @@ def main() -> None:
         if tags_val != tags_test:
             raise RuntimeError(f"Method ordering mismatch for run {run_id}.")
 
+        _test_mol_buf: Dict[int, Dict[str, Any]] = {}
+
         _ensure_same_length(y_val, p_val, f"val run {run_id}")
-        _ensure_same_length(y_test, p_test, f"test run {run_id}")
+        if y_test is not None:
+            _ensure_same_length(y_test, p_test, f"test run {run_id}")
 
         # Accumulate for CSA decision-space scatter plots.
         csa_scatter_p_test_runs.append(p_test.copy())
@@ -2429,39 +2545,40 @@ def main() -> None:
                 prob=p_val[idx],
                 labels=y_val,
             )
-            _accumulate_auc_cutoff_inputs(
-                auc_cutoff_store,
-                scenario="all",
-                uncertainty_type="epistemic",
-                model_family="base",
-                model_name=method,
-                split="test",
-                uncertainty=u_test_epi[idx],
-                prob=p_test[idx],
-                labels=y_test,
-            )
-            _accumulate_auc_cutoff_inputs(
-                auc_cutoff_store,
-                scenario="all",
-                uncertainty_type="aleatoric",
-                model_family="base",
-                model_name=method,
-                split="test",
-                uncertainty=u_test_ale[idx],
-                prob=p_test[idx],
-                labels=y_test,
-            )
-            _accumulate_auc_cutoff_inputs(
-                auc_cutoff_store,
-                scenario="all",
-                uncertainty_type="total",
-                model_family="base",
-                model_name=method,
-                split="test",
-                uncertainty=u_test[idx],
-                prob=p_test[idx],
-                labels=y_test,
-            )
+            if y_test is not None:
+                _accumulate_auc_cutoff_inputs(
+                    auc_cutoff_store,
+                    scenario="all",
+                    uncertainty_type="epistemic",
+                    model_family="base",
+                    model_name=method,
+                    split="test",
+                    uncertainty=u_test_epi[idx],
+                    prob=p_test[idx],
+                    labels=y_test,
+                )
+                _accumulate_auc_cutoff_inputs(
+                    auc_cutoff_store,
+                    scenario="all",
+                    uncertainty_type="aleatoric",
+                    model_family="base",
+                    model_name=method,
+                    split="test",
+                    uncertainty=u_test_ale[idx],
+                    prob=p_test[idx],
+                    labels=y_test,
+                )
+                _accumulate_auc_cutoff_inputs(
+                    auc_cutoff_store,
+                    scenario="all",
+                    uncertainty_type="total",
+                    model_family="base",
+                    model_name=method,
+                    split="test",
+                    uncertainty=u_test[idx],
+                    prob=p_test[idx],
+                    labels=y_test,
+                )
             _accumulate_uncertainty_values(
                 uncertainty_store,
                 scenario="all",
@@ -2526,41 +2643,12 @@ def main() -> None:
                 n_bins=args.ece_bins,
                 threshold=thr,
             )
-            test_m = _evaluate_like_main_active(
-                y_true=y_test,
-                prob=p_test[idx],
-                uncertainty=u_test[idx],
-                n_bins=args.ece_bins,
-                threshold=thr,
-            )
             val_m["Val_Precision_At_Selected_Thr"] = float(val_prec_at_thr)
             val_m["Val_Recall_At_Selected_Thr"] = float(val_rec_at_thr)
-            test_m["Val_Precision_At_Selected_Thr"] = float(val_prec_at_thr)
-            test_m["Val_Recall_At_Selected_Thr"] = float(val_rec_at_thr)
             print(f"- {method} | val  | {_format_metric_line(val_m)}")
-            print(f"- {method} | test | {_format_metric_line(test_m)}")
             base_key = f"base::{method}"
-            aggregate_metrics.setdefault(base_key, []).append(test_m)
             radar_metrics_store["all"]["val"].setdefault(base_key, []).append(val_m)
-            radar_metrics_store["all"]["test"].setdefault(base_key, []).append(test_m)
             confusion_store["all"]["val"].setdefault(base_key, []).append(_cm_counts_from_metrics(val_m))
-            confusion_store["all"]["test"].setdefault(base_key, []).append(_cm_counts_from_metrics(test_m))
-            conformal_trend_confusion_store["all_test"].setdefault(base_key, []).append(
-                _cm_counts_from_metrics(test_m)
-            )
-            _append_category_confusion(
-                scenario="all",
-                model_key=base_key,
-                val_cm=_cm_counts_from_metrics(val_m),
-                test_prob=p_test[idx],
-                threshold=thr,
-            )
-            _append_category_trend_confusion(
-                row_key="all_test",
-                model_key=base_key,
-                test_prob=p_test[idx],
-                threshold=thr,
-            )
             _append_metric_row(
                 report_rows,
                 row_type="per_run",
@@ -2570,15 +2658,45 @@ def main() -> None:
                 model_name=method,
                 metrics=val_m,
             )
-            _append_metric_row(
-                report_rows,
-                row_type="per_run",
-                run_id=str(run_id),
-                split="test",
-                model_family="base",
-                model_name=method,
-                metrics=test_m,
-            )
+            if y_test is not None:
+                test_m = _evaluate_like_main_active(
+                    y_true=y_test,
+                    prob=p_test[idx],
+                    uncertainty=u_test[idx],
+                    n_bins=args.ece_bins,
+                    threshold=thr,
+                )
+                test_m["Val_Precision_At_Selected_Thr"] = float(val_prec_at_thr)
+                test_m["Val_Recall_At_Selected_Thr"] = float(val_rec_at_thr)
+                print(f"- {method} | test | {_format_metric_line(test_m)}")
+                aggregate_metrics.setdefault(base_key, []).append(test_m)
+                radar_metrics_store["all"]["test"].setdefault(base_key, []).append(test_m)
+                confusion_store["all"]["test"].setdefault(base_key, []).append(_cm_counts_from_metrics(test_m))
+                conformal_trend_confusion_store["all_test"].setdefault(base_key, []).append(
+                    _cm_counts_from_metrics(test_m)
+                )
+                _append_category_confusion(
+                    scenario="all",
+                    model_key=base_key,
+                    val_cm=_cm_counts_from_metrics(val_m),
+                    test_prob=p_test[idx],
+                    threshold=thr,
+                )
+                _append_category_trend_confusion(
+                    row_key="all_test",
+                    model_key=base_key,
+                    test_prob=p_test[idx],
+                    threshold=thr,
+                )
+                _append_metric_row(
+                    report_rows,
+                    row_type="per_run",
+                    run_id=str(run_id),
+                    split="test",
+                    model_family="base",
+                    model_name=method,
+                    metrics=test_m,
+                )
 
             scores_pos, scores_neg, scores_pos_w, scores_neg_w = _build_label_conditional_conformal_scores(
                 y_val=y_val, prob_pos_val=p_val[idx], sample_weights_val=cp_w_val
@@ -2620,6 +2738,13 @@ def main() -> None:
                 sorted_weights_neg=scores_neg_w,
                 test_sample_weights=cp_w_test,
             )
+            _test_mol_buf[idx] = {
+                "pos_prob": np.asarray(p_test[idx], dtype=np.float64).copy(),
+                "epi": np.asarray(u_test_epi[idx], dtype=np.float64).copy(),
+                "thr": float(thr),
+                "cp_accepted": np.asarray(accepted_mask, dtype=np.int8).copy(),
+                "cp_pred_label": np.asarray(pred_label_test, dtype=np.int8).copy(),
+            }
             if val_molecule_export is not None:
                 pfx = _sanitize_method_csv_prefix(method)
                 val_molecule_export[f"{pfx}_{PROB_COL}"] = np.asarray(p_val[idx], dtype=np.float64)
@@ -2650,25 +2775,26 @@ def main() -> None:
                     sorted_weights_neg=scores_neg_w,
                     test_sample_weights=cp_w_test,
                 )
-                conf_test_alpha = _evaluate_accepted_subset(
-                    y_true=y_test,
-                    prob=p_test[idx],
-                    uncertainty=u_test[idx],
-                    accepted_mask=accepted_mask_alpha,
-                    n_bins=args.ece_bins,
-                    threshold=thr,
-                )
-                if int(conf_test_alpha.get("accepted_count", 0.0)) > 0:
-                    conformal_trend_confusion_store[f"alpha_{alpha:.4f}"].setdefault(base_key, []).append(
-                        _cm_counts_from_metrics(conf_test_alpha)
+                if y_test is not None:
+                    conf_test_alpha = _evaluate_accepted_subset(
+                        y_true=y_test,
+                        prob=p_test[idx],
+                        uncertainty=u_test[idx],
+                        accepted_mask=accepted_mask_alpha,
+                        n_bins=args.ece_bins,
+                        threshold=thr,
                     )
-                _append_category_trend_confusion(
-                    row_key=f"alpha_{alpha:.4f}",
-                    model_key=base_key,
-                    test_prob=p_test[idx],
-                    threshold=thr,
-                    accepted_mask=accepted_mask_alpha,
-                )
+                    if int(conf_test_alpha.get("accepted_count", 0.0)) > 0:
+                        conformal_trend_confusion_store[f"alpha_{alpha:.4f}"].setdefault(base_key, []).append(
+                            _cm_counts_from_metrics(conf_test_alpha)
+                        )
+                    _append_category_trend_confusion(
+                        row_key=f"alpha_{alpha:.4f}",
+                        model_key=base_key,
+                        test_prob=p_test[idx],
+                        threshold=thr,
+                        accepted_mask=accepted_mask_alpha,
+                    )
             _accumulate_conformal_hist_values(
                 conformal_hist_store,
                 split="val",
@@ -2677,14 +2803,15 @@ def main() -> None:
                 accepted_mask=accepted_mask_val,
                 pred_label=pred_label_val,
             )
-            _accumulate_conformal_hist_values(
-                conformal_hist_store,
-                split="test",
-                y_true=y_test,
-                prob=p_test[idx],
-                accepted_mask=accepted_mask,
-                pred_label=pred_label_test,
-            )
+            if y_test is not None:
+                _accumulate_conformal_hist_values(
+                    conformal_hist_store,
+                    split="test",
+                    y_true=y_test,
+                    prob=p_test[idx],
+                    accepted_mask=accepted_mask,
+                    pred_label=pred_label_test,
+                )
             _accumulate_uncertainty_values(
                 uncertainty_store,
                 scenario="conformal",
@@ -2754,17 +2881,18 @@ def main() -> None:
                 split="test",
                 values=u_test_epi[idx][accepted_mask],
             )
-            _accumulate_auc_cutoff_inputs(
-                auc_cutoff_store,
-                scenario="conformal",
-                uncertainty_type="epistemic",
-                model_family="base",
-                model_name=method,
-                split="test",
-                uncertainty=u_test_epi[idx][accepted_mask],
-                prob=p_test[idx][accepted_mask],
-                labels=y_test[accepted_mask],
-            )
+            if y_test is not None:
+                _accumulate_auc_cutoff_inputs(
+                    auc_cutoff_store,
+                    scenario="conformal",
+                    uncertainty_type="epistemic",
+                    model_family="base",
+                    model_name=method,
+                    split="test",
+                    uncertainty=u_test_epi[idx][accepted_mask],
+                    prob=p_test[idx][accepted_mask],
+                    labels=y_test[accepted_mask],
+                )
             _accumulate_uncertainty_values(
                 uncertainty_store,
                 scenario="conformal",
@@ -2774,17 +2902,18 @@ def main() -> None:
                 split="test",
                 values=u_test_ale[idx][accepted_mask],
             )
-            _accumulate_auc_cutoff_inputs(
-                auc_cutoff_store,
-                scenario="conformal",
-                uncertainty_type="aleatoric",
-                model_family="base",
-                model_name=method,
-                split="test",
-                uncertainty=u_test_ale[idx][accepted_mask],
-                prob=p_test[idx][accepted_mask],
-                labels=y_test[accepted_mask],
-            )
+            if y_test is not None:
+                _accumulate_auc_cutoff_inputs(
+                    auc_cutoff_store,
+                    scenario="conformal",
+                    uncertainty_type="aleatoric",
+                    model_family="base",
+                    model_name=method,
+                    split="test",
+                    uncertainty=u_test_ale[idx][accepted_mask],
+                    prob=p_test[idx][accepted_mask],
+                    labels=y_test[accepted_mask],
+                )
             _accumulate_uncertainty_values(
                 uncertainty_store,
                 scenario="conformal",
@@ -2794,25 +2923,18 @@ def main() -> None:
                 split="test",
                 values=u_test[idx][accepted_mask],
             )
-            _accumulate_auc_cutoff_inputs(
-                auc_cutoff_store,
-                scenario="conformal",
-                uncertainty_type="total",
-                model_family="base",
-                model_name=method,
-                split="test",
-                uncertainty=u_test[idx][accepted_mask],
-                prob=p_test[idx][accepted_mask],
-                labels=y_test[accepted_mask],
-            )
-            conf_test_m = _evaluate_accepted_subset(
-                y_true=y_test,
-                prob=p_test[idx],
-                uncertainty=u_test[idx],
-                accepted_mask=accepted_mask,
-                n_bins=args.ece_bins,
-                threshold=thr,
-            )
+            if y_test is not None:
+                _accumulate_auc_cutoff_inputs(
+                    auc_cutoff_store,
+                    scenario="conformal",
+                    uncertainty_type="total",
+                    model_family="base",
+                    model_name=method,
+                    split="test",
+                    uncertainty=u_test[idx][accepted_mask],
+                    prob=p_test[idx][accepted_mask],
+                    labels=y_test[accepted_mask],
+                )
             conf_val_m = _evaluate_accepted_subset(
                 y_true=y_val,
                 prob=p_val[idx],
@@ -2823,32 +2945,11 @@ def main() -> None:
             )
             conf_val_m["Val_Precision_At_Selected_Thr"] = float(val_prec_at_thr)
             conf_val_m["Val_Recall_At_Selected_Thr"] = float(val_rec_at_thr)
-            conf_test_m["Val_Precision_At_Selected_Thr"] = float(val_prec_at_thr)
-            conf_test_m["Val_Recall_At_Selected_Thr"] = float(val_rec_at_thr)
-            conformal_aggregate.setdefault(base_key, []).append(conf_test_m)
             radar_metrics_store["conformal"]["val"].setdefault(base_key, []).append(conf_val_m)
-            radar_metrics_store["conformal"]["test"].setdefault(base_key, []).append(conf_test_m)
             if int(conf_val_m.get("accepted_count", 0.0)) > 0:
                 confusion_store["conformal"]["val"].setdefault(base_key, []).append(
                     _cm_counts_from_metrics(conf_val_m)
                 )
-            if int(conf_test_m.get("accepted_count", 0.0)) > 0:
-                confusion_store["conformal"]["test"].setdefault(base_key, []).append(
-                    _cm_counts_from_metrics(conf_test_m)
-                )
-            _append_category_confusion(
-                scenario="conformal",
-                model_key=base_key,
-                val_cm=_cm_counts_from_probs(
-                    y_true=y_val,
-                    probs=p_val[idx],
-                    threshold=thr,
-                    mask=accepted_mask_val,
-                ),
-                test_prob=p_test[idx],
-                threshold=thr,
-                accepted_mask=accepted_mask,
-            )
             _append_metric_row(
                 conformal_rows,
                 row_type="conformal_per_run",
@@ -2859,16 +2960,46 @@ def main() -> None:
                 metrics=conf_val_m,
                 weights=f"alpha={args.conformal_alpha}",
             )
-            _append_metric_row(
-                conformal_rows,
-                row_type="conformal_per_run",
-                run_id=str(run_id),
-                split="test_conformal_accepted",
-                model_family="base",
-                model_name=method,
-                metrics=conf_test_m,
-                weights=f"alpha={args.conformal_alpha}",
-            )
+            if y_test is not None:
+                conf_test_m = _evaluate_accepted_subset(
+                    y_true=y_test,
+                    prob=p_test[idx],
+                    uncertainty=u_test[idx],
+                    accepted_mask=accepted_mask,
+                    n_bins=args.ece_bins,
+                    threshold=thr,
+                )
+                conf_test_m["Val_Precision_At_Selected_Thr"] = float(val_prec_at_thr)
+                conf_test_m["Val_Recall_At_Selected_Thr"] = float(val_rec_at_thr)
+                conformal_aggregate.setdefault(base_key, []).append(conf_test_m)
+                radar_metrics_store["conformal"]["test"].setdefault(base_key, []).append(conf_test_m)
+                if int(conf_test_m.get("accepted_count", 0.0)) > 0:
+                    confusion_store["conformal"]["test"].setdefault(base_key, []).append(
+                        _cm_counts_from_metrics(conf_test_m)
+                    )
+                _append_category_confusion(
+                    scenario="conformal",
+                    model_key=base_key,
+                    val_cm=_cm_counts_from_probs(
+                        y_true=y_val,
+                        probs=p_val[idx],
+                        threshold=thr,
+                        mask=accepted_mask_val,
+                    ),
+                    test_prob=p_test[idx],
+                    threshold=thr,
+                    accepted_mask=accepted_mask,
+                )
+                _append_metric_row(
+                    conformal_rows,
+                    row_type="conformal_per_run",
+                    run_id=str(run_id),
+                    split="test_conformal_accepted",
+                    model_family="base",
+                    model_name=method,
+                    metrics=conf_test_m,
+                    weights=f"alpha={args.conformal_alpha}",
+                )
 
         if val_molecule_export is not None and export_base_per_molecule_dir is not None:
             out_v = export_base_per_molecule_dir / f"base_per_molecule_{args.val_split}_run_{run_id}.csv"
@@ -2915,6 +3046,21 @@ def main() -> None:
             )
             inverse_isotonic_resultant_weight_test_store[method].append(
                 np.asarray(iso_sample_w_test[idx], dtype=np.float64).reshape(-1)
+            )
+        # Write per-model test per-molecule CSVs
+        for idx, method in enumerate(methods):
+            if idx not in _test_mol_buf or not args.export_per_molecule_csv:
+                continue
+            _pfx = _sanitize_method_csv_prefix(method)
+            _write_test_mol_csv(
+                out_path=summary_csv.parent / f"per_molecule_test_{_pfx}_run_{run_id}.csv",
+                pos_prob=_test_mol_buf[idx]["pos_prob"],
+                epi=_test_mol_buf[idx]["epi"],
+                iso_cal=np.asarray(iso_calibrated_test[idx], dtype=np.float64),
+                thr=_test_mol_buf[idx]["thr"],
+                cp_accepted=_test_mol_buf[idx]["cp_accepted"],
+                cp_pred_label=_test_mol_buf[idx]["cp_pred_label"],
+                smiles=test_smiles,
             )
         base_accept_mask_val = np.zeros_like(p_val, dtype=bool)
         base_accept_mask_test = np.zeros_like(p_test, dtype=bool)
@@ -3070,17 +3216,18 @@ def main() -> None:
                 split="test",
                 values=test_unc_epi,
             )
-            _accumulate_auc_cutoff_inputs(
-                auc_cutoff_store,
-                scenario="all",
-                uncertainty_type="epistemic",
-                model_family="stack",
-                model_name=stack_name,
-                split="test",
-                uncertainty=test_unc_epi,
-                prob=test_prob,
-                labels=y_test,
-            )
+            if y_test is not None:
+                _accumulate_auc_cutoff_inputs(
+                    auc_cutoff_store,
+                    scenario="all",
+                    uncertainty_type="epistemic",
+                    model_family="stack",
+                    model_name=stack_name,
+                    split="test",
+                    uncertainty=test_unc_epi,
+                    prob=test_prob,
+                    labels=y_test,
+                )
             _accumulate_uncertainty_values(
                 uncertainty_store,
                 scenario="all",
@@ -3090,17 +3237,18 @@ def main() -> None:
                 split="test",
                 values=test_unc_ale,
             )
-            _accumulate_auc_cutoff_inputs(
-                auc_cutoff_store,
-                scenario="all",
-                uncertainty_type="aleatoric",
-                model_family="stack",
-                model_name=stack_name,
-                split="test",
-                uncertainty=test_unc_ale,
-                prob=test_prob,
-                labels=y_test,
-            )
+            if y_test is not None:
+                _accumulate_auc_cutoff_inputs(
+                    auc_cutoff_store,
+                    scenario="all",
+                    uncertainty_type="aleatoric",
+                    model_family="stack",
+                    model_name=stack_name,
+                    split="test",
+                    uncertainty=test_unc_ale,
+                    prob=test_prob,
+                    labels=y_test,
+                )
             _accumulate_uncertainty_values(
                 uncertainty_store,
                 scenario="all",
@@ -3110,57 +3258,34 @@ def main() -> None:
                 split="test",
                 values=test_unc,
             )
-            _accumulate_auc_cutoff_inputs(
-                auc_cutoff_store,
-                scenario="all",
-                uncertainty_type="total",
-                model_family="stack",
-                model_name=stack_name,
-                split="test",
-                uncertainty=test_unc,
-                prob=test_prob,
-                labels=y_test,
-            )
+            if y_test is not None:
+                _accumulate_auc_cutoff_inputs(
+                    auc_cutoff_store,
+                    scenario="all",
+                    uncertainty_type="total",
+                    model_family="stack",
+                    model_name=stack_name,
+                    split="test",
+                    uncertainty=test_unc,
+                    prob=test_prob,
+                    labels=y_test,
+                )
             thr, val_prec_at_thr, val_rec_at_thr = _select_threshold_by_val_pr(
                 y_val=y_val, prob_val=val_prob, target_recall=args.target_recall
             )
             val_metrics = _evaluate_like_main_active(
                 y_true=y_val, prob=val_prob, uncertainty=val_unc, n_bins=args.ece_bins, threshold=thr
             )
-            test_metrics = _evaluate_like_main_active(
-                y_true=y_test, prob=test_prob, uncertainty=test_unc, n_bins=args.ece_bins, threshold=thr
-            )
             val_metrics["Val_Precision_At_Selected_Thr"] = float(val_prec_at_thr)
             val_metrics["Val_Recall_At_Selected_Thr"] = float(val_rec_at_thr)
-            test_metrics["Val_Precision_At_Selected_Thr"] = float(val_prec_at_thr)
-            test_metrics["Val_Recall_At_Selected_Thr"] = float(val_rec_at_thr)
 
             all_val_probs[stack_name].append(val_prob)
             all_test_probs[stack_name].append(test_prob)
             all_test_uncs[stack_name].append(test_unc)
             all_weights[stack_name].append(w_summary)
             stack_key = f"stack::{stack_name}"
-            aggregate_metrics.setdefault(stack_key, []).append(test_metrics)
             radar_metrics_store["all"]["val"].setdefault(stack_key, []).append(val_metrics)
-            radar_metrics_store["all"]["test"].setdefault(stack_key, []).append(test_metrics)
             confusion_store["all"]["val"].setdefault(stack_key, []).append(_cm_counts_from_metrics(val_metrics))
-            confusion_store["all"]["test"].setdefault(stack_key, []).append(_cm_counts_from_metrics(test_metrics))
-            conformal_trend_confusion_store["all_test"].setdefault(stack_key, []).append(
-                _cm_counts_from_metrics(test_metrics)
-            )
-            _append_category_confusion(
-                scenario="all",
-                model_key=stack_key,
-                val_cm=_cm_counts_from_metrics(val_metrics),
-                test_prob=test_prob,
-                threshold=thr,
-            )
-            _append_category_trend_confusion(
-                row_key="all_test",
-                model_key=stack_key,
-                test_prob=test_prob,
-                threshold=thr,
-            )
             w_str = ", ".join(f"{m}={ww:.4f}" for m, ww in zip(methods, w_summary))
             if stack_name in iso_stack_names:
                 coef_val_str = ", ".join(f"{m}={cc:.4f}" for m, cc in zip(methods, iso_coeff_val))
@@ -3179,7 +3304,6 @@ def main() -> None:
                 )
             print(f"- {stack_name} | weights: {w_str}")
             print(f"  val  | {_format_metric_line(val_metrics)}")
-            print(f"  test | {_format_metric_line(test_metrics)}")
             _append_metric_row(
                 report_rows,
                 row_type="per_run",
@@ -3205,31 +3329,57 @@ def main() -> None:
                     )
                 ),
             )
-            _append_metric_row(
-                report_rows,
-                row_type="per_run",
-                run_id=str(run_id),
-                split="test",
-                model_family="stack",
-                model_name=stack_name,
-                metrics=test_metrics,
-                weights=(
-                    (w_str if not adaptive_note else f"{w_str} | {adaptive_note}")
-                    if stack_name not in iso_stack_names
-                    else (
-                        w_str
-                        + " | isotonic_coef_val: "
-                        + ", ".join(f"{m}={cc:.4f}" for m, cc in zip(methods, iso_coeff_val))
-                        + " | isotonic_coef_test: "
-                        + ", ".join(f"{m}={cc:.4f}" for m, cc in zip(methods, iso_coeff_test))
-                        + " | "
-                        + adaptive_note
-                        + f" | score_cap={args.iso_inverse_score_cap:.1f}"
-                        + f" | tau={args.uncertainty_tau:.3f}"
-                        + " | method=exp(-tau*quantile)"
-                    )
-                ),
-            )
+            if y_test is not None:
+                test_metrics = _evaluate_like_main_active(
+                    y_true=y_test, prob=test_prob, uncertainty=test_unc, n_bins=args.ece_bins, threshold=thr
+                )
+                test_metrics["Val_Precision_At_Selected_Thr"] = float(val_prec_at_thr)
+                test_metrics["Val_Recall_At_Selected_Thr"] = float(val_rec_at_thr)
+                aggregate_metrics.setdefault(stack_key, []).append(test_metrics)
+                radar_metrics_store["all"]["test"].setdefault(stack_key, []).append(test_metrics)
+                confusion_store["all"]["test"].setdefault(stack_key, []).append(_cm_counts_from_metrics(test_metrics))
+                conformal_trend_confusion_store["all_test"].setdefault(stack_key, []).append(
+                    _cm_counts_from_metrics(test_metrics)
+                )
+                _append_category_confusion(
+                    scenario="all",
+                    model_key=stack_key,
+                    val_cm=_cm_counts_from_metrics(val_metrics),
+                    test_prob=test_prob,
+                    threshold=thr,
+                )
+                _append_category_trend_confusion(
+                    row_key="all_test",
+                    model_key=stack_key,
+                    test_prob=test_prob,
+                    threshold=thr,
+                )
+                print(f"  test | {_format_metric_line(test_metrics)}")
+                _append_metric_row(
+                    report_rows,
+                    row_type="per_run",
+                    run_id=str(run_id),
+                    split="test",
+                    model_family="stack",
+                    model_name=stack_name,
+                    metrics=test_metrics,
+                    weights=(
+                        (w_str if not adaptive_note else f"{w_str} | {adaptive_note}")
+                        if stack_name not in iso_stack_names
+                        else (
+                            w_str
+                            + " | isotonic_coef_val: "
+                            + ", ".join(f"{m}={cc:.4f}" for m, cc in zip(methods, iso_coeff_val))
+                            + " | isotonic_coef_test: "
+                            + ", ".join(f"{m}={cc:.4f}" for m, cc in zip(methods, iso_coeff_test))
+                            + " | "
+                            + adaptive_note
+                            + f" | score_cap={args.iso_inverse_score_cap:.1f}"
+                            + f" | tau={args.uncertainty_tau:.3f}"
+                            + " | method=exp(-tau*quantile)"
+                        )
+                    ),
+                )
 
             # --- conformal credal sets (standard / csa / csa_lc) -------------
             if args.conformal_method == "csa" and csa_obj is not None:
@@ -3244,30 +3394,31 @@ def main() -> None:
                     _, accepted_mask_alpha, _ = _csa_predict(
                         csa_obj, p_test, alpha=float(alpha)
                     )
-                    conf_test_alpha = _evaluate_accepted_subset(
-                        y_true=y_test,
-                        prob=test_prob,
-                        uncertainty=test_unc,
-                        accepted_mask=accepted_mask_alpha,
-                        n_bins=args.ece_bins,
-                        threshold=thr,
-                    )
-                    if int(conf_test_alpha.get("accepted_count", 0.0)) > 0:
-                        conformal_trend_confusion_store[f"alpha_{alpha:.4f}"].setdefault(stack_key, []).append(
-                            _cm_counts_from_metrics(conf_test_alpha)
+                    if y_test is not None:
+                        conf_test_alpha = _evaluate_accepted_subset(
+                            y_true=y_test,
+                            prob=test_prob,
+                            uncertainty=test_unc,
+                            accepted_mask=accepted_mask_alpha,
+                            n_bins=args.ece_bins,
+                            threshold=thr,
                         )
-                    _append_category_trend_confusion(
-                        row_key=f"alpha_{alpha:.4f}",
-                        model_key=stack_key,
-                        test_prob=test_prob,
-                        threshold=thr,
-                        accepted_mask=accepted_mask_alpha,
-                    )
+                        if int(conf_test_alpha.get("accepted_count", 0.0)) > 0:
+                            conformal_trend_confusion_store[f"alpha_{alpha:.4f}"].setdefault(stack_key, []).append(
+                                _cm_counts_from_metrics(conf_test_alpha)
+                            )
+                        _append_category_trend_confusion(
+                            row_key=f"alpha_{alpha:.4f}",
+                            model_key=stack_key,
+                            test_prob=test_prob,
+                            threshold=thr,
+                            accepted_mask=accepted_mask_alpha,
+                        )
                     if stack_name in iso_stack_names:
                         credal_ac_accept_store[stack_name].setdefault(
                             f"alpha_{alpha:.4f}", []
                         ).append(accepted_mask_alpha.copy())
-                if stack_name in iso_stack_names:
+                if stack_name in iso_stack_names and args.export_per_molecule_csv:
                     test_out = summary_csv.parent / f"{stack_name}_conformal_test_run_{run_id}.csv"
                     pd.DataFrame(
                         {
@@ -3293,30 +3444,31 @@ def main() -> None:
                     _, accepted_mask_alpha, _ = _csa_predict_label_conditional(
                         lc_csa_obj, p_test, alpha=float(alpha)
                     )
-                    conf_test_alpha = _evaluate_accepted_subset(
-                        y_true=y_test,
-                        prob=test_prob,
-                        uncertainty=test_unc,
-                        accepted_mask=accepted_mask_alpha,
-                        n_bins=args.ece_bins,
-                        threshold=thr,
-                    )
-                    if int(conf_test_alpha.get("accepted_count", 0.0)) > 0:
-                        conformal_trend_confusion_store[f"alpha_{alpha:.4f}"].setdefault(stack_key, []).append(
-                            _cm_counts_from_metrics(conf_test_alpha)
+                    if y_test is not None:
+                        conf_test_alpha = _evaluate_accepted_subset(
+                            y_true=y_test,
+                            prob=test_prob,
+                            uncertainty=test_unc,
+                            accepted_mask=accepted_mask_alpha,
+                            n_bins=args.ece_bins,
+                            threshold=thr,
                         )
-                    _append_category_trend_confusion(
-                        row_key=f"alpha_{alpha:.4f}",
-                        model_key=stack_key,
-                        test_prob=test_prob,
-                        threshold=thr,
-                        accepted_mask=accepted_mask_alpha,
-                    )
+                        if int(conf_test_alpha.get("accepted_count", 0.0)) > 0:
+                            conformal_trend_confusion_store[f"alpha_{alpha:.4f}"].setdefault(stack_key, []).append(
+                                _cm_counts_from_metrics(conf_test_alpha)
+                            )
+                        _append_category_trend_confusion(
+                            row_key=f"alpha_{alpha:.4f}",
+                            model_key=stack_key,
+                            test_prob=test_prob,
+                            threshold=thr,
+                            accepted_mask=accepted_mask_alpha,
+                        )
                     if stack_name in iso_stack_names:
                         credal_ac_accept_store[stack_name].setdefault(
                             f"alpha_{alpha:.4f}", []
                         ).append(accepted_mask_alpha.copy())
-                if stack_name in iso_stack_names:
+                if stack_name in iso_stack_names and args.export_per_molecule_csv:
                     test_out = summary_csv.parent / f"{stack_name}_conformal_test_run_{run_id}.csv"
                     pd.DataFrame(
                         {
@@ -3364,25 +3516,26 @@ def main() -> None:
                         sorted_weights_neg=scores_neg_w,
                         test_sample_weights=cp_w_test,
                     )
-                    conf_test_alpha = _evaluate_accepted_subset(
-                        y_true=y_test,
-                        prob=test_prob,
-                        uncertainty=test_unc,
-                        accepted_mask=accepted_mask_alpha,
-                        n_bins=args.ece_bins,
-                        threshold=thr,
-                    )
-                    if int(conf_test_alpha.get("accepted_count", 0.0)) > 0:
-                        conformal_trend_confusion_store[f"alpha_{alpha:.4f}"].setdefault(stack_key, []).append(
-                            _cm_counts_from_metrics(conf_test_alpha)
+                    if y_test is not None:
+                        conf_test_alpha = _evaluate_accepted_subset(
+                            y_true=y_test,
+                            prob=test_prob,
+                            uncertainty=test_unc,
+                            accepted_mask=accepted_mask_alpha,
+                            n_bins=args.ece_bins,
+                            threshold=thr,
                         )
-                    _append_category_trend_confusion(
-                        row_key=f"alpha_{alpha:.4f}",
-                        model_key=stack_key,
-                        test_prob=test_prob,
-                        threshold=thr,
-                        accepted_mask=accepted_mask_alpha,
-                    )
+                        if int(conf_test_alpha.get("accepted_count", 0.0)) > 0:
+                            conformal_trend_confusion_store[f"alpha_{alpha:.4f}"].setdefault(stack_key, []).append(
+                                _cm_counts_from_metrics(conf_test_alpha)
+                            )
+                        _append_category_trend_confusion(
+                            row_key=f"alpha_{alpha:.4f}",
+                            model_key=stack_key,
+                            test_prob=test_prob,
+                            threshold=thr,
+                            accepted_mask=accepted_mask_alpha,
+                        )
                     if stack_name in iso_stack_names:
                         credal_ac_accept_store[stack_name].setdefault(
                             f"alpha_{alpha:.4f}", []
@@ -3435,9 +3588,10 @@ def main() -> None:
                             "accepted": accepted_mask.astype(bool),
                         }
                     )
-                    test_out = summary_csv.parent / f"{stack_name}_conformal_test_run_{run_id}.csv"
-                    test_rows.to_csv(test_out, index=False)
-                    print(f"[{stack_name}] saved: {test_out}")
+                    if args.export_per_molecule_csv:
+                        test_out = summary_csv.parent / f"{stack_name}_conformal_test_run_{run_id}.csv"
+                        test_rows.to_csv(test_out, index=False)
+                        print(f"[{stack_name}] saved: {test_out}")
             _accumulate_conformal_hist_values(
                 conformal_hist_store,
                 split="val",
@@ -3446,14 +3600,15 @@ def main() -> None:
                 accepted_mask=accepted_mask_val,
                 pred_label=pred_label_val,
             )
-            _accumulate_conformal_hist_values(
-                conformal_hist_store,
-                split="test",
-                y_true=y_test,
-                prob=test_prob,
-                accepted_mask=accepted_mask,
-                pred_label=pred_label_test,
-            )
+            if y_test is not None:
+                _accumulate_conformal_hist_values(
+                    conformal_hist_store,
+                    split="test",
+                    y_true=y_test,
+                    prob=test_prob,
+                    accepted_mask=accepted_mask,
+                    pred_label=pred_label_test,
+                )
             _accumulate_uncertainty_values(
                 uncertainty_store,
                 scenario="conformal",
@@ -3523,17 +3678,18 @@ def main() -> None:
                 split="test",
                 values=test_unc_epi[accepted_mask],
             )
-            _accumulate_auc_cutoff_inputs(
-                auc_cutoff_store,
-                scenario="conformal",
-                uncertainty_type="epistemic",
-                model_family="stack",
-                model_name=stack_name,
-                split="test",
-                uncertainty=test_unc_epi[accepted_mask],
-                prob=test_prob[accepted_mask],
-                labels=y_test[accepted_mask],
-            )
+            if y_test is not None:
+                _accumulate_auc_cutoff_inputs(
+                    auc_cutoff_store,
+                    scenario="conformal",
+                    uncertainty_type="epistemic",
+                    model_family="stack",
+                    model_name=stack_name,
+                    split="test",
+                    uncertainty=test_unc_epi[accepted_mask],
+                    prob=test_prob[accepted_mask],
+                    labels=y_test[accepted_mask],
+                )
             _accumulate_uncertainty_values(
                 uncertainty_store,
                 scenario="conformal",
@@ -3543,17 +3699,18 @@ def main() -> None:
                 split="test",
                 values=test_unc_ale[accepted_mask],
             )
-            _accumulate_auc_cutoff_inputs(
-                auc_cutoff_store,
-                scenario="conformal",
-                uncertainty_type="aleatoric",
-                model_family="stack",
-                model_name=stack_name,
-                split="test",
-                uncertainty=test_unc_ale[accepted_mask],
-                prob=test_prob[accepted_mask],
-                labels=y_test[accepted_mask],
-            )
+            if y_test is not None:
+                _accumulate_auc_cutoff_inputs(
+                    auc_cutoff_store,
+                    scenario="conformal",
+                    uncertainty_type="aleatoric",
+                    model_family="stack",
+                    model_name=stack_name,
+                    split="test",
+                    uncertainty=test_unc_ale[accepted_mask],
+                    prob=test_prob[accepted_mask],
+                    labels=y_test[accepted_mask],
+                )
             _accumulate_uncertainty_values(
                 uncertainty_store,
                 scenario="conformal",
@@ -3563,25 +3720,18 @@ def main() -> None:
                 split="test",
                 values=test_unc[accepted_mask],
             )
-            _accumulate_auc_cutoff_inputs(
-                auc_cutoff_store,
-                scenario="conformal",
-                uncertainty_type="total",
-                model_family="stack",
-                model_name=stack_name,
-                split="test",
-                uncertainty=test_unc[accepted_mask],
-                prob=test_prob[accepted_mask],
-                labels=y_test[accepted_mask],
-            )
-            conf_test_m = _evaluate_accepted_subset(
-                y_true=y_test,
-                prob=test_prob,
-                uncertainty=test_unc,
-                accepted_mask=accepted_mask,
-                n_bins=args.ece_bins,
-                threshold=thr,
-            )
+            if y_test is not None:
+                _accumulate_auc_cutoff_inputs(
+                    auc_cutoff_store,
+                    scenario="conformal",
+                    uncertainty_type="total",
+                    model_family="stack",
+                    model_name=stack_name,
+                    split="test",
+                    uncertainty=test_unc[accepted_mask],
+                    prob=test_prob[accepted_mask],
+                    labels=y_test[accepted_mask],
+                )
             conf_val_m = _evaluate_accepted_subset(
                 y_true=y_val,
                 prob=val_prob,
@@ -3592,32 +3742,11 @@ def main() -> None:
             )
             conf_val_m["Val_Precision_At_Selected_Thr"] = float(val_prec_at_thr)
             conf_val_m["Val_Recall_At_Selected_Thr"] = float(val_rec_at_thr)
-            conf_test_m["Val_Precision_At_Selected_Thr"] = float(val_prec_at_thr)
-            conf_test_m["Val_Recall_At_Selected_Thr"] = float(val_rec_at_thr)
-            conformal_aggregate.setdefault(stack_key, []).append(conf_test_m)
             radar_metrics_store["conformal"]["val"].setdefault(stack_key, []).append(conf_val_m)
-            radar_metrics_store["conformal"]["test"].setdefault(stack_key, []).append(conf_test_m)
             if int(conf_val_m.get("accepted_count", 0.0)) > 0:
                 confusion_store["conformal"]["val"].setdefault(stack_key, []).append(
                     _cm_counts_from_metrics(conf_val_m)
                 )
-            if int(conf_test_m.get("accepted_count", 0.0)) > 0:
-                confusion_store["conformal"]["test"].setdefault(stack_key, []).append(
-                    _cm_counts_from_metrics(conf_test_m)
-                )
-            _append_category_confusion(
-                scenario="conformal",
-                model_key=stack_key,
-                val_cm=_cm_counts_from_probs(
-                    y_true=y_val,
-                    probs=val_prob,
-                    threshold=thr,
-                    mask=accepted_mask_val,
-                ),
-                test_prob=test_prob,
-                threshold=thr,
-                accepted_mask=accepted_mask,
-            )
             _append_metric_row(
                 conformal_rows,
                 row_type="conformal_per_run",
@@ -3628,49 +3757,94 @@ def main() -> None:
                 metrics=conf_val_m,
                 weights=f"{w_str}; alpha={args.conformal_alpha}",
             )
-            _append_metric_row(
-                conformal_rows,
-                row_type="conformal_per_run",
-                run_id=str(run_id),
-                split="test_conformal_accepted",
-                model_family="stack",
-                model_name=stack_name,
-                metrics=conf_test_m,
-                weights=f"{w_str}; alpha={args.conformal_alpha}",
-            )
+            if y_test is not None:
+                conf_test_m = _evaluate_accepted_subset(
+                    y_true=y_test,
+                    prob=test_prob,
+                    uncertainty=test_unc,
+                    accepted_mask=accepted_mask,
+                    n_bins=args.ece_bins,
+                    threshold=thr,
+                )
+                conf_test_m["Val_Precision_At_Selected_Thr"] = float(val_prec_at_thr)
+                conf_test_m["Val_Recall_At_Selected_Thr"] = float(val_rec_at_thr)
+                conformal_aggregate.setdefault(stack_key, []).append(conf_test_m)
+                radar_metrics_store["conformal"]["test"].setdefault(stack_key, []).append(conf_test_m)
+                if int(conf_test_m.get("accepted_count", 0.0)) > 0:
+                    confusion_store["conformal"]["test"].setdefault(stack_key, []).append(
+                        _cm_counts_from_metrics(conf_test_m)
+                    )
+                _append_category_confusion(
+                    scenario="conformal",
+                    model_key=stack_key,
+                    val_cm=_cm_counts_from_probs(
+                        y_true=y_val,
+                        probs=val_prob,
+                        threshold=thr,
+                        mask=accepted_mask_val,
+                    ),
+                    test_prob=test_prob,
+                    threshold=thr,
+                    accepted_mask=accepted_mask,
+                )
+                _append_metric_row(
+                    conformal_rows,
+                    row_type="conformal_per_run",
+                    run_id=str(run_id),
+                    split="test_conformal_accepted",
+                    model_family="stack",
+                    model_name=stack_name,
+                    metrics=conf_test_m,
+                    weights=f"{w_str}; alpha={args.conformal_alpha}",
+                )
+
+            # Per-molecule test CSV for iso-stacking variants
+            if stack_name in iso_stack_names and args.export_per_molecule_csv:
+                _ens_iso_cal = _apply_weights(iso_calibrated_test, w_test)
+                _write_test_mol_csv(
+                    out_path=summary_csv.parent / f"per_molecule_test_{stack_name}_run_{run_id}.csv",
+                    pos_prob=np.asarray(test_prob, dtype=np.float64),
+                    epi=np.asarray(test_unc_epi, dtype=np.float64),
+                    iso_cal=_ens_iso_cal,
+                    thr=float(thr),
+                    cp_accepted=np.asarray(accepted_mask, dtype=np.int8),
+                    cp_pred_label=np.asarray(pred_label_test, dtype=np.int8),
+                    smiles=test_smiles,
+                )
 
         # Radar-only baselines for visual scale anchoring.
-        baseline_defs = {
-            "always_pos": (
-                np.ones_like(y_val, dtype=np.float64),
-                np.ones_like(y_test, dtype=np.float64),
-            ),
-            "always_neg": (
-                np.zeros_like(y_val, dtype=np.float64),
-                np.zeros_like(y_test, dtype=np.float64),
-            ),
-        }
-        for baseline_name, (val_prob_b, test_prob_b) in baseline_defs.items():
-            key = f"baseline::{baseline_name}"
-            val_unc_b = np.full_like(val_prob_b, 1e-7, dtype=np.float64)
-            test_unc_b = np.full_like(test_prob_b, 1e-7, dtype=np.float64)
-            thr_b = 0.5
-            val_metrics_b = _evaluate_like_main_active(
-                y_true=y_val,
-                prob=val_prob_b,
-                uncertainty=val_unc_b,
-                n_bins=args.ece_bins,
-                threshold=thr_b,
-            )
-            test_metrics_b = _evaluate_like_main_active(
-                y_true=y_test,
-                prob=test_prob_b,
-                uncertainty=test_unc_b,
-                n_bins=args.ece_bins,
-                threshold=thr_b,
-            )
-            radar_metrics_store["all"]["val"].setdefault(key, []).append(val_metrics_b)
-            radar_metrics_store["all"]["test"].setdefault(key, []).append(test_metrics_b)
+        if y_test is not None:
+            baseline_defs = {
+                "always_pos": (
+                    np.ones_like(y_val, dtype=np.float64),
+                    np.ones_like(y_test, dtype=np.float64),
+                ),
+                "always_neg": (
+                    np.zeros_like(y_val, dtype=np.float64),
+                    np.zeros_like(y_test, dtype=np.float64),
+                ),
+            }
+            for baseline_name, (val_prob_b, test_prob_b) in baseline_defs.items():
+                key = f"baseline::{baseline_name}"
+                val_unc_b = np.full_like(val_prob_b, 1e-7, dtype=np.float64)
+                test_unc_b = np.full_like(test_prob_b, 1e-7, dtype=np.float64)
+                thr_b = 0.5
+                val_metrics_b = _evaluate_like_main_active(
+                    y_true=y_val,
+                    prob=val_prob_b,
+                    uncertainty=val_unc_b,
+                    n_bins=args.ece_bins,
+                    threshold=thr_b,
+                )
+                test_metrics_b = _evaluate_like_main_active(
+                    y_true=y_test,
+                    prob=test_prob_b,
+                    uncertainty=test_unc_b,
+                    n_bins=args.ece_bins,
+                    threshold=thr_b,
+                )
+                radar_metrics_store["all"]["val"].setdefault(key, []).append(val_metrics_b)
+                radar_metrics_store["all"]["test"].setdefault(key, []).append(test_metrics_b)
 
     # Aggregate over runs: average test probabilities and average weights.
     print("\n=== Mean-over-runs (test) ===")
@@ -3685,24 +3859,25 @@ def main() -> None:
         thr, val_prec_at_thr, val_rec_at_thr = _select_threshold_by_val_pr(
             y_val=y_val, prob_val=p_val_mean, target_recall=args.target_recall
         )
-        agg_metrics = _evaluate_like_main_active(
-            y_true=y_test, prob=p_mean, uncertainty=u_mean, n_bins=args.ece_bins, threshold=thr
-        )
-        agg_metrics["Val_Precision_At_Selected_Thr"] = float(val_prec_at_thr)
-        agg_metrics["Val_Recall_At_Selected_Thr"] = float(val_rec_at_thr)
         w_str = ", ".join(f"{m}={ww:.4f}" for m, ww in zip(methods, w_mean))
         print(f"- {stack_name} | mean weights: {w_str}")
-        print(f"  {_format_metric_line(agg_metrics)}")
-        _append_metric_row(
-            report_rows,
-            row_type="mean_over_runs_prediction",
-            run_id="mean_over_runs",
-            split="test",
-            model_family="stack",
-            model_name=stack_name,
-            metrics=agg_metrics,
-            weights=w_str,
-        )
+        if y_test is not None:
+            agg_metrics = _evaluate_like_main_active(
+                y_true=y_test, prob=p_mean, uncertainty=u_mean, n_bins=args.ece_bins, threshold=thr
+            )
+            agg_metrics["Val_Precision_At_Selected_Thr"] = float(val_prec_at_thr)
+            agg_metrics["Val_Recall_At_Selected_Thr"] = float(val_rec_at_thr)
+            print(f"  {_format_metric_line(agg_metrics)}")
+            _append_metric_row(
+                report_rows,
+                row_type="mean_over_runs_prediction",
+                run_id="mean_over_runs",
+                split="test",
+                model_family="stack",
+                model_name=stack_name,
+                metrics=agg_metrics,
+                weights=w_str,
+            )
 
     if aggregate_metrics:
         print("\n=== Per-method mean±std over runs (test) ===")
@@ -3783,7 +3958,7 @@ def main() -> None:
     print(f"Saved uncertainty distribution artifacts under: {uncertainty_dist_dir}")
 
     # Export credal-set acceptance vs ac_label grid for iso-stack methods.
-    if category_specs and ac_labels_test is not None and len(ac_labels_test) == len(y_test):
+    if category_specs and ac_labels_test is not None and y_test is not None and len(ac_labels_test) == len(y_test):
         iso_slug_map = {
             "uncertainty_inverse_isotonic": "inv_iso",
             "uncertainty_inverse_isotonic_reject_filtered": "inv_iso_rf",
@@ -3827,6 +4002,74 @@ def main() -> None:
                         methods=methods,
                         out_dir=summary_csv.parent,
                     )
+
+    # OOD uncertainty envelope — fit once across all accumulated runs.
+    if args.ood_envelope and csa_scatter_u_epi_runs:
+        ood_alpha = float(args.ood_alpha) if args.ood_alpha is not None else float(args.conformal_alpha)
+        # Average epistemic uncertainty across runs → (K, N)
+        n_runs = len(list(isotonic_uncertainty_val_store.values())[0])
+        val_epi_runs = [
+            np.stack([isotonic_uncertainty_val_store[m][r] for m in methods], axis=0)
+            for r in range(n_runs)
+        ]
+        u_val_epi_avg  = np.mean(np.stack(val_epi_runs, axis=0), axis=0)
+        u_test_epi_avg = np.mean(np.stack(csa_scatter_u_epi_runs, axis=0), axis=0)
+
+        ac_labels_val_arr: Optional[np.ndarray] = None
+        if args.ood_envelope_source == "non_ac_only":
+            ac_labels_val_arr = _load_optional_text_column(
+                label_dir=label_dir, split_name=args.val_split, column_name="ac_label"
+            )
+
+        ood_result = fit_ood_uncertainty_envelope(
+            u_val=u_val_epi_avg,
+            u_test=u_test_epi_avg,
+            alpha=ood_alpha,
+            M=args.csa_n_directions,
+            split_ratio=args.csa_split_ratio,
+            seed=args.csa_seed,
+            normalisation=args.ood_normalisation,
+            percentile_q=args.ood_percentile_q,
+            envelope_source=args.ood_envelope_source,
+            ac_labels_val=ac_labels_val_arr,
+            ac_labels_test=ac_labels_test,
+        )
+
+        norm_tag = args.ood_normalisation
+        src_tag  = args.ood_envelope_source
+
+        _export_ood_uncertainty_scatter(
+            u_test_epi_runs=csa_scatter_u_epi_runs,
+            ood_mask=ood_result["ood_mask"],
+            T_scores=ood_result["T_scores"],
+            t_hat=ood_result["t_hat"],
+            methods=methods,
+            category_specs=category_specs,
+            normalisation=norm_tag,
+            envelope_source=src_tag,
+            out_png=summary_csv.parent / f"ood_uncertainty_scatter_{norm_tag}_{src_tag}.png",
+            out_csv=summary_csv.parent / f"ood_uncertainty_scatter_{norm_tag}_{src_tag}.csv",
+        )
+
+        if category_specs:
+            _export_ood_ac_label_grid(
+                ood_mask=ood_result["ood_mask"],
+                category_specs=category_specs,
+                normalisation=norm_tag,
+                envelope_source=src_tag,
+                out_png=summary_csv.parent / f"ood_ac_label_grid_{norm_tag}_{src_tag}.png",
+                out_csv=summary_csv.parent / f"ood_ac_label_grid_{norm_tag}_{src_tag}.csv",
+                norm="column",
+            )
+            _export_ood_ac_label_grid(
+                ood_mask=ood_result["ood_mask"],
+                category_specs=category_specs,
+                normalisation=norm_tag,
+                envelope_source=src_tag,
+                out_png=summary_csv.parent / f"ood_ac_label_grid_{norm_tag}_{src_tag}_row_norm.png",
+                out_csv=summary_csv.parent / f"ood_ac_label_grid_{norm_tag}_{src_tag}_row_norm.csv",
+                norm="row",
+            )
 
     # Export confusion matrices without/with conformal filtering.
     def _model_sort_key(name: str) -> Tuple[int, str]:

@@ -128,16 +128,23 @@ def load_custom_ecfp_tox_pkl(
     label_column: str = "Outcome",
     save_dir: str = "save_ecfp_pkl",
     reload: bool = True,
+    train_file: str = "HEK293_train_BM.pkl",
+    val_file: str = "HEK293_test_BM.pkl",
+    test_file: str = "tox21_all.pkl",
 ) -> Dict[str, Dict[str, np.ndarray]]:
     files = {
-        "train": "HEK293_train_BM.pkl",
-        "val": "HEK293_test_BM.pkl",
-        "test": "tox21_all.pkl",
+        "train": train_file,
+        "val": val_file,
+        "test": test_file,
     }
 
     # Cache featurized arrays so repeated runs can skip featurization.
+    # Include the resolved file names so different splits never reuse a stale cache.
+    file_tag = "_".join(
+        os.path.splitext(os.path.basename(files[s]))[0] for s in ("train", "val", "test")
+    )
     cache_tag = (
-        f"{encoder_type}_ecfp{ecfp_size}_r{radius}_{smiles_column}_{label_column}"
+        f"{encoder_type}_ecfp{ecfp_size}_r{radius}_{smiles_column}_{label_column}_{file_tag}"
     )
     cache_root = os.path.join(save_dir, cache_tag)
     os.makedirs(cache_root, exist_ok=True)
@@ -821,6 +828,24 @@ def main() -> None:
     parser.add_argument("--mode", choices=["train", "infer"], default="train")
     parser.add_argument("--data_dir", type=str, default="cytotoxicity_data")
     parser.add_argument(
+        "--train_file",
+        type=str,
+        default="HEK293_train_BM.pkl",
+        help="Training split file name (relative to --data_dir) or absolute path.",
+    )
+    parser.add_argument(
+        "--val_file",
+        type=str,
+        default="HEK293_test_BM.pkl",
+        help="Validation split file name (relative to --data_dir) or absolute path.",
+    )
+    parser.add_argument(
+        "--test_file",
+        type=str,
+        default="tox21_all.pkl",
+        help="Test split file name (relative to --data_dir) or absolute path.",
+    )
+    parser.add_argument(
         "--featurized_save_dir",
         type=str,
         default="save_ecfp_pkl",
@@ -927,6 +952,9 @@ def main() -> None:
             label_column=args.label_column,
             save_dir=args.featurized_save_dir,
             reload=args.reload,
+            train_file=args.train_file,
+            val_file=args.val_file,
+            test_file=args.test_file,
         )
         train_x, train_y = splits["train"]["X"], splits["train"]["y"]
         val_x, val_y = splits["val"]["X"], splits["val"]["y"]
