@@ -447,7 +447,9 @@ class _DMPNNDataset(TorchDataset):
     def __getitem__(self, idx):
         g = self.graphs[idx]
         if self.y is not None:
-            return g, float(self.y[idx])
+            # y may be shaped (N, 1); flatten the element to a scalar so
+            # float() works on newer NumPy (which rejects size-1 1-D arrays).
+            return g, float(np.asarray(self.y[idx]).reshape(-1)[0])
         return (g,)
 
 
