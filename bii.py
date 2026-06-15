@@ -1044,10 +1044,20 @@ def main() -> None:
     model_type = _normalize_model_type(meta.get("model_type", args.model_type))
     mc_dropout_samples = int(meta.get("mc_dropout_samples", args.mc_dropout_samples))
     if args.inference_all_splits:
+        def _resolve_split_path(name: str) -> Path:
+            p = Path(name)
+            return p if p.is_absolute() else data_dir / p
+
+        # Driven by --train_file/--val_file/--test_file (default to the standard
+        # HEK293/tox21 splits). Empty values are skipped so you can infer on a subset.
         split_files = {
-            "train": data_dir / "HEK293_train_BM.pkl",
-            "val": data_dir / "HEK293_test_BM.pkl",
-            "test": data_dir / "tox21_all.pkl",
+            split_name: _resolve_split_path(fname)
+            for split_name, fname in (
+                ("train", args.train_file),
+                ("val", args.val_file),
+                ("test", args.test_file),
+            )
+            if str(fname).strip()
         }
         for split_name, inference_input in split_files.items():
             pred_df = infer_from_file(

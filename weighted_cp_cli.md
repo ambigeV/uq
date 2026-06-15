@@ -63,7 +63,8 @@ python bii_super_learner.py \
   --run_ids "0,1,2,3,4" \
   --summary_csv "${OUT_DIR_PLAIN}/stacking_summary_all_metrics.csv" \
   --conformal_summary_csv "${OUT_DIR_PLAIN}/stacking_summary_conformal_accepted.csv" \
-  --uncertainty_dist_dir "${OUT_DIR_PLAIN}/artifacts"
+  --uncertainty_dist_dir "${OUT_DIR_PLAIN}/artifacts" \
+  --uncertainty_tau 2.0
 ```
 
 ---
@@ -76,19 +77,23 @@ Use this if you want the original 3-base-model setup.
 
 ```bash
 TS=$(date +"%Y%m%d_%H%M%S")
-OUT_DIR_PLAIN_3="inference_outputs/stacking/plain_cp_3base_${TS}"
+OUT_DIR_PLAIN_3="inference_outputs/stacking/plain_cp_2base_${TS}"
+# OUT_DIR_PLAIN_3="inference_outputs/stacking/plain_cp_3base_${TS}"
 
 python bii_super_learner.py \
   --pred_root inference_outputs \
   --label_dir cytotoxicity_data \
   --val_split HEK293_test_BM \
-  --test_split tox21_all \
+  --test_split tox21_all_ACA \
   --label_column Outcome \
-  --methods "dmpnn_bii_mc_dmpnn_balanced,dmpnn_bii_new_dmpnn_balanced,ensemble" \
+  --methods "dmpnn_bii_mc_dmpnn_balanced,dmpnn_bii_new_dmpnn_balanced" \
   --run_ids "0,1,2,3,4" \
   --summary_csv "${OUT_DIR_PLAIN_3}/stacking_summary_all_metrics.csv" \
   --conformal_summary_csv "${OUT_DIR_PLAIN_3}/stacking_summary_conformal_accepted.csv" \
-  --uncertainty_dist_dir "${OUT_DIR_PLAIN_3}/artifacts"
+  --uncertainty_dist_dir "${OUT_DIR_PLAIN_3}/artifacts" \
+  --uncertainty_tau 2.0 \
+  --no_per_molecule_csv
+
 ```
 
 ### Weighted CP (legacy 3-model, online RF)

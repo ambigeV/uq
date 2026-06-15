@@ -512,6 +512,51 @@ def _apply_weights(p: np.ndarray, w: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unsupported weight ndim={w_arr.ndim}; expected 1 or 2.")
 
 
+def _weighted_uncertainty_with_disagreement(
+    values: np.ndarray,
+    w: np.ndarray,
+    disagreement_lambda: float = 1.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Fuse per-model calibrated uncertainties into a single ensemble UQ score that
+    augments the trust-weighted mean with an inter-model disagreement term.
+
+    Unlike a plain weighted average (which collapses toward the most-trusted
+    model and discards how much the base models disagree), this adds the
+    weighted standard deviation so that molecules where the heterogeneous models
+    contradict each other are flagged as more uncertain.
+
+    Parameters
+    ----------
+    values : (K, N) per-model uncertainty, e.g. isotonic-calibrated P(error).
+    w      : (K,) or (K, N) ensemble weights (same convention as _apply_weights).
+    disagreement_lambda : multiplier on the weighted-std disagreement term.
+
+    Returns
+    -------
+    (fused, mean, disagreement_std), each shape (N,).
+    """
+    v = np.asarray(values, dtype=np.float64)
+    w_arr = np.asarray(w, dtype=np.float64)
+    if w_arr.ndim == 1:
+        if w_arr.shape[0] != v.shape[0]:
+            raise ValueError(f"Weight length mismatch: {w_arr.shape[0]} vs {v.shape[0]}.")
+        w_arr = w_arr[:, None]
+    elif w_arr.ndim == 2:
+        if w_arr.shape != v.shape:
+            raise ValueError(f"Adaptive weight shape mismatch: {w_arr.shape} vs {v.shape}.")
+    else:
+        raise ValueError(f"Unsupported weight ndim={w_arr.ndim}; expected 1 or 2.")
+
+    # Per-sample normalization keeps the weighted moments well defined.
+    w_norm = w_arr / np.clip(w_arr.sum(axis=0, keepdims=True), 1e-12, None)
+    mean = (w_norm * v).sum(axis=0)
+    var = (w_norm * (v - mean[None, :]) ** 2).sum(axis=0)
+    disagreement = np.sqrt(np.clip(var, 0.0, None))
+    fused = mean + float(disagreement_lambda) * disagreement
+    return fused, mean, disagreement
+
+
 def _downweight_rejected_method_weights(
     sample_weights: np.ndarray,
     accepted_masks: np.ndarray,
@@ -1903,6 +1948,17 @@ def main() -> None:
     parser.add_argument("--label_dir", type=str, default="cytotoxicity_data")
     parser.add_argument("--val_split", type=str, default="HEK293_test_BM")
     parser.add_argument("--test_split", type=str, default="tox21_all")
+    parser.add_argument(
+        "--test_pred_split",
+        type=str,
+        default="",
+        help=(
+            "Split directory name under pred_root from which test prediction CSVs are read. "
+            "Labels are still loaded from --test_split (cytotoxicity_data/<test_split>.pkl). "
+            "Use this when the prediction folder differs from the label split name. "
+            "If empty, defaults to --test_split."
+        ),
+    )
     parser.add_argument("--label_column", type=str, default="Outcome")
     parser.add_argument(
         "--methods",
@@ -1913,6 +1969,16 @@ def main() -> None:
     parser.add_argument("--run_ids", type=str, default="0,1,2,3,4")
     parser.add_argument("--l2", type=float, default=1e-3)
     parser.add_argument("--uncertainty_tau", type=float, default=1.0)
+    parser.add_argument(
+        "--disagreement_lambda",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight on the inter-model disagreement (weighted-std) term added to "
+            "the trust-weighted isotonic-calibrated error when forming the fused "
+            "ensemble UQ score. 0 disables disagreement (mean only)."
+        ),
+    )
     parser.add_argument(
         "--iso_inverse_score_cap",
         type=float,
@@ -2114,7 +2180,10 @@ def main() -> None:
         "--no_ac_labels",
         dest="use_ac_labels",
         action="store_false",
-        help="Disable loading ac_label column and all activity-cliff category analysis.",
+        help=(
+            "Disable loading ac_label column and all activity-cliff category analysis. "
+            "Activity-cliff analysis is currently force-disabled regardless of this flag."
+        ),
     )
     parser.add_argument(
         "--no_per_molecule_csv",
@@ -2155,8 +2224,11 @@ def main() -> None:
         default=None,
         help="[OOD] Significance level for OOD envelope. Defaults to --conformal_alpha if not set.",
     )
-    parser.set_defaults(use_test_labels=True, use_ac_labels=True, export_per_molecule_csv=True, ood_envelope=False)
+    parser.set_defaults(use_test_labels=True, use_ac_labels=False, export_per_molecule_csv=True, ood_envelope=False)
     args = parser.parse_args()
+    # Activity-cliff analysis is disabled for now: force off on every invocation
+    # regardless of any flag, so ac_label columns are never loaded or used.
+    args.use_ac_labels = False
 
     repo_root = Path(__file__).resolve().parent
     pred_root = Path(args.pred_root)
@@ -2184,7 +2256,7 @@ def main() -> None:
 
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
     run_ids = [int(x.strip()) for x in args.run_ids.split(",") if x.strip()]
-    test_pred_split = "tox21_all" if args.test_split == "tox21_all_ACA" else args.test_split
+    test_pred_split = args.test_pred_split.strip() or args.test_split
     if test_pred_split != args.test_split:
         print(
             f"[Split override] labels/test split='{args.test_split}', "
@@ -2320,6 +2392,8 @@ def main() -> None:
     }
     all_val_probs: Dict[str, List[np.ndarray]] = {k: [] for k in all_test_probs.keys()}
     all_test_uncs: Dict[str, List[np.ndarray]] = {k: [] for k in all_test_probs.keys()}
+    # Fused isotonic-calibrated UQ (trust-weighted mean + disagreement term).
+    all_test_iso_unc: Dict[str, List[np.ndarray]] = {k: [] for k in all_test_probs.keys()}
     all_weights: Dict[str, List[np.ndarray]] = {k: [] for k in all_test_probs.keys()}
     isotonic_uncertainty_val_store: Dict[str, List[np.ndarray]] = {m: [] for m in methods}
     isotonic_uncertainty_test_store: Dict[str, List[np.ndarray]] = {m: [] for m in methods}
@@ -3147,6 +3221,38 @@ def main() -> None:
             test_unc_ale = _apply_weights(u_test_ale, w_test)
             val_unc = _apply_weights(u_val, w_val)
             test_unc = _apply_weights(u_test, w_test)
+            # Fused isotonic UQ = trust-weighted mean of per-model calibrated
+            # P(error) + lambda * inter-model disagreement (weighted std).
+            val_unc_iso, val_unc_iso_mean, val_unc_iso_disagree = (
+                _weighted_uncertainty_with_disagreement(
+                    iso_calibrated_val, w_val, disagreement_lambda=args.disagreement_lambda
+                )
+            )
+            test_unc_iso, test_unc_iso_mean, test_unc_iso_disagree = (
+                _weighted_uncertainty_with_disagreement(
+                    iso_calibrated_test, w_test, disagreement_lambda=args.disagreement_lambda
+                )
+            )
+            _accumulate_uncertainty_values(
+                uncertainty_store,
+                scenario="all",
+                uncertainty_type="iso_disagreement",
+                model_family="stack",
+                model_name=stack_name,
+                split="val",
+                values=val_unc_iso,
+            )
+            _accumulate_auc_cutoff_inputs(
+                auc_cutoff_store,
+                scenario="all",
+                uncertainty_type="iso_disagreement",
+                model_family="stack",
+                model_name=stack_name,
+                split="val",
+                uncertainty=val_unc_iso,
+                prob=val_prob,
+                labels=y_val,
+            )
             _accumulate_uncertainty_values(
                 uncertainty_store,
                 scenario="all",
@@ -3279,9 +3385,31 @@ def main() -> None:
             val_metrics["Val_Precision_At_Selected_Thr"] = float(val_prec_at_thr)
             val_metrics["Val_Recall_At_Selected_Thr"] = float(val_rec_at_thr)
 
+            _accumulate_uncertainty_values(
+                uncertainty_store,
+                scenario="all",
+                uncertainty_type="iso_disagreement",
+                model_family="stack",
+                model_name=stack_name,
+                split="test",
+                values=test_unc_iso,
+            )
+            if y_test is not None:
+                _accumulate_auc_cutoff_inputs(
+                    auc_cutoff_store,
+                    scenario="all",
+                    uncertainty_type="iso_disagreement",
+                    model_family="stack",
+                    model_name=stack_name,
+                    split="test",
+                    uncertainty=test_unc_iso,
+                    prob=test_prob,
+                    labels=y_test,
+                )
             all_val_probs[stack_name].append(val_prob)
             all_test_probs[stack_name].append(test_prob)
             all_test_uncs[stack_name].append(test_unc)
+            all_test_iso_unc[stack_name].append(test_unc_iso)
             all_weights[stack_name].append(w_summary)
             stack_key = f"stack::{stack_name}"
             radar_metrics_store["all"]["val"].setdefault(stack_key, []).append(val_metrics)
@@ -3301,6 +3429,13 @@ def main() -> None:
                     f"score_cap={args.iso_inverse_score_cap:.1f}; "
                     f"tau={args.uncertainty_tau:.3f}; "
                     f"method=exp(-tau*quantile)"
+                )
+                print(
+                    f"- {stack_name} | fused_iso_UQ(test): "
+                    f"mean={float(np.mean(test_unc_iso_mean)):.4f}; "
+                    f"disagreement={float(np.mean(test_unc_iso_disagree)):.4f}; "
+                    f"lambda={args.disagreement_lambda:.3f}; "
+                    f"fused={float(np.mean(test_unc_iso)):.4f}"
                 )
             print(f"- {stack_name} | weights: {w_str}")
             print(f"  val  | {_format_metric_line(val_metrics)}")
